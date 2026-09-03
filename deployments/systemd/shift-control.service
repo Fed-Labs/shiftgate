@@ -1,0 +1,24 @@
+[Unit]
+Description=SHIFT fleet control plane
+Documentation=https://github.com/Fed-Labs/shiftgate
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/shift/control.env
+ExecStart=/usr/local/bin/shift-control --config /etc/shift/control.json
+Restart=on-failure
+RestartSec=5s
+User=shift
+Group=shift
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

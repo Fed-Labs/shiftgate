@@ -1,0 +1,29 @@
+[Unit]
+Description=SHIFT privileged workload mobility agent
+Documentation=https://github.com/Fed-Labs/shiftgate
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/shift-agent --config /etc/shift/agent.json
+EnvironmentFile=-/etc/shift/agent.env
+Restart=on-failure
+RestartSec=5s
+User=root
+Group=root
+UMask=0077
+StateDirectory=shift
+RuntimeDirectory=shift
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/shift /run/shift
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_NET_ADMIN CAP_SETGID CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_NET_ADMIN CAP_SETGID CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

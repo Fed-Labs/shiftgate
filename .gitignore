@@ -1,0 +1,17 @@
+.env
+.idea/
+.vscode/
+.DS_Store
+bin/
+dist/
+coverage/
+tmp/
+data/
+*.log
+*.pid
+*.sock
+node_modules/
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+target/
+

@@ -1,0 +1,17 @@
+image:
+  repository: ghcr.io/fed-labs/shift-control
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+service:
+  type: ClusterIP
+  port: 8090
+control:
+  listen: 0.0.0.0:8090
+  databaseURL: ""
+  tokenPepperSecret: shift-secrets
+  tokenPepperKey: token-pepper
+  passwordPepperSecret: shift-secrets
+  passwordPepperKey: password-pepper
+resources: {}
+serviceMonitor:
+  enabled: false

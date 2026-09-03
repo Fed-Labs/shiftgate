@@ -1,0 +1,193 @@
+# CI for SHIFT.
+#
+# Five lanes:
+#   1. check   — build, vet, gofmt, golangci-lint on every push/PR.
+#   2. test    — unit tests (PostgreSQL service for control-plane tests).
+#   3. e2e     — real CRIU end-to-end suite, root, ubuntu-24.04 only.
+#   4. stress  — the heavyweight scenarios (memory, process flood, latency,
+#                source death, disk exhaustion, OOM).
+#   5. desktop — frontend type-check/bundle and the Rust transport tests.
+#
+# The e2e and stress lanes are the suites that gate any "production-ready"
+# claim; the spec forbids making that claim without these cases having
+# automated coverage, so both lanes fail the build when nothing actually ran
+# rather than skipping silently.
+
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Format
+        run: |
+          files=$(gofmt -l $(find cmd internal tests -name '*.go' -type f))
+          if [ -n "$files" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$files"
+            exit 1
+          fi
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: shift-test
+          POSTGRES_DB: shift_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SHIFT_TEST_DATABASE_URL: postgres://postgres:shift-test@localhost:5432/shift_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: Unit tests
+        run: go test ./... -count=1
+      - name: Race tests
+        run: go test -race ./internal/... -count=1
+
+  e2e:
+    # The real-workload suite: real agents, real CRIU, real migrations. It
+    # runs as root on a CRIU-capable runner. ubuntu-24.04 ships a new enough
+    # kernel; the suite itself skips honestly if something is missing, but a
+    # silent skip would defeat the point — the doctor check below makes the
+    # environment explicit.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: Install CRIU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y criu
+          sudo criu check || true
+          criu --version
+      - name: End-to-end suite
+        env:
+          SHIFT_TEST_E2E: "1"
+        run: |
+          set -o pipefail
+          GO=$(which go)
+          sudo env SHIFT_TEST_E2E=1 PATH="$PATH" HOME="$HOME" "$GO" test ./tests/integration/ -run TestE2E -v -count=1 -timeout 30m 2>&1 | tee /tmp/e2e.log
+          # A lane where every test skipped is not coverage. The suite skips
+          # honestly when CRIU is unusable on the runner; surface that as a
+          # failure here rather than an empty green check.
+          passes=$(grep -c '^--- PASS' /tmp/e2e.log || true)
+          skips=$(grep -c '^--- SKIP' /tmp/e2e.log || true)
+          echo "e2e: $passes passed, $skips skipped"
+          if [ "$passes" -eq 0 ]; then
+            echo "no end-to-end test actually ran on this runner"
+            exit 1
+          fi
+
+  stress:
+    # Heavyweight scenarios. A separate job so the e2e lane stays fast; it
+    # is required for the stress-coverage claims in docs/limitations.md.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: Install CRIU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y criu
+          criu --version
+      - name: Stress suite
+        env:
+          SHIFT_TEST_E2E: "1"
+          SHIFT_TEST_STRESS: "1"
+          # CI runners have 7 GB of RAM; shrink the arena, not the scenario.
+          SHIFT_TEST_STRESS_BYTES: "268435456"
+        run: |
+          set -o pipefail
+          GO=$(which go)
+          sudo env SHIFT_TEST_E2E=1 SHIFT_TEST_STRESS=1 SHIFT_TEST_STRESS_BYTES=268435456 \
+            PATH="$PATH" HOME="$HOME" "$GO" test ./tests/integration/ -run TestStress -v -count=1 -timeout 45m 2>&1 | tee /tmp/stress.log
+          passes=$(grep -c '^--- PASS' /tmp/stress.log || true)
+          skips=$(grep -c '^--- SKIP' /tmp/stress.log || true)
+          echo "stress: $passes passed, $skips skipped"
+          if [ "$passes" -eq 0 ]; then
+            echo "no stress test actually ran on this runner"
+            exit 1
+          fi
+
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Lint
+        run: |
+          npm --prefix apps/web install
+          npm --prefix apps/web run lint
+      - name: Type-check and production build
+        run: npm --prefix apps/web run build
+
+  desktop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: dtolnay/rust-toolchain@stable
+      # Tauri v2 on Linux links against webkit2gtk-4.1 and its friends; the
+      # stock runner image ships none of them, and cargo test compiles the
+      # whole shell crate — not just the std-only transport tests.
+      - name: Install Tauri system prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - name: Frontend type-check and bundle
+        run: |
+          npm --prefix apps/desktop install
+          npm --prefix apps/desktop run build
+      - name: Transport tests
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - name: Rust shell builds
+        run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml

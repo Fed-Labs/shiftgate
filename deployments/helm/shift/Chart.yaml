@@ -1,0 +1,6 @@
+apiVersion: v2
+name: shift
+description: SHIFT control plane and optional agent deployment
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

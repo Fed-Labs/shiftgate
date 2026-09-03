@@ -1,0 +1,2021 @@
+openapi: 3.1.0
+info:
+  title: SHIFT Control Plane API
+  version: 0.1.0
+  description: |
+    Fleet metadata and orchestration API for SHIFT. Raw computational state,
+    checkpoint chunks, and workload keys remain on mutually authenticated agents.
+servers:
+  - url: http://127.0.0.1:8090
+    description: Local development server
+tags:
+  - name: Health
+  - name: Authentication
+  - name: Organizations
+  - name: Machines
+  - name: Workloads
+  - name: Migrations
+  - name: Checkpoints
+  - name: API Keys
+  - name: Compute
+  - name: Usage
+  - name: Billing
+  - name: Webhooks
+  - name: SCIM
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: health
+      responses:
+        '200':
+          description: Service health
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /metrics:
+    get:
+      tags: [Health]
+      operationId: metrics
+      responses:
+        '200':
+          description: Prometheus metrics
+          content:
+            text/plain:
+              schema: { type: string }
+  /ready:
+    get:
+      tags: [Health]
+      operationId: readiness
+      responses:
+        '200':
+          description: PostgreSQL is reachable and the service is ready
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ready] }
+        '503':
+          description: PostgreSQL is unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/auth/register:
+    post:
+      tags: [Authentication]
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Account and initial organization created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: The email's domain requires single sign-on; accounts for it arrive through the issuer }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/auth/login:
+    post:
+      tags: [Authentication]
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Session tokens
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The email's domain requires single sign-on; use the SSO flow instead }
+  /v1/auth/refresh:
+    post:
+      tags: [Authentication]
+      operationId: refresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: Rotated session tokens
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionTokens' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/auth/sso/authorize:
+    post:
+      tags: [Authentication]
+      operationId: ssoAuthorize
+      description: Starts an OIDC single sign-on login. The redirect URI must be a loopback http URL; PKCE S256 is mandatory. Returns the issuer's authorization URL plus the state the client must echo back.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SSOAuthorizeRequest' }
+      responses:
+        '200':
+          description: Authorization URL and state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SSOAuthorizeResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '502': { description: The issuer could not be reached }
+        '503': { description: Single sign-on is not configured }
+  /v1/auth/sso/token:
+    post:
+      tags: [Authentication]
+      operationId: ssoToken
+      description: Redeems the authorization code the loopback listener received. Validates the ID token's signature, issuer, audience, expiry, and nonce; links or provisions the local account; issues a session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SSOTokenRequest' }
+      responses:
+        '200':
+          description: Session tokens for the federated account
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { description: The ID token failed validation }
+        '403': { description: The account is disabled }
+        '409': { description: The account is already federated to a different identity }
+        '502': { description: The code exchange failed }
+        '503': { description: Single sign-on is not configured }
+  /v1/auth/sso/required:
+    get:
+      tags: [Authentication]
+      operationId: ssoRequired
+      description: Reports whether an email's domain is under SSO enforcement, so clients route to the issuer before asking for a password.
+      parameters:
+        - name: email
+          in: query
+          required: true
+          schema: { type: string, format: email }
+      responses:
+        '200':
+          description: Enforcement answer
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [required]
+                properties:
+                  required: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /v1/auth/logout:
+    post:
+      tags: [Authentication]
+      security: [{ bearerAuth: [] }]
+      operationId: logout
+      responses:
+        '204': { description: Session revoked }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/me:
+    get:
+      tags: [Authentication]
+      security: [{ bearerAuth: [] }]
+      operationId: me
+      responses:
+        '200':
+          description: Authenticated principal
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Principal' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/organizations:
+    get:
+      tags: [Organizations]
+      security: [{ bearerAuth: [] }]
+      operationId: listOrganizations
+      responses:
+        '200':
+          description: Organizations visible to the user
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Organization' }
+  /v1/organizations/{organizationID}/members:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    post:
+      tags: [Organizations]
+      security: [{ bearerAuth: [] }]
+      operationId: upsertMember
+      description: Requires admin or owner role. Owner cannot be assigned by this endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              properties:
+                email: { type: string, format: email }
+                role: { $ref: '#/components/schemas/Role' }
+      responses:
+        '200': { description: Membership updated }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/organizations/{organizationID}/machines:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Machines]
+      security: [{ bearerAuth: [] }]
+      operationId: listMachines
+      responses:
+        '200':
+          description: Registered machines
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Machine' }
+    post:
+      tags: [Machines]
+      security: [{ bearerAuth: [] }]
+      operationId: createMachine
+      description: Requires operator, admin, or owner role. The agent URL must be HTTPS.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMachineRequest' }
+      responses:
+        '201':
+          description: Machine registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Machine' }
+        '402': { $ref: '#/components/responses/EntitlementExceeded' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/organizations/{organizationID}/machines/{machineID}/heartbeat:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationID'
+      - $ref: '#/components/parameters/MachineID'
+    post:
+      tags: [Machines]
+      security: [{ bearerAuth: [] }]
+      operationId: machineHeartbeat
+      description: Updates inventory and online state. Requires operator role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                agent_url: { type: string, format: uri }
+                capabilities: { type: object, additionalProperties: true }
+                status: { type: string, enum: [online, offline, draining] }
+      responses:
+        '200':
+          description: Updated machine
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Machine' }
+  /v1/organizations/{organizationID}/workloads:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Workloads]
+      security: [{ bearerAuth: [] }]
+      operationId: listWorkloads
+      responses:
+        '200':
+          description: Workload metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Workload' }
+    post:
+      tags: [Workloads]
+      security: [{ bearerAuth: [] }]
+      operationId: createWorkload
+      description: Stores metadata only; execution remains on the selected agent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWorkloadRequest' }
+      responses:
+        '201':
+          description: Workload metadata created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workload' }
+  /v1/organizations/{organizationID}/workloads/{workloadID}/status:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationID'
+      - $ref: '#/components/parameters/WorkloadID'
+    post:
+      tags: [Workloads]
+      security: [{ bearerAuth: [] }]
+      operationId: updateWorkloadStatus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Updated workload
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workload' }
+  /v1/organizations/{organizationID}/migrations:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Migrations]
+      security: [{ bearerAuth: [] }]
+      operationId: listMigrations
+      responses:
+        '200':
+          description: Migration jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MigrationJob' }
+    post:
+      tags: [Migrations]
+      security: [{ bearerAuth: [] }]
+      operationId: createMigration
+      description: Creates a metadata job. Agents execute the actual state transfer over their mutually authenticated peer channel.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMigrationRequest' }
+      responses:
+        '202':
+          description: Migration queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MigrationJob' }
+  /v1/organizations/{organizationID}/audit:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Organizations]
+      security: [{ bearerAuth: [] }]
+      operationId: listAuditEvents
+      description: Requires admin or owner role.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: Audit events
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEvent' }
+  /v1/organizations/{organizationID}/machines/capability:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Machines]
+      security: [{ bearerAuth: [] }]
+      operationId: queryMachinesByCapability
+      description: >
+        Fleet query answered from the relational projection of each machine's
+        JSONB capability document. Only scalar capabilities (number, text,
+        boolean) are projected; objects and arrays are not queryable.
+      parameters:
+        - name: capability
+          in: query
+          required: true
+          schema: { type: string, maxLength: 256 }
+        - name: kind
+          in: query
+          required: true
+          schema: { type: string, enum: [number, text, boolean] }
+        - name: minimum
+          in: query
+          required: false
+          description: Value floor; valid only with kind=number.
+          schema: { type: number, format: double }
+      responses:
+        '200':
+          description: Machines reporting the capability, numbers ordered by value descending
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Machine' }
+        '400':
+          description: Missing capability, unknown kind, or minimum without kind=number
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /v1/organizations/{organizationID}/retention:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Organizations]
+      security: [{ bearerAuth: [] }]
+      operationId: getRetentionPolicy
+      description: Requires admin or owner role. Returns defaults when no policy was configured.
+      responses:
+        '200':
+          description: Retention windows in days
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionPolicy' }
+    put:
+      tags: [Organizations]
+      security: [{ bearerAuth: [] }]
+      operationId: setRetentionPolicy
+      description: >
+        Requires admin or owner role. Omitted fields keep their current value;
+        zero is the deliberate keep-forever policy. Changes are audited and
+        take effect on the next enforcement sweep.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetRetentionPolicyRequest' }
+      responses:
+        '200':
+          description: Stored policy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetentionPolicy' }
+        '400':
+          description: Unknown field or a window outside 0-36500 days
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /v1/organizations/{organizationID}/sso:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Organizations]
+      security: [{ bearerAuth: [] }]
+      operationId: getOrganizationSSO
+      description: Requires admin or owner role. Reports the organization's SSO enforcement state.
+      responses:
+        '200':
+          description: Enforcement state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrganizationSSO' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Organizations]
+      security: [{ bearerAuth: [] }]
+      operationId: setOrganizationSSO
+      description: >
+        Requires admin or owner role. Enforcing SSO claims an email domain:
+        from that moment the domain's accounts authenticate through the
+        configured OIDC issuer and local passwords stop working for them. A
+        domain can be claimed by one organization at a time. Disabling clears
+        the claim. Requires the control plane to have an OIDC issuer
+        configured.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrganizationSSO' }
+      responses:
+        '200':
+          description: Stored enforcement state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrganizationSSO' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { description: Another organization already claims this domain }
+        '503': { description: Single sign-on is not configured }
+  /v1/organizations/{organizationID}/entitlement:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Billing]
+      security: [{ bearerAuth: [] }]
+      operationId: getEntitlement
+      responses:
+        '200':
+          description: Current server-side limits
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entitlement' }
+  /v1/organizations/{organizationID}/api-keys:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [API Keys]
+      security: [{ bearerAuth: [] }]
+      operationId: listAPIKeys
+      description: Lists API-key metadata. Secrets are never returned after creation.
+      responses:
+        '200':
+          description: API keys
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/APIKey' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [API Keys]
+      security: [{ bearerAuth: [] }]
+      operationId: createAPIKey
+      description: Requires admin or owner role. The returned secret is shown once and is stored only as a digest.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAPIKeyRequest' }
+      responses:
+        '201':
+          description: API key and one-time secret
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/APIKeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/organizations/{organizationID}/api-keys/{keyID}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationID'
+      - $ref: '#/components/parameters/APIKeyID'
+    delete:
+      tags: [API Keys]
+      security: [{ bearerAuth: [] }]
+      operationId: revokeAPIKey
+      responses:
+        '204': { description: API key revoked }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: API key was not found or already revoked }
+  /v1/organizations/{organizationID}/checkpoints:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Checkpoints]
+      security: [{ bearerAuth: [] }]
+      operationId: listCheckpoints
+      parameters:
+        - name: workload_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Checkpoint metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Checkpoint' }
+    post:
+      tags: [Checkpoints]
+      security: [{ bearerAuth: [] }]
+      operationId: registerCheckpoint
+      description: Registers metadata produced by an agent. Raw checkpoint chunks remain on agents.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCheckpointRequest' }
+      responses:
+        '201':
+          description: Checkpoint metadata created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Checkpoint' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '402': { $ref: '#/components/responses/EntitlementExceeded' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '404': { description: Workload or machine was not found }
+        '422': { description: Incremental parent is unavailable or belongs to another workload }
+  /v1/organizations/{organizationID}/migrations/{migrationID}/events:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationID'
+      - $ref: '#/components/parameters/MigrationID'
+    get:
+      tags: [Migrations]
+      security: [{ bearerAuth: [] }]
+      operationId: listMigrationEvents
+      responses:
+        '200':
+          description: Ordered migration stage events
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MigrationEvent' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/organizations/{organizationID}/usage:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Usage]
+      security: [{ bearerAuth: [] }]
+      operationId: listUsage
+      parameters:
+        - name: from
+          in: query
+          description: Inclusive ISO-8601 calendar date. Defaults to one month ago.
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          description: Exclusive ISO-8601 calendar date. Defaults to tomorrow.
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Usage records
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UsageSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/organizations/{organizationID}/machines/{machineID}/commands:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationID'
+      - $ref: '#/components/parameters/MachineID'
+    post:
+      tags: [Machines]
+      security: [{ bearerAuth: [] }]
+      operationId: dispatchAgentCommand
+      description: |
+        Dispatches one action to the machine's agent over mutually authenticated
+        HTTPS and records what the agent reported. The control plane performs no
+        checkpoint or migration work itself; it only reconciles the agent's result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentCommandRequest' }
+      responses:
+        '200':
+          description: Agent accepted the command and the result was reconciled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentCommandResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '402': { $ref: '#/components/responses/EntitlementExceeded' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: Machine, workload, checkpoint, or migration destination was not found }
+        '409': { description: Machine has no reachable agent URL, or the agent reported a conflict }
+        '502':
+          description: Agent was unreachable, refused the command, or the result could not be reconciled
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+  /v1/organizations/{organizationID}/migrations/{migrationID}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationID'
+      - $ref: '#/components/parameters/MigrationID'
+    post:
+      tags: [Migrations]
+      security: [{ bearerAuth: [] }]
+      operationId: cancelMigration
+      description: |
+        Asks the source agent to cancel an active migration, then records the
+        cancellation. The agent is the authority on whether the workload was
+        rolled back, so a cancellation is only recorded once the agent accepted it.
+      responses:
+        '202':
+          description: Source agent accepted the cancellation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MigrationJob' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: Migration was not found }
+        '409': { description: Migration is not active, carries no agent identifier, or its source agent is unavailable }
+        '500':
+          description: Stored migration progress could not be read
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+        '502':
+          description: Source agent was unreachable or the cancellation could not be reconciled
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+  /v1/organizations/{organizationID}/reconcile:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    post:
+      tags: [Workloads]
+      security: [{ bearerAuth: [] }]
+      operationId: reconcileFleet
+      description: |
+        Polls every enabled machine's agent for its workloads and checkpoint
+        manifests and writes the observed state back. Per-resource failures are
+        reported instead of aborting the sweep, so one unreachable machine does
+        not hide the state of the rest of the fleet.
+      responses:
+        '200':
+          description: Reconciliation sweep finished, including any per-resource failures
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconcileResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500':
+          description: Machine registry could not be read
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+  /v1/organizations/{organizationID}/compute/offers:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Compute]
+      security: [{ bearerAuth: [] }]
+      operationId: listComputeOffers
+      description: |
+        Lists the offers this organization publishes, including withdrawn ones.
+        Use the inventory endpoint to see what the organization may schedule
+        against, which is a different set.
+      responses:
+        '200':
+          description: Offers published by this organization
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ComputeOffer' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500':
+          description: Offers could not be read or decoded
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+    post:
+      tags: [Compute]
+      security: [{ bearerAuth: [] }]
+      operationId: publishComputeOffer
+      description: |
+        Exposes a registered machine's resources to the scheduler. Machine name,
+        agent URL, hardware capabilities, and presence come from the control
+        plane's machine registry rather than from this body, so an operator
+        cannot advertise hardware a machine does not have. A claimed trust tier
+        is clamped to the evidence the control plane can actually produce, and a
+        public offer requires the server-side compute trading gate to be on.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishComputeOfferRequest' }
+      responses:
+        '201':
+          description: Offer published
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ComputeOffer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: Machine is not registered in this organization }
+        '409': { description: Public trading is disabled server-side, the machine is disabled, or the offer already exists }
+        '500':
+          description: Offer identifier could not be generated or machine capabilities were unreadable
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+  /v1/organizations/{organizationID}/compute/offers/{offerID}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationID'
+      - $ref: '#/components/parameters/ComputeOfferID'
+    delete:
+      tags: [Compute]
+      security: [{ bearerAuth: [] }]
+      operationId: withdrawComputeOffer
+      description: |
+        Withdraws an offer so the scheduler stops selecting it. Live reservations
+        already held against the offer are unaffected: capacity is handed back
+        through the reservation state machine, never by deleting the offer.
+      responses:
+        '200':
+          description: Offer withdrawn
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ComputeOffer' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: Offer was not found }
+        '500':
+          description: Offer could not be withdrawn
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+  /v1/organizations/{organizationID}/compute/inventory:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Compute]
+      security: [{ bearerAuth: [] }]
+      operationId: computeInventory
+      description: |
+        Returns the offers this organization may schedule against, together with
+        the state of the public-trading gate so a client never has to guess why
+        another organization's machines are absent. Each offer reports the
+        capacity left after live reservations.
+      responses:
+        '200':
+          description: Schedulable inventory and the state of the trading gate
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ComputeInventory' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500':
+          description: Inventory could not be assembled
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+  /v1/organizations/{organizationID}/compute/placements:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    post:
+      tags: [Compute]
+      security: [{ bearerAuth: [] }]
+      operationId: computePlacement
+      description: |
+        Scores the schedulable inventory for one workload and returns both the
+        ranked candidates and a typed rejection for every offer that was filtered
+        out. Placement is advisory: it holds no capacity. A checkpoint identifier
+        is resolved server-side into the stored manifest, so restore
+        compatibility is checked against state that was actually captured rather
+        than against client claims.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlacementRequest' }
+      responses:
+        '200':
+          description: Ranked candidates and the reason each rejected offer was excluded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Placement' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: Referenced checkpoint was not found }
+        '500':
+          description: Inventory or checkpoint manifest could not be read
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+  /v1/organizations/{organizationID}/compute/reservations:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Compute]
+      security: [{ bearerAuth: [] }]
+      operationId: listComputeReservations
+      description: |
+        Lists reservations held by this organization. Lapsed holds are expired
+        before the list is assembled, so the returned states never overstate how
+        much capacity is committed.
+      parameters:
+        - name: offer_id
+          in: query
+          description: Restricts the list to holds on one offer.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Reservations held by this organization
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ComputeReservation' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500':
+          description: Reservations could not be expired, read, or decoded
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+    post:
+      tags: [Compute]
+      security: [{ bearerAuth: [] }]
+      operationId: createComputeReservation
+      description: |
+        Holds capacity on one offer. The offer row is locked, lapsed holds are
+        expired, and the real scheduler is re-run against the locked offer, so a
+        hold is never granted on terms a placement would have refused and two
+        concurrent migrations cannot both plan for the same capacity. Every
+        reservation expires: the default hold is 15 minutes and the ceiling is 24
+        hours, so abandoned capacity is always reclaimed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateComputeReservationRequest' }
+      responses:
+        '201':
+          description: Capacity reserved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ComputeReservation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: Offer was not found }
+        '409': { description: Requested capacity is no longer available, or the reservation already exists }
+        '422':
+          description: Scheduler refused the offer on policy grounds; the body carries the rejection code
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Error' } }
+  /v1/organizations/{organizationID}/compute/reservations/{reservationID}/state:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationID'
+      - $ref: '#/components/parameters/ComputeReservationID'
+    post:
+      tags: [Compute]
+      security: [{ bearerAuth: [] }]
+      operationId: setComputeReservationState
+      description: |
+        Moves a reservation through its state machine. Released and expired are
+        terminal: capacity that was handed back is never taken again under the
+        same reservation identifier.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ComputeReservationStateRequest' }
+      responses:
+        '200':
+          description: Reservation state changed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ComputeReservation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: Reservation was not found }
+        '409': { description: Requested transition is not legal from the current state }
+  /v1/plans:
+    get:
+      tags: [Billing]
+      operationId: listPlans
+      description: Returns the public plan catalog — the same plans and limits the control plane enforces entitlements from.
+      responses:
+        '200':
+          description: Plan catalog
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Plan' }
+  /v1/organizations/{organizationID}/billing/checkout:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    post:
+      tags: [Billing]
+      security: [{ bearerAuth: [] }]
+      operationId: startCheckout
+      description: Requires admin or owner role. Opens a Stripe-hosted checkout session for a catalog plan. The session carries only the organization id and plan key as metadata; limits are resolved server-side when the signed subscription webhook arrives.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckoutRequest' }
+      responses:
+        '200':
+          description: Checkout session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckoutSession' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { description: Stripe rejected the checkout session request }
+        '503': { description: Billing is not configured, or the plan has no Stripe price }
+  /v1/organizations/{organizationID}/billing/portal:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    post:
+      tags: [Billing]
+      security: [{ bearerAuth: [] }]
+      operationId: openBillingPortal
+      description: Requires admin or owner role. Opens a Stripe billing-portal session for the organization's stored customer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PortalRequest' }
+      responses:
+        '200':
+          description: Billing portal session
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url]
+                properties:
+                  url: { type: string, format: uri }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { description: Stripe rejected the billing-portal session request }
+        '503': { description: Billing is not configured }
+  /v1/webhooks/stripe:
+    post:
+      tags: [Webhooks]
+      operationId: stripeWebhook
+      description: Verifies Stripe-Signature and processes subscription events idempotently.
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { type: object, additionalProperties: true } }
+      responses:
+        '200': { description: Event processed, ignored, or already processed }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '501': { description: Billing is disabled }
+  /v1/scim/v2/ServiceProviderConfig:
+    get:
+      tags: [SCIM]
+      security: [{ bearerAuth: [] }]
+      operationId: scimServiceProviderConfig
+      description: SCIM v2 service provider configuration. Requires an API key with the scim scope.
+      responses:
+        '200':
+          description: Capability statements
+          content:
+            application/scim+json:
+              schema: { $ref: '#/components/schemas/SCIMServiceProviderConfig' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The credential cannot provision (requires an API key with the scim scope) }
+  /v1/scim/v2/ResourceTypes:
+    get:
+      tags: [SCIM]
+      security: [{ bearerAuth: [] }]
+      operationId: scimResourceTypes
+      description: The resource types this SCIM implementation serves. Users only; Groups is not implemented.
+      responses:
+        '200':
+          description: Resource types
+          content:
+            application/scim+json: { schema: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The credential cannot provision }
+  /v1/scim/v2/Schemas:
+    get:
+      tags: [SCIM]
+      security: [{ bearerAuth: [] }]
+      operationId: scimSchemas
+      description: The SCIM schema definitions, stating exactly which attributes are stored.
+      responses:
+        '200':
+          description: Schema definitions
+          content:
+            application/scim+json: { schema: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The credential cannot provision }
+  /v1/scim/v2/Users:
+    get:
+      tags: [SCIM]
+      security: [{ bearerAuth: [] }]
+      operationId: scimListUsers
+      description: >
+        Lists provisioned users in the API key's organization. Filters support
+        eq, co, sw, ew, and pr over userName, emails.value, displayName,
+        externalId, and active, joined by "and". Responses use the ListResponse
+        shape with startIndex/count pagination.
+      parameters:
+        - name: filter
+          in: query
+          required: false
+          schema: { type: string }
+          example: 'userName sw "dev-" and active eq true'
+        - name: startIndex
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: count
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        '200':
+          description: Provisioned users
+          content:
+            application/scim+json:
+              schema: { $ref: '#/components/schemas/SCIMListResponse' }
+        '400': { description: Unsupported filter (SCIM error shape) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The credential cannot provision }
+    post:
+      tags: [SCIM]
+      security: [{ bearerAuth: [] }]
+      operationId: scimCreateUser
+      description: Provisions a user. The account is created with no usable password and joins the organization as a viewer.
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema: { $ref: '#/components/schemas/SCIMUser' }
+      responses:
+        '201':
+          description: Created user
+          content:
+            application/scim+json:
+              schema: { $ref: '#/components/schemas/SCIMUser' }
+        '400': { description: Invalid user (SCIM error shape) }
+        '409': { description: Email or external id already exists }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The credential cannot provision }
+  /v1/scim/v2/Users/{userID}:
+    parameters: [{ $ref: '#/components/parameters/SCIMUserID' }]
+    get:
+      tags: [SCIM]
+      security: [{ bearerAuth: [] }]
+      operationId: scimGetUser
+      responses:
+        '200':
+          description: One provisioned user
+          content:
+            application/scim+json:
+              schema: { $ref: '#/components/schemas/SCIMUser' }
+        '404': { description: Not found (SCIM error shape) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The credential cannot provision }
+    put:
+      tags: [SCIM]
+      security: [{ bearerAuth: [] }]
+      operationId: scimReplaceUser
+      description: Full replacement of the idP-controlled fields.
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema: { $ref: '#/components/schemas/SCIMUser' }
+      responses:
+        '200':
+          description: Replaced user
+          content:
+            application/scim+json:
+              schema: { $ref: '#/components/schemas/SCIMUser' }
+        '404': { description: Not found (SCIM error shape) }
+        '409': { description: Email or external id already exists }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The credential cannot provision }
+    patch:
+      tags: [SCIM]
+      security: [{ bearerAuth: [] }]
+      operationId: scimPatchUser
+      description: >
+        Partial update. Only the "replace" operation is supported, on active,
+        displayName, externalId, and userName. Unsupported operations and paths
+        are rejected rather than silently dropped.
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema: { $ref: '#/components/schemas/SCIMPatchRequest' }
+      responses:
+        '200':
+          description: Patched user
+          content:
+            application/scim+json:
+              schema: { $ref: '#/components/schemas/SCIMUser' }
+        '400': { description: Unsupported operation or path (SCIM error shape) }
+        '404': { description: Not found (SCIM error shape) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The credential cannot provision }
+    delete:
+      tags: [SCIM]
+      security: [{ bearerAuth: [] }]
+      operationId: scimDeleteUser
+      description: >
+        SCIM delete deactivates the account: live sessions are revoked in the
+        same transaction, and the row survives so audit trails keep pointing
+        at a real account.
+      responses:
+        '204': { description: Deactivated }
+        '404': { description: Not found (SCIM error shape) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The credential cannot provision }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: SHIFT access token
+  parameters:
+    OrganizationID:
+      name: organizationID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SCIMUserID:
+      name: userID
+      in: path
+      required: true
+      schema: { type: string }
+      description: The SHIFT user id as returned in the SCIM User resource.
+    MachineID:
+      name: machineID
+      in: path
+      required: true
+      schema: { type: string }
+    WorkloadID:
+      name: workloadID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MigrationID:
+      name: migrationID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    APIKeyID:
+      name: keyID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ComputeOfferID:
+      name: offerID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ComputeReservationID:
+      name: reservationID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    BadRequest:
+      description: Invalid request
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: Authentication failed
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Authorization failed
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: Resource conflict
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    EntitlementExceeded:
+      description: Server-side plan limit exceeded
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        request_id: { type: string }
+    Health:
+      type: object
+      required: [status, version, started_at, uptime]
+      properties:
+        status: { type: string, enum: [ok] }
+        version: { type: string }
+        started_at: { type: string, format: date-time }
+        uptime: { type: string }
+    Role:
+      type: string
+      enum: [owner, admin, operator, viewer]
+    RegisterRequest:
+      type: object
+      required: [email, password, display_name]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 12, writeOnly: true }
+        display_name: { type: string, maxLength: 200 }
+        organization: { type: string, maxLength: 200 }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, writeOnly: true }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string, writeOnly: true }
+    SessionTokens:
+      type: object
+      required: [session_id, access_token, refresh_token, token_type, expires_at]
+      properties:
+        session_id: { type: string, format: uuid }
+        access_token: { type: string, writeOnly: true }
+        refresh_token: { type: string, writeOnly: true }
+        token_type: { type: string, enum: [Bearer] }
+        expires_at: { type: string, format: date-time }
+    User:
+      type: object
+      required: [id, email, display_name, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        disabled_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    Organization:
+      type: object
+      required: [id, name, role, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        created_at: { type: string, format: date-time }
+    Principal:
+      type: object
+      required: [session_id, user_id, email, display_name]
+      properties:
+        session_id: { type: string }
+        user_id: { type: string }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        organization_id: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        api_key_id: { type: string }
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/APIKeyScope' }
+    RegisterResponse:
+      type: object
+      required: [user, organization, tokens]
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        organization: { $ref: '#/components/schemas/Organization' }
+        tokens: { $ref: '#/components/schemas/SessionTokens' }
+    LoginResponse:
+      type: object
+      required: [user, tokens]
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        tokens: { $ref: '#/components/schemas/SessionTokens' }
+    CreateMachineRequest:
+      type: object
+      required: [machine_id, name, agent_url]
+      properties:
+        machine_id: { type: string, maxLength: 256 }
+        name: { type: string, maxLength: 200 }
+        agent_url: { type: string, format: uri, pattern: '^https://' }
+        capabilities: { type: object, additionalProperties: true }
+    Machine:
+      type: object
+      required: [id, organization_id, machine_id, name, agent_url, capabilities, status, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        machine_id: { type: string }
+        name: { type: string }
+        agent_url: { type: string, format: uri }
+        capabilities: { type: object, additionalProperties: true }
+        status: { type: string, enum: [online, offline, draining, disabled] }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreateWorkloadRequest:
+      type: object
+      required: [name, spec]
+      properties:
+        machine_id: { type: string }
+        name: { type: string, maxLength: 200 }
+        spec: { type: object, additionalProperties: true }
+        status: { type: object, additionalProperties: true }
+    Workload:
+      type: object
+      required: [id, organization_id, name, spec, status, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        machine_id: { type: string }
+        name: { type: string }
+        spec: { type: object, additionalProperties: true }
+        status: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreateMigrationRequest:
+      type: object
+      required: [workload_id, source_machine_id, destination_machine_id]
+      properties:
+        workload_id: { type: string, format: uuid }
+        source_machine_id: { type: string }
+        destination_machine_id: { type: string }
+        mode: { type: string, enum: [cold, live], default: cold }
+    MigrationJob:
+      type: object
+      required: [id, organization_id, workload_id, source_machine_id, destination_machine_id, mode, status, progress, created_by, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        workload_id: { type: string, format: uuid }
+        source_machine_id: { type: string }
+        destination_machine_id: { type: string }
+        mode: { type: string, enum: [cold, live] }
+        status: { type: string, enum: [queued, running, completed, failed, cancelled] }
+        progress: { type: object, additionalProperties: true }
+        error_message: { type: string }
+        created_by: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time, nullable: true }
+    Entitlement:
+      type: object
+      required: [organization_id, plan, status, max_storage_bytes, used_storage_bytes, max_machines]
+      properties:
+        organization_id: { type: string, format: uuid }
+        plan: { type: string, enum: [free, pro, business, enterprise, paid] }
+        status: { type: string }
+        max_storage_bytes: { type: integer, format: int64, description: -1 means unlimited }
+        used_storage_bytes: { type: integer, format: int64, minimum: 0 }
+        max_machines: { type: integer, description: -1 means unlimited }
+        stripe_customer_id: { type: string }
+    Plan:
+      type: object
+      required: [key, name, price_cents, description, features, max_machines, max_storage_bytes]
+      properties:
+        key: { type: string, enum: [free, pro, business, enterprise] }
+        name: { type: string }
+        price_cents: { type: integer, format: int64, description: Monthly price in cents; 0 is free and -1 is custom }
+        per_seat: { type: boolean, description: Present and true when the price is charged per seat }
+        description: { type: string }
+        features:
+          type: array
+          items: { type: string }
+        max_machines: { type: integer, description: -1 means unlimited }
+        max_storage_bytes: { type: integer, format: int64, description: -1 means unlimited }
+    CheckoutRequest:
+      type: object
+      required: [plan, success_url, cancel_url]
+      properties:
+        plan: { type: string, enum: [pro, business] }
+        success_url: { type: string, format: uri }
+        cancel_url: { type: string, format: uri }
+        seats: { type: integer, minimum: 1, description: Seat count for per-seat plans }
+    CheckoutSession:
+      type: object
+      required: [url, session_id, plan]
+      properties:
+        url: { type: string, format: uri }
+        session_id: { type: string }
+        plan: { type: string }
+    PortalRequest:
+      type: object
+      required: [return_url]
+      properties:
+        return_url: { type: string, format: uri }
+    AuditEvent:
+      type: object
+      required: [id, action, resource_type, metadata, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string }
+        actor_user_id: { type: string }
+        action: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        request_id: { type: string }
+        remote_addr: { type: string }
+        created_at: { type: string, format: date-time }
+    APIKeyScope:
+      type: string
+      enum: [read, operate, admin, machines, workloads, migrations, checkpoints, compute, scim]
+      description: read/operate/admin are broad grants; resource scopes are limited to one resource family; scim allows directory provisioning through the SCIM v2 endpoints.
+    CreateAPIKeyRequest:
+      type: object
+      required: [name, scopes]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 16
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/APIKeyScope' }
+        expires_at: { type: string, format: date-time, nullable: true }
+    APIKey:
+      type: object
+      required: [id, organization_id, name, prefix, scopes, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string, description: Non-secret display prefix }
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/APIKeyScope' }
+        expires_at: { type: string, format: date-time, nullable: true }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    APIKeyCreated:
+      allOf:
+        - $ref: '#/components/schemas/APIKey'
+        - type: object
+          required: [secret]
+          properties:
+            secret: { type: string, writeOnly: true, description: Store immediately; never returned again }
+    RetentionPolicy:
+      type: object
+      required: [organization_id, audit_retention_days, checkpoint_retention_days, deleted_storage_retention_days, updated_at]
+      properties:
+        organization_id: { type: string, format: uuid }
+        audit_retention_days: { type: integer, minimum: 0, maximum: 36500, description: 0 keeps audit events forever }
+        checkpoint_retention_days: { type: integer, minimum: 0, maximum: 36500, description: 0 keeps checkpoints forever; expired checkpoints are marked deleted, their rows survive }
+        deleted_storage_retention_days: { type: integer, minimum: 0, maximum: 36500, description: Grace period after soft deletion before storage-object rows are purged }
+        updated_at: { type: string, format: date-time }
+    SetRetentionPolicyRequest:
+      type: object
+      description: Every field is optional; omitted fields keep their current value while zero means keep forever.
+      minProperties: 1
+      properties:
+        audit_retention_days: { type: integer, minimum: 0, maximum: 36500 }
+        checkpoint_retention_days: { type: integer, minimum: 0, maximum: 36500 }
+        deleted_storage_retention_days: { type: integer, minimum: 0, maximum: 36500 }
+    SSOAuthorizeRequest:
+      type: object
+      required: [email, redirect_uri, code_challenge]
+      properties:
+        email: { type: string, format: email }
+        redirect_uri: { type: string, description: Loopback http URL only (127.0.0.1, localhost, or ::1), per RFC 8252 }
+        code_challenge: { type: string, minLength: 43, maxLength: 128, description: S256 challenge of the client's PKCE verifier }
+    SSOAuthorizeResponse:
+      type: object
+      required: [authorization_url, state]
+      properties:
+        authorization_url: { type: string, format: uri, description: The issuer's authorization endpoint with PKCE, state, and nonce applied }
+        state: { type: string, description: The state the issuer will echo back; send it again when redeeming the code }
+    SSOTokenRequest:
+      type: object
+      required: [code, state, code_verifier, redirect_uri]
+      properties:
+        code: { type: string, minLength: 16 }
+        state: { type: string }
+        code_verifier: { type: string, minLength: 43, maxLength: 128 }
+        redirect_uri: { type: string, description: Must byte-match the one that started the flow }
+    OrganizationSSO:
+      type: object
+      required: [enforced, email_domain]
+      properties:
+        enforced: { type: boolean }
+        email_domain: { type: string, description: The claimed domain; empty when enforcement is off }
+    SCIMServiceProviderConfig:
+      type: object
+      description: Capability statements per RFC 7643 §8.5. patch, filter, and authentication are supported; bulk, changePassword, sort, and etag are not.
+      additionalProperties: true
+    SCIMUser:
+      type: object
+      description: The SCIM v2 User as this control plane stores it. userName is the account's email — one address per account.
+      properties:
+        schemas: { type: array, items: { type: string }, example: ['urn:ietf:params:scim:schemas:core:2.0:User'] }
+        id: { type: string, readOnly: true }
+        externalId: { type: string, maxLength: 256 }
+        userName: { type: string, format: email }
+        displayName: { type: string, maxLength: 200 }
+        active: { type: boolean }
+        emails:
+          type: array
+          items:
+            type: object
+            properties:
+              value: { type: string, format: email }
+              primary: { type: boolean }
+        meta: { type: object, additionalProperties: true, readOnly: true }
+    SCIMListResponse:
+      type: object
+      required: [schemas, totalResults, startIndex, itemsPerPage, Resources]
+      properties:
+        schemas: { type: array, items: { type: string } }
+        totalResults: { type: integer }
+        startIndex: { type: integer }
+        itemsPerPage: { type: integer }
+        Resources: { type: array, items: { $ref: '#/components/schemas/SCIMUser' } }
+    SCIMPatchRequest:
+      type: object
+      required: [Operations]
+      properties:
+        schemas: { type: array, items: { type: string } }
+        Operations:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [op, path]
+            properties:
+              op: { type: string, enum: [replace], description: Only replace is supported }
+              path: { type: string, enum: [active, displayName, externalId, userName] }
+              value: { description: The replacement value — boolean for active, string for the rest }
+    CreateCheckpointRequest:
+      type: object
+      required: [id, workload_id, machine_id, kind, plain_bytes, stored_bytes, chunk_count]
+      properties:
+        id: { type: string, format: uuid }
+        workload_id: { type: string, format: uuid }
+        machine_id: { type: string }
+        kind: { type: string, enum: [full, incremental] }
+        parent_id: { type: string, format: uuid }
+        manifest: { type: object, additionalProperties: true }
+        plain_bytes: { type: integer, format: int64, minimum: 0 }
+        stored_bytes: { type: integer, format: int64, minimum: 0 }
+        chunk_count: { type: integer, minimum: 0 }
+    Checkpoint:
+      type: object
+      required: [id, organization_id, workload_id, machine_id, kind, manifest, plain_bytes, stored_bytes, chunk_count, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        workload_id: { type: string, format: uuid }
+        machine_id: { type: string }
+        kind: { type: string, enum: [full, incremental] }
+        parent_id: { type: string, format: uuid }
+        manifest: { type: object, additionalProperties: true }
+        plain_bytes: { type: integer, format: int64, minimum: 0 }
+        stored_bytes: { type: integer, format: int64, minimum: 0 }
+        chunk_count: { type: integer, minimum: 0 }
+        status: { type: string, enum: [creating, available, corrupt, deleted] }
+        created_at: { type: string, format: date-time }
+        deleted_at: { type: string, format: date-time, nullable: true }
+    MigrationEvent:
+      type: object
+      required: [id, sequence, stage, message, progress, bytes_done, bytes_total, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        sequence: { type: integer, format: int64 }
+        stage: { type: string }
+        message: { type: string }
+        progress: { type: number, format: double, minimum: 0, maximum: 1 }
+        bytes_done: { type: integer, format: int64, minimum: 0 }
+        bytes_total: { type: integer, format: int64, minimum: 0 }
+        created_at: { type: string, format: date-time }
+    UsageSummary:
+      type: object
+      required: [kind, quantity, period_start, period_end]
+      properties:
+        kind: { type: string, enum: [checkpoint_storage, transfer_bytes, machine_hours, api_requests] }
+        quantity: { type: integer, format: int64, minimum: 0 }
+        period_start: { type: string, format: date }
+        period_end: { type: string, format: date }
+    ComputeResources:
+      type: object
+      description: Resource quantities. CPU counts and network rates are fractional so shared machines can be expressed exactly.
+      properties:
+        cpu_count: { type: number, format: double, minimum: 0 }
+        memory_bytes: { type: integer, format: int64, minimum: 0 }
+        storage_bytes: { type: integer, format: int64, minimum: 0 }
+        network_mbps: { type: number, format: double, minimum: 0 }
+        gpus:
+          type: array
+          items: { type: object, additionalProperties: true }
+    ComputePricing:
+      type: object
+      description: |
+        Prices in integer micro-units of the stated currency, where one micro-unit
+        is one millionth of a currency unit. Money is never represented as a
+        binary floating-point number.
+      required: [currency]
+      properties:
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        cpu_hour_micros: { type: integer, format: int64, minimum: 0 }
+        memory_gib_hour_micros: { type: integer, format: int64, minimum: 0 }
+        storage_gib_hour_micros: { type: integer, format: int64, minimum: 0 }
+        gpu_hour_micros: { type: integer, format: int64, minimum: 0 }
+        egress_gib_micros: { type: integer, format: int64, minimum: 0 }
+        minimum_charge_micros: { type: integer, format: int64, minimum: 0 }
+        billing_increment_hours: { type: integer, format: int64, minimum: 0 }
+    ComputeGeography:
+      type: object
+      properties:
+        region: { type: string }
+        country: { type: string, description: ISO 3166-1 alpha-2 country code. }
+        zone: { type: string }
+    ComputeVisibility:
+      type: string
+      enum: [private, organization, public]
+      description: |
+        private is never schedulable by anyone else; organization is schedulable
+        inside the owning organization; public additionally requires the
+        server-side compute trading gate.
+    ComputeTrustTier:
+      type: string
+      enum: [unverified, community, organization, verified]
+      description: |
+        How much the control plane can substantiate about the machine behind an
+        offer. A claimed tier is clamped to what the control plane can prove: a
+        publisher cannot promote its own trust.
+    ComputeOfferStatus:
+      type: string
+      enum: [available, reserved, draining, withdrawn]
+    ComputePolicy:
+      type: object
+      required: [visibility]
+      properties:
+        visibility: { $ref: '#/components/schemas/ComputeVisibility' }
+        allowed_organizations:
+          type: array
+          items: { type: string, format: uuid }
+        denied_organizations:
+          type: array
+          items: { type: string, format: uuid }
+        allowed_countries:
+          type: array
+          items: { type: string }
+        max_state_bytes: { type: integer, format: int64, minimum: 0 }
+        max_duration_hours: { type: integer, format: int64, minimum: 0 }
+        require_encrypted_state: { type: boolean }
+        gpu_sharing_allowed: { type: boolean }
+    ComputeAvailability:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/ComputeOfferStatus' }
+        window_from: { type: string, format: date-time, nullable: true }
+        window_to: { type: string, format: date-time, nullable: true }
+        last_seen_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Machine presence, taken from the registry. An offer whose machine stopped reporting is rejected as stale.
+    LatencySample:
+      type: object
+      required: [observer, round_trip_ms, measured_at]
+      properties:
+        observer: { type: string, description: 'A machine id, "region:<region>", or "country:<code>".' }
+        round_trip_ms: { type: number, format: double, minimum: 0 }
+        measured_at: { type: string, format: date-time }
+        sample_count: { type: integer, minimum: 0 }
+    PublishComputeOfferRequest:
+      type: object
+      required: [machine_id, exposed, pricing]
+      properties:
+        machine_id: { type: string, description: Must name a machine already registered in this organization. }
+        exposed: { $ref: '#/components/schemas/ComputeResources' }
+        pricing: { $ref: '#/components/schemas/ComputePricing' }
+        geography: { $ref: '#/components/schemas/ComputeGeography' }
+        policy: { $ref: '#/components/schemas/ComputePolicy' }
+        trust:
+          allOf: [{ $ref: '#/components/schemas/ComputeTrustTier' }]
+          description: A claim only. The control plane clamps it to the tier it can substantiate.
+        status: { $ref: '#/components/schemas/ComputeOfferStatus' }
+        window_from: { type: string, format: date-time, nullable: true }
+        window_to: { type: string, format: date-time, nullable: true }
+        latency:
+          type: array
+          items: { $ref: '#/components/schemas/LatencySample' }
+    ComputeOffer:
+      type: object
+      required: [id, organization_id, machine_id, exposed, committed, available, pricing, geography, policy, availability, trust, identity_verified, capabilities, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        machine_id: { type: string }
+        machine_name: { type: string }
+        agent_url: { type: string, format: uri }
+        exposed: { $ref: '#/components/schemas/ComputeResources' }
+        committed:
+          allOf: [{ $ref: '#/components/schemas/ComputeResources' }]
+          description: Capacity held by live reservations.
+        available:
+          allOf: [{ $ref: '#/components/schemas/ComputeResources' }]
+          description: Exposure minus live reservations. This is the figure to schedule against.
+        pricing: { $ref: '#/components/schemas/ComputePricing' }
+        geography: { $ref: '#/components/schemas/ComputeGeography' }
+        policy: { $ref: '#/components/schemas/ComputePolicy' }
+        availability: { $ref: '#/components/schemas/ComputeAvailability' }
+        trust: { $ref: '#/components/schemas/ComputeTrustTier' }
+        identity_verified:
+          type: boolean
+          description: True only when the machine's signed identity was actually checked. Never inferred from the offer itself.
+        capabilities:
+          type: object
+          additionalProperties: true
+          description: Hardware and CRIU capabilities as reported by the machine registry, not by the publisher.
+        latency:
+          type: array
+          items: { $ref: '#/components/schemas/LatencySample' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        withdrawn_at: { type: string, format: date-time, nullable: true }
+    ComputeInventory:
+      type: object
+      required: [trading_enabled, offers]
+      properties:
+        trading_enabled:
+          type: boolean
+          description: Whether the server-side public compute trading gate is on. It is off by default.
+        offers:
+          type: array
+          items: { $ref: '#/components/schemas/ComputeOffer' }
+    ComputeConstraints:
+      type: object
+      description: Hard filters. Every offer that fails one is returned as a typed rejection rather than silently dropped.
+      properties:
+        allowed_regions: { type: array, items: { type: string } }
+        denied_regions: { type: array, items: { type: string } }
+        allowed_countries: { type: array, items: { type: string } }
+        denied_countries: { type: array, items: { type: string } }
+        min_trust: { $ref: '#/components/schemas/ComputeTrustTier' }
+        max_price_micros_per_hour: { type: integer, format: int64, minimum: 0 }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        max_latency_millis: { type: number, format: double, minimum: 0 }
+        required_features: { type: array, items: { type: string } }
+        exclude_machine_ids: { type: array, items: { type: string } }
+        include_other_organizations:
+          type: boolean
+          description: Cross-organization placement must be requested explicitly, even when the trading gate is open.
+        state_is_encrypted: { type: boolean }
+        shares_gpu: { type: boolean }
+    ComputeWeights:
+      type: object
+      description: Relative scoring weights. Defaults are capability 0.20, price 0.25, latency 0.20, trust 0.15, locality 0.10, freshness 0.10.
+      required: [capability, price, latency, trust, locality, freshness]
+      properties:
+        capability: { type: number, format: double, minimum: 0 }
+        price: { type: number, format: double, minimum: 0 }
+        latency: { type: number, format: double, minimum: 0 }
+        trust: { type: number, format: double, minimum: 0 }
+        locality: { type: number, format: double, minimum: 0 }
+        freshness: { type: number, format: double, minimum: 0 }
+    PlacementRequest:
+      type: object
+      required: [requirements]
+      properties:
+        workload_id: { type: string, format: uuid }
+        checkpoint_id:
+          type: string
+          format: uuid
+          description: Resolved server-side into the stored manifest so restore compatibility is checked against captured state.
+        source_machine_id: { type: string, description: Excluded from the results; a workload is never placed back on its own machine. }
+        source_geography: { $ref: '#/components/schemas/ComputeGeography' }
+        requirements: { $ref: '#/components/schemas/ComputeResources' }
+        state_bytes: { type: integer, format: int64, minimum: 0 }
+        duration_seconds: { type: integer, format: int64, minimum: 0 }
+        constraints: { $ref: '#/components/schemas/ComputeConstraints' }
+        weights: { $ref: '#/components/schemas/ComputeWeights' }
+        limit: { type: integer, minimum: 0, description: Truncates the ranked candidates. Rejections are always complete. }
+    ComputeScores:
+      type: object
+      description: Per-dimension scores in the range 0 to 1, and their weighted total.
+      required: [capability, price, latency, trust, locality, freshness, total]
+      properties:
+        capability: { type: number, format: double }
+        price: { type: number, format: double }
+        latency: { type: number, format: double }
+        trust: { type: number, format: double }
+        locality: { type: number, format: double }
+        freshness: { type: number, format: double }
+        total: { type: number, format: double }
+    ComputeCandidate:
+      type: object
+      required: [offer_id, machine_id, organization_id, geography, trust, same_organization, available, hourly_micros, estimated_micros, latency_known, scores]
+      properties:
+        offer_id: { type: string, format: uuid }
+        machine_id: { type: string }
+        machine_name: { type: string }
+        organization_id: { type: string, format: uuid }
+        agent_url: { type: string, format: uri }
+        geography: { $ref: '#/components/schemas/ComputeGeography' }
+        trust: { $ref: '#/components/schemas/ComputeTrustTier' }
+        same_organization: { type: boolean }
+        available: { $ref: '#/components/schemas/ComputeResources' }
+        hourly_micros: { type: integer, format: int64, minimum: 0 }
+        estimated_micros: { type: integer, format: int64, minimum: 0, description: Quote for the requested duration, in micro-units. }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        latency_millis: { type: number, format: double, minimum: 0 }
+        latency_known: { type: boolean, description: False when no sample applies; scoring then uses the neutral value rather than pretending a measurement exists. }
+        scores: { $ref: '#/components/schemas/ComputeScores' }
+        warnings: { type: array, items: { type: string } }
+        compatibility:
+          type: object
+          additionalProperties: true
+          description: Restore compatibility report for the checkpoint, produced by the same checker the migration pre-flight uses.
+    ComputeRejectionCode:
+      type: string
+      enum:
+        - TRADING_DISABLED
+        - CROSS_ORGANIZATION_NOT_REQUESTED
+        - VISIBILITY_FORBIDDEN
+        - ORGANIZATION_DENIED
+        - ORGANIZATION_NOT_ALLOWED
+        - SELF_PLACEMENT
+        - MACHINE_EXCLUDED
+        - OFFER_UNAVAILABLE
+        - OUTSIDE_AVAILABILITY_WINDOW
+        - MACHINE_PRESENCE_STALE
+        - TRUST_TOO_LOW
+        - REGION_NOT_ALLOWED
+        - COUNTRY_NOT_ALLOWED
+        - DATA_RESIDENCY_FORBIDDEN
+        - CPU_INSUFFICIENT
+        - MEMORY_INSUFFICIENT
+        - STORAGE_INSUFFICIENT
+        - NETWORK_INSUFFICIENT
+        - GPU_INCOMPATIBLE
+        - FEATURE_MISSING
+        - LATENCY_EXCEEDED
+        - LATENCY_UNMEASURED
+        - PRICE_EXCEEDED
+        - CURRENCY_MISMATCH
+        - STATE_TOO_LARGE
+        - DURATION_TOO_LONG
+        - ENCRYPTED_STATE_REQUIRED
+        - GPU_SHARING_FORBIDDEN
+        - RESTORE_INCOMPATIBLE
+    ComputeRejection:
+      type: object
+      required: [offer_id, machine_id, code, reason]
+      properties:
+        offer_id: { type: string, format: uuid }
+        machine_id: { type: string }
+        code: { $ref: '#/components/schemas/ComputeRejectionCode' }
+        reason: { type: string }
+    Placement:
+      type: object
+      required: [candidates, rejected, evaluated, trading_enabled, weights, evaluated_at]
+      properties:
+        candidates:
+          type: array
+          description: Feasible destinations, best first. Ties break deterministically.
+          items: { $ref: '#/components/schemas/ComputeCandidate' }
+        rejected:
+          type: array
+          description: One entry per offer that failed a hard filter, so a caller can see why capacity was not usable.
+          items: { $ref: '#/components/schemas/ComputeRejection' }
+        evaluated: { type: integer, minimum: 0 }
+        trading_enabled: { type: boolean }
+        weights: { $ref: '#/components/schemas/ComputeWeights' }
+        evaluated_at: { type: string, format: date-time }
+    CreateComputeReservationRequest:
+      type: object
+      required: [offer_id, requested]
+      properties:
+        offer_id: { type: string, format: uuid }
+        workload_id: { type: string, format: uuid }
+        migration_id: { type: string, format: uuid }
+        checkpoint_id: { type: string, format: uuid }
+        source_machine_id: { type: string }
+        source_geography: { $ref: '#/components/schemas/ComputeGeography' }
+        requested: { $ref: '#/components/schemas/ComputeResources' }
+        state_bytes: { type: integer, format: int64, minimum: 0 }
+        duration_seconds: { type: integer, format: int64, minimum: 0 }
+        constraints: { $ref: '#/components/schemas/ComputeConstraints' }
+        ttl_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 86400
+          description: How long the hold lasts. Defaults to 900 seconds; the ceiling is 86400 so abandoned capacity is always reclaimed.
+    ComputeReservationState:
+      type: string
+      enum: [PENDING, ACTIVE, RELEASED, EXPIRED, FAILED]
+      description: |
+        RELEASED and EXPIRED are terminal. Legal transitions are PENDING to any
+        other state, ACTIVE to RELEASED, EXPIRED, or FAILED, and FAILED to
+        RELEASED.
+    ComputeReservation:
+      type: object
+      required: [id, offer_id, organization_id, machine_id, requested, state, hourly_micros, expires_at, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        offer_id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        machine_id: { type: string }
+        workload_id: { type: string, format: uuid }
+        migration_id: { type: string, format: uuid }
+        requested: { $ref: '#/components/schemas/ComputeResources' }
+        state: { $ref: '#/components/schemas/ComputeReservationState' }
+        hourly_micros: { type: integer, format: int64, minimum: 0 }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        released_at: { type: string, format: date-time, nullable: true }
+        error: { type: string }
+    ComputeReservationStateRequest:
+      type: object
+      required: [state]
+      properties:
+        state: { $ref: '#/components/schemas/ComputeReservationState' }
+        error: { type: string, maxLength: 1000, description: Recorded when moving to FAILED. }
+    AgentCommandRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [start, pause, resume, stop, delete, checkpoint, restore, migrate]
+          description: Case-insensitive.
+        workload_id: { type: string, format: uuid, description: Required for every action; the workload must live on the addressed machine. }
+        checkpoint_id: { type: string, format: uuid, description: Required for restore. }
+        destination_id: { type: string, description: Destination machine id. Required for migrate. }
+        mode: { type: string, enum: [cold, live], description: Migration mode. Defaults to cold. }
+        timeout_seconds: { type: integer, minimum: 0, description: Defaults to 30 and is clamped to 600. }
+        spec: { type: object, additionalProperties: true }
+    AgentCommandResponse:
+      type: object
+      required: [machine, action]
+      properties:
+        machine: { type: string }
+        action: { type: string }
+        result:
+          description: The agent's own response for the dispatched action, passed through unchanged.
+          type: object
+          additionalProperties: true
+        workload: { $ref: '#/components/schemas/Workload' }
+        checkpoint: { $ref: '#/components/schemas/Checkpoint' }
+        migration: { $ref: '#/components/schemas/MigrationJob' }
+    ReconcileResult:
+      type: object
+      required: [reconciled_workloads, failed]
+      properties:
+        reconciled_workloads: { type: integer, minimum: 0 }
+        failed:
+          type: object
+          description: Per-resource failures keyed by machine id, workload id, or a prefixed resource key such as "checkpoint:<id>".
+          additionalProperties: { type: string }

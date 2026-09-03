@@ -1,0 +1,58 @@
+# golangci-lint configuration for SHIFT.
+#
+# The project is deliberately stdlib-heavy; the enabled linters enforce the
+# invariants its own spec demands: no stray prints (structured logging only),
+# no ignored errors, no leaked bodies or rows, no context-less HTTP requests,
+# and formatted, vet-clean code. Everything here must pass `make lint-ci`.
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard
+  enable:
+    - gofmt
+    - goimports
+    - govet
+    - ineffassign
+    - misspell
+    - unconvert
+    - gocritic
+    - copyloopvar
+    - nolintlint
+    - errorlint
+    - bodyclose
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - durationcheck
+    - wastedassign
+  settings:
+    govet:
+      enable-all: false
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+      disabled-checks:
+        - hugeParam
+        - rangeValCopy
+    misspell:
+      locale: US
+  exclusions:
+    rules:
+      # Test files legitimately use t.Fatal-style control flow and long
+      # table helpers; keep the production bar strict and the test bar
+      # practical.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

@@ -1,0 +1,137 @@
+@import "tailwindcss";
+
+@theme inline {
+  /* SHIFT — instrument palette. Near-black base, warm off-white, one accent. */
+  --color-bg: #0a0a0b;
+  --color-bg-elevated: #101012;
+  --color-bg-surface: #16161a;
+  --color-bg-hover: #1c1c21;
+  --color-bg-active: #26262c;
+
+  /* Hairlines */
+  --color-border: #26262c;
+  --color-border-subtle: #1a1a1f;
+  --color-border-strong: #3a3a42;
+
+  /* Warm off-white type scale */
+  --color-text: #e9e7e2;
+  --color-text-secondary: #9c9c9f;
+  --color-text-muted: #63636a;
+  --color-text-faint: #45454c;
+
+  /* The single accent: state transfer */
+  --color-accent: #14e0b0;
+  --color-accent-dim: #0fb891;
+  --color-accent-glow: rgba(20, 224, 176, 0.1);
+
+  /* Status — reserved for real states only */
+  --color-status-healthy: #3ecf6f;
+  --color-status-warning: #e0b13e;
+  --color-status-error: #e05252;
+  --color-status-offline: #4a4a52;
+  --color-status-info: #4a90d9;
+
+  --font-display: var(--font-display), ui-sans-serif, system-ui, sans-serif;
+  --font-body: var(--font-display), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-mono), ui-monospace, "SF Mono", monospace;
+
+  --color-background: var(--color-bg);
+  --color-foreground: var(--color-text);
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  letter-spacing: 0.01em;
+}
+
+/* Scrollbar — thin, instrument-like */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-bg-active); }
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-muted); }
+
+::selection { background: var(--color-accent); color: var(--color-bg); }
+
+:focus-visible { outline: 1px solid var(--color-accent); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  html { scroll-behavior: auto; }
+}
+
+.tabular-nums { font-variant-numeric: tabular-nums; }
+
+/* Technical label — small mono uppercase */
+.tlabel {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+/* Readout value — mono measurement */
+.readout {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+}
+
+/* Hairline separators */
+.hline { height: 1px; background: var(--color-border); }
+.vline { width: 1px; background: var(--color-border); }
+
+/* Code / terminal block — sharp, no radius */
+.code-block {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.7;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 1rem 1.25rem;
+  overflow-x: auto;
+}
+
+/* Pulse for live state */
+@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.animate-pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+
+/* State travel — a dot crossing a line */
+@keyframes travel {
+  0% { left: 0%; opacity: 0; }
+  8% { opacity: 1; }
+  92% { opacity: 1; }
+  100% { left: 100%; opacity: 0; }
+}
+.animate-travel { animation: travel 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite; }
+
+/* Scanline sweep for machine activity */
+@keyframes scan {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100%); }
+}
+.animate-scan { animation: scan 3s linear infinite; }
+
+/* State object breathing */
+@keyframes breathe {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+.animate-breathe { animation: breathe 2.8s ease-in-out infinite; }

@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-shift}
+      POSTGRES_USER: ${POSTGRES_USER:-shift}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - shift-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  control:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.control
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SHIFT_DATABASE_URL: postgres://${POSTGRES_USER:-shift}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-shift}?sslmode=disable
+      SHIFT_TOKEN_PEPPER: ${SHIFT_TOKEN_PEPPER:?set SHIFT_TOKEN_PEPPER}
+      SHIFT_PASSWORD_PEPPER: ${SHIFT_PASSWORD_PEPPER:?set SHIFT_PASSWORD_PEPPER}
+      SHIFT_CONTROL_LISTEN: 0.0.0.0:8090
+    ports:
+      - "${SHIFT_CONTROL_PORT:-8090}:8090"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  agent:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.agent
+    profiles: [agent]
+    command:
+      - --state-dir
+      - /var/lib/shift
+      - --listen
+      - unix:///run/shift/agent.sock
+      - --remote-listen
+      - tcp://0.0.0.0:8443
+    volumes:
+      - shift-agent-state:/var/lib/shift
+      - shift-agent-run:/run/shift
+    ports:
+      - "${SHIFT_AGENT_PORT:-8443}:8443"
+    security_opt:
+      - no-new-privileges:true
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+      - NET_ADMIN
+    restart: unless-stopped
+
+volumes:
+  shift-postgres:
+  shift-agent-state:
+  shift-agent-run:

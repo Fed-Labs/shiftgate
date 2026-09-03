@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "state_dir": "/var/lib/shift",
+  "listen": "unix:///run/shift/agent.sock",
+  "remote_listen": "tcp://0.0.0.0:8443",
+  "tls": {
+    "certificate_file": "/etc/shift/tls/agent-cert.pem",
+    "private_key_file": "/etc/shift/tls/agent-key.pem",
+    "client_ca_file": "/etc/shift/tls/agents-ca.pem",
+    "peer_ca_file": "/etc/shift/tls/agents-ca.pem"
+  },
+  "chunk_size_bytes": 4194304,
+  "max_concurrent_migrations": 2,
+  "shutdown_timeout": 20000000000,
+  "log_level": "info",
+  "object_store": {
+    "enabled": false,
+    "backend": "local",
+    "local_root": "/var/lib/shift/cloud-objects",
+    "state_dir": "/var/lib/shift/objectstore-state"
+  }
+}

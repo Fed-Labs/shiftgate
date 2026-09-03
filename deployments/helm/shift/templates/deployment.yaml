@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "shift.fullname" . }}-control
+  labels:
+    {{- include "shift.labels" . | nindent 4 }}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "shift.name" . }}-control
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "shift.name" . }}-control
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: control
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--listen", "{{ .Values.control.listen }}"]
+          env:
+            - name: SHIFT_DATABASE_URL
+              value: {{ required "control.databaseURL is required" .Values.control.databaseURL | quote }}
+            - name: SHIFT_TOKEN_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.control.tokenPepperSecret }}
+                  key: {{ .Values.control.tokenPepperKey }}
+            - name: SHIFT_PASSWORD_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.control.passwordPepperSecret }}
+                  key: {{ .Values.control.passwordPepperKey }}
+          ports:
+            - name: http
+              containerPort: 8090
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

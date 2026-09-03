@@ -1,0 +1,17 @@
+FROM golang:1.24-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/shift-agent ./cmd/shift-agent
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates criu tar iproute2 procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --home-dir /var/lib/shift --create-home --shell /usr/sbin/nologin shift
+COPY --from=build /out/shift-agent /usr/local/bin/shift-agent
+RUN mkdir -p /var/lib/shift /run/shift && chown -R shift:shift /var/lib/shift /run/shift
+VOLUME ["/var/lib/shift"]
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/shift-agent"]
