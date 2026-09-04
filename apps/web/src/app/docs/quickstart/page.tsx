@@ -11,7 +11,7 @@ const STEPS = [
   {
     number: "01",
     title: "Prepare Linux",
-    description: "Use an x86_64 Linux host with CRIU, GNU tar, Go 1.24+, and the kernel capabilities CRIU reports through `shift doctor`.",
+    description: "Use an x86_64 Linux host with CRIU, GNU tar, Go 1.24+, and the kernel capabilities CRIU reports through `shiftgate doctor`.",
     command: "criu --version && tar --version | head -1 && go version",
     output: `CRIU version 4.0
 tar (GNU tar) 1.35
@@ -25,7 +25,7 @@ go version go1.24.0 linux/amd64`,
 mkdir -p ./data/run
 ./bin/shift-agent --state-dir ./data --listen unix://$PWD/data/agent.sock
 # In another terminal:
-./bin/shift --agent unix://$PWD/data/agent.sock doctor`,
+./bin/shiftgate --agent unix://$PWD/data/agent.sock doctor`,
     output: `Healthy: true
   ✓ CRIU installed and kernel check passed
   ✓ GNU tar available
@@ -36,7 +36,7 @@ If doctor reports a kernel capability error, resolve that prerequisite first; SH
     number: "03",
     title: "Create and start a scoped workload",
     description: "Attach one explicit directory as the workload root. Commands run under the agent, and only that approved root is captured.",
-    command: `./bin/shift --agent unix://$PWD/data/agent.sock workload create demo \\
+    command: `./bin/shiftgate --agent unix://$PWD/data/agent.sock workload create demo \\
   --path "$PWD/demo" --start -- /usr/bin/python3 -m http.server 8080`,
     output: `Workload wl_example created.
 Status: running
@@ -46,8 +46,8 @@ Root:   /absolute/path/to/demo`,
     number: "04",
     title: "Checkpoint and restore locally",
     description: "Create an encrypted, content-addressed checkpoint while leaving the source running, then restore it to validate that process and filesystem state round-trip on this host.",
-    command: `./bin/shift --agent unix://$PWD/data/agent.sock checkpoint create demo --leave-running
-./bin/shift --agent unix://$PWD/data/agent.sock restore CHECKPOINT_ID`,
+    command: `./bin/shiftgate --agent unix://$PWD/data/agent.sock checkpoint create demo --leave-running
+./bin/shiftgate --agent unix://$PWD/data/agent.sock restore CHECKPOINT_ID`,
     output: `Checkpoint ckpt_example created.
 Plain:  ... Stored: ...
 Checkpoint restored and committed. Process PID: 12345`,
@@ -56,7 +56,7 @@ Checkpoint restored and committed. Process PID: 12345`,
     number: "05",
     title: "Move between two agents",
     description: "After both hosts pass `doctor`, migrate over mutually authenticated HTTPS. Use cold mode for the simplest path or live mode to invoke CRIU pre-copy before its authoritative final dump.",
-    command: `./bin/shift migrate demo \\
+    command: `./bin/shiftgate migrate demo \\
   --to https://destination.example:8443 \\
   --machine-id DESTINATION_MACHINE_ID \\
   --mode cold`,

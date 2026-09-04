@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -339,6 +341,25 @@ func (s *Service) listener(endpoint string, remote bool) (net.Listener, *tls.Con
 		if err := os.Chmod(parsed.Path, 0o660); err != nil {
 			_ = listener.Close()
 			return nil, nil, "", err
+		}
+		// A socket owned by the agent's own group locks out every other user,
+		// so the local CLI would need root to talk to the local agent. Handing
+		// the socket to the configured group lets its members connect. A
+		// missing group or a failed chown only narrows access — warn and keep
+		// serving rather than refusing to start.
+		if group := s.config.SocketGroup; group != "" {
+			if groupID, err := strconv.Atoi(group); err == nil {
+				if err := os.Chown(parsed.Path, -1, groupID); err != nil {
+					s.logger.Warn("socket group ownership not applied", "group", group, "error", err.Error())
+				}
+			} else if resolved, err := user.LookupGroup(group); err == nil {
+				gid, _ := strconv.Atoi(resolved.Gid)
+				if err := os.Chown(parsed.Path, -1, gid); err != nil {
+					s.logger.Warn("socket group ownership not applied", "group", group, "error", err.Error())
+				}
+			} else {
+				s.logger.Warn("socket group not found; only the agent's own user can connect", "group", group)
+			}
 		}
 		return credentialListener{Listener: listener}, nil, parsed.Path, nil
 	case "tcp":

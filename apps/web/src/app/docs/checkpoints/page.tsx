@@ -135,8 +135,8 @@ export default function CheckpointsPage() {
               parent images. The CLI infers incremental mode from that parent.
             </p>
             <pre className="text-sm">
-              <code className="text-accent">{`shift checkpoint create demo --leave-running
-shift checkpoint create demo --parent ckpt_a1b2c3d4`}</code>
+              <code className="text-accent">{`shiftgate checkpoint create demo --leave-running
+shiftgate checkpoint create demo --parent ckpt_a1b2c3d4`}</code>
             </pre>
             <div className="my-3 h-px bg-border-subtle" />
             <pre className="text-sm text-text-secondary whitespace-pre-wrap">
@@ -161,7 +161,7 @@ The CLI reports this workload's actual bytes and duration.`}</code>
           </p>
           <div className="rounded-lg border border-border bg-bg-elevated p-5">
             <pre className="text-sm">
-              <code className="text-accent">shift restore ckpt_a1b2c3d4</code>
+              <code className="text-accent">shiftgate restore ckpt_a1b2c3d4</code>
             </pre>
             <div className="my-3 h-px bg-border-subtle" />
             <pre className="text-sm text-text-secondary whitespace-pre-wrap">

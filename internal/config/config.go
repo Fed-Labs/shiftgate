@@ -19,7 +19,7 @@ import (
 	"shift.dev/shift/internal/persistence"
 )
 
-const Version = "0.1.0"
+const Version = "0.1.1"
 
 // AgentConfigVersion is the on-disk agent configuration schema this build reads
 // and writes. It is compared against a release's config schema so an update that
@@ -35,9 +35,13 @@ type TLSConfig struct {
 }
 
 type Agent struct {
-	Version                 int                `json:"version"`
-	StateDir                string             `json:"state_dir"`
-	Listen                  string             `json:"listen"`
+	Version  int    `json:"version"`
+	StateDir string `json:"state_dir"`
+	Listen   string `json:"listen"`
+	// SocketGroup names the group that owns the Unix socket when Listen is a
+	// unix:// path, so unprivileged users in that group can reach the local
+	// agent. Empty leaves the socket owned by the agent's own group.
+	SocketGroup             string             `json:"socket_group,omitempty"`
 	RemoteListen            string             `json:"remote_listen,omitempty"`
 	TLS                     TLSConfig          `json:"tls"`
 	InsecureDevelopment     bool               `json:"insecure_development"`
@@ -99,6 +103,7 @@ func DefaultAgent() Agent {
 		Version:                 AgentConfigVersion,
 		StateDir:                "/var/lib/shift",
 		Listen:                  "unix:///run/shift/agent.sock",
+		SocketGroup:             "shift",
 		ChunkSizeBytes:          4 << 20,
 		MaxConcurrentMigrations: 2,
 		ShutdownTimeout:         20 * time.Second,
@@ -245,6 +250,9 @@ func applyAgentEnvironment(configuration *Agent) {
 	}
 	if value := os.Getenv("SHIFT_AGENT_LISTEN"); value != "" {
 		configuration.Listen = value
+	}
+	if value := os.Getenv("SHIFT_SOCKET_GROUP"); value != "" {
+		configuration.SocketGroup = value
 	}
 	if value := os.Getenv("SHIFT_LOG_LEVEL"); value != "" {
 		configuration.LogLevel = strings.ToLower(value)

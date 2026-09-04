@@ -10,12 +10,15 @@ curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/instal
 
 The installer (`deployments/dist/install.sh` in the repository):
 
-- verifies Linux x86_64, downloads `shift-linux-amd64.tar.gz`, and refuses to
+- verifies Linux x86_64, downloads `shiftgate-linux-amd64.tar.gz`, and refuses to
   install unless its SHA-256 matches the release's `.sha256` sidecar;
-- installs `shift`, `shift-agent`, and `shift-control` under `/usr/local/bin`
+- installs `shiftgate`, `shift-agent`, and `shift-control` under `/usr/local/bin`
   (sudo is used only when the target prefix needs it — `--prefix` a writable
   directory and no password is ever asked);
 - installs CRIU through the distribution's package manager when it is missing;
+- creates the `shift` system group, adds the installing user to it, and the
+  agent hands its Unix socket to that group — so the CLI works unprivileged
+  after one re-login (or `newgrp shift`);
 - writes a local-only `/etc/shift/agent.json` — a Unix-socket API with no
   remote listener, so no TLS material is needed — and enables the agent as a
   systemd service.
@@ -35,10 +38,10 @@ then `systemctl restart shift-agent`.
 A maintainer cuts a release with:
 
 ```sh
-make dist                                                   # dist/shift-linux-amd64.tar.gz + .sha256 + .txt
-gh release create vX.Y.Z dist/shift-linux-amd64.tar.gz \
-                     dist/shift-linux-amd64.tar.gz.sha256 \
-                     dist/shift-linux-amd64.txt \
+make dist                                                   # dist/shiftgate-linux-amd64.tar.gz + .sha256 + .txt
+gh release create vX.Y.Z dist/shiftgate-linux-amd64.tar.gz \
+                     dist/shiftgate-linux-amd64.tar.gz.sha256 \
+                     dist/shiftgate-linux-amd64.txt \
                      deployments/dist/install.sh
 ```
 
@@ -57,7 +60,7 @@ From a repository checkout on a supported host:
 ```
 
 The installer verifies Linux x86_64, installs distribution packages for Go/CRIU/build tools,
-builds from local sources, verifies every binary checksum, and installs `shift`,
+builds from local sources, verifies every binary checksum, and installs `shiftgate`,
 `shift-agent`, and `shift-control` under `/usr/local/bin`. It does not generate private
 TLS material or expose a remote listener.
 
@@ -86,7 +89,7 @@ Build the binaries with Go 1.24 or newer:
 ```sh
 make build
 sudo install -m 0755 bin/shift-agent /usr/local/bin/shift-agent
-install -m 0755 bin/shift "$HOME/.local/bin/shift"
+install -m 0755 bin/shiftgate "$HOME/.local/bin/shiftgate"
 sudo install -d -m 0750 /etc/shift/tls
 sudo install -m 0644 deployments/systemd/agent.json.example /etc/shift/agent.json
 # Optional: configure S3/local checkpoint mirroring.

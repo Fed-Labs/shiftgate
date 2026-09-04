@@ -118,7 +118,7 @@ func TestFleetMachinesRequiresLogin(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when no session is stored")
 	}
-	if !strings.Contains(err.Error(), "shift login") {
+	if !strings.Contains(err.Error(), "shiftgate login") {
 		t.Fatalf("error does not point at login: %v", err)
 	}
 }

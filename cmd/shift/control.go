@@ -35,7 +35,7 @@ func controlSession(settings options) (*controlclient.Session, error) {
 		return nil, exitError{code: 2, err: err}
 	}
 	if !session.Authenticated() {
-		return nil, exitError{code: 3, err: errors.New("not logged in; run shift login first")}
+		return nil, exitError{code: 3, err: errors.New("not logged in; run shiftgate login first")}
 	}
 	return session, nil
 }
@@ -49,7 +49,7 @@ func controlOperationError(err error) error {
 			return exitError{code: 4, err: err}
 		}
 		if api.Status == 401 {
-			return exitError{code: 3, err: fmt.Errorf("%s (run shift login)", api.Message)}
+			return exitError{code: 3, err: fmt.Errorf("%s (run shiftgate login)", api.Message)}
 		}
 	}
 	return exitError{code: 3, err: err}
@@ -308,7 +308,7 @@ func runFleet(ctx context.Context, settings options, arguments []string) error {
 	}
 	remaining := flags.Args()
 	if len(remaining) == 0 {
-		return usageError("usage: shift fleet [--org ID] machines|workloads|migrations|checkpoints|audit|retention|sso|api-keys|entitlement|usage [args]")
+		return usageError("usage: shiftgate fleet [--org ID] machines|workloads|migrations|checkpoints|audit|retention|sso|api-keys|entitlement|usage [args]")
 	}
 	subcommand, args := remaining[0], remaining[1:]
 	session, err := controlSession(settings)
@@ -435,7 +435,7 @@ func runFleetMachineCapability(ctx context.Context, session *controlclient.Sessi
 	}
 	rest := flags.Args()
 	if len(rest) != 1 {
-		return usageError("usage: shift fleet machines capability NAME [--kind number] [--minimum 9.0]")
+		return usageError("usage: shiftgate fleet machines capability NAME [--kind number] [--minimum 9.0]")
 	}
 	if *kind != "number" && *kind != "text" && *kind != "boolean" {
 		return usageError("kind must be number, text, or boolean")
@@ -467,7 +467,7 @@ func runFleetRetention(ctx context.Context, session *controlclient.Session, sett
 		return usageError(err.Error())
 	}
 	if flags.NArg() > 0 {
-		return usageError("usage: shift fleet retention [--audit-days N] [--checkpoint-days N] [--deleted-storage-days N]")
+		return usageError("usage: shiftgate fleet retention [--audit-days N] [--checkpoint-days N] [--deleted-storage-days N]")
 	}
 	// -1 is "flag not set"; 0 is the real keep-forever policy and passes through.
 	if *auditDays >= 0 || *checkpointDays >= 0 || *storageDays >= 0 {
@@ -520,7 +520,7 @@ func runFleetSSO(ctx context.Context, session *controlclient.Session, settings o
 		return usageError(err.Error())
 	}
 	if flags.NArg() > 0 {
-		return usageError("usage: shift fleet sso [--enforce DOMAIN | --disable]")
+		return usageError("usage: shiftgate fleet sso [--enforce DOMAIN | --disable]")
 	}
 	if *enforce != "" && *disable {
 		return usageError("pick one: --enforce DOMAIN or --disable")
@@ -547,7 +547,7 @@ func runFleetSSO(ctx context.Context, session *controlclient.Session, settings o
 	}
 	fmt.Fprintf(settings.stdout, "single sign-on: %s\n", status)
 	if state.Enforced {
-		fmt.Fprintln(settings.stdout, "the domain's accounts authenticate with `shift login --sso`; passwords no longer work for them")
+		fmt.Fprintln(settings.stdout, "the domain's accounts authenticate with `shiftgate login --sso`; passwords no longer work for them")
 	}
 	return nil
 }
@@ -574,7 +574,7 @@ func runFleetWorkloads(ctx context.Context, settings options, arguments []string
 // runFleetWorkload lists workloads.
 func runFleetWorkload(ctx context.Context, session *controlclient.Session, settings options, organizationID string, arguments []string) error {
 	if len(arguments) > 0 {
-		return usageError("usage: shift fleet workloads (listing only; create workloads on the machine)")
+		return usageError("usage: shiftgate fleet workloads (listing only; create workloads on the machine)")
 	}
 	workloads, err := session.Workloads(ctx, organizationID)
 	if err != nil {
@@ -609,7 +609,7 @@ func runFleetMigration(ctx context.Context, session *controlclient.Session, sett
 		return writer.Flush()
 	}
 	if len(arguments) != 1 {
-		return usageError("usage: shift fleet migrations [ID]")
+		return usageError("usage: shiftgate fleet migrations [ID]")
 	}
 	migrationID := arguments[0]
 	jobs, err := session.Migrations(ctx, organizationID)
@@ -643,7 +643,7 @@ func runFleetMigration(ctx context.Context, session *controlclient.Session, sett
 // runFleetCheckpoint lists checkpoints, optionally for one workload.
 func runFleetCheckpoint(ctx context.Context, session *controlclient.Session, settings options, organizationID string, arguments []string) error {
 	if len(arguments) > 1 {
-		return usageError("usage: shift fleet checkpoints [WORKLOAD]")
+		return usageError("usage: shiftgate fleet checkpoints [WORKLOAD]")
 	}
 	workloadID := ""
 	if len(arguments) == 1 {
@@ -752,7 +752,7 @@ func runFleetAPIKeys(ctx context.Context, session *controlclient.Session, settin
 		return nil
 	case "revoke":
 		if len(args) != 1 {
-			return usageError("usage: shift fleet api-keys revoke KEY")
+			return usageError("usage: shiftgate fleet api-keys revoke KEY")
 		}
 		if err := session.RevokeAPIKey(ctx, organizationID, args[0]); err != nil {
 			return controlOperationError(err)
@@ -776,7 +776,7 @@ func runMarketplace(ctx context.Context, settings options, arguments []string) e
 	}
 	remaining := flags.Args()
 	if len(remaining) == 0 {
-		return usageError("usage: shift marketplace [--org ID] offers|inventory|place|publish|withdraw|reservations|reserve|commit|release|fail [args]")
+		return usageError("usage: shiftgate marketplace [--org ID] offers|inventory|place|publish|withdraw|reservations|reserve|commit|release|fail [args]")
 	}
 	subcommand, args := remaining[0], remaining[1:]
 	session, err := controlSession(settings)

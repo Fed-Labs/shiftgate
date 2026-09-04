@@ -16,7 +16,7 @@ import (
 // to answer a release that misbehaved here.
 func runUpdate(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 0 {
-		return usageError("usage: shift update status|check|apply|rollback|block|unblock")
+		return usageError("usage: shiftgate update status|check|apply|rollback|block|unblock")
 	}
 	subcommand := arguments[0]
 	args := arguments[1:]
@@ -70,7 +70,7 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 		return nil
 	case "block":
 		if len(args) < 1 {
-			return usageError("usage: shift update block VERSION [--reason TEXT]")
+			return usageError("usage: shiftgate update block VERSION [--reason TEXT]")
 		}
 		flags := flag.NewFlagSet("update block", flag.ContinueOnError)
 		flags.SetOutput(settings.stderr)
@@ -89,7 +89,7 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 		return nil
 	case "unblock":
 		if len(args) != 1 {
-			return usageError("usage: shift update unblock VERSION")
+			return usageError("usage: shiftgate update unblock VERSION")
 		}
 		status, err := client.UpdateUnblock(ctx, args[0])
 		if err != nil {

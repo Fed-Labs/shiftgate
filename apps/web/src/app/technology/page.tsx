@@ -288,7 +288,7 @@ export default function TechnologyPage() {
                 <div className="bg-bg rounded-md border border-border-subtle p-4">
                   <p className="text-xs text-text-muted leading-relaxed">
                     Live mode has no transparent dirty-page convergence or CoW filesystem
-                    adapter. Run `shift doctor` and validate your workload before production.
+                    adapter. Run `shiftgate doctor` and validate your workload before production.
                   </p>
                 </div>
               </motion.div>

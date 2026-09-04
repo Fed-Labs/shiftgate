@@ -18,7 +18,7 @@ const ISSUES = [
     solutions: [
       "Check service status and logs: systemctl status shift-agent; journalctl -u shift-agent",
       "Confirm --listen matches the CLI --agent endpoint",
-      "Run ./bin/shift doctor on both machines",
+      "Run ./bin/shiftgate doctor on both machines",
       "Verify remote certificates and that TCP 443 reaches the destination agent",
     ],
   },
@@ -32,7 +32,7 @@ const ISSUES = [
       "Multi-GPU topology doesn't match",
     ],
     solutions: [
-      "Run ./bin/shift machine on each host and compare inventory",
+      "Run ./bin/shiftgate machine on each host and compare inventory",
       "Require a vendor checkpoint/restore adapter for GPU context state; otherwise reinitialize device state",
       "Match declared device requirements to available hardware",
       "Do not copy generic /dev files as a substitute for supported device state",

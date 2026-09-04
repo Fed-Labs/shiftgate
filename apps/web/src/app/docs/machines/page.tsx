@@ -61,7 +61,7 @@ export default function MachinesPage() {
             <pre className="text-sm">
               <code className="text-accent">{`sudo ./bin/shift-agent --state-dir /var/lib/shift \\
   --listen unix:///run/shift/agent.sock
-./bin/shift doctor`}</code>
+./bin/shiftgate doctor`}</code>
             </pre>
             <div className="my-3 h-px bg-border-subtle" />
             <pre className="text-sm text-text-secondary whitespace-pre-wrap">

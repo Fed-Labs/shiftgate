@@ -157,7 +157,7 @@ OLDPWD="$PWD"
 cd "$REPO_DIR"
 make build
 mkdir -p "$HOME/.cache/shift-install"
-sha256sum bin/shift bin/shift-agent bin/shift-control >"$HOME/.cache/shift-install/checksums.txt"
+sha256sum bin/shiftgate bin/shift-agent bin/shift-control >"$HOME/.cache/shift-install/checksums.txt"
 cd "$OLDPWD"
 
 while read -r expected path; do
@@ -167,12 +167,12 @@ done <"$HOME/.cache/shift-install/checksums.txt"
 
 log "Installing binaries to $BINDIR"
 as_root mkdir -p "$BINDIR"
-as_root install -m 0755 "$REPO_DIR/bin/shift" "$BINDIR/shift"
+as_root install -m 0755 "$REPO_DIR/bin/shiftgate" "$BINDIR/shiftgate"
 as_root install -m 0755 "$REPO_DIR/bin/shift-agent" "$BINDIR/shift-agent"
 as_root install -m 0755 "$REPO_DIR/bin/shift-control" "$BINDIR/shift-control"
 
 rollback_binaries() {
-    for name in shift shift-agent shift-control; do
+    for name in shiftgate shift-agent shift-control; do
         if [ -e "$BINDIR/$name.pre-shift" ]; then
             as_root mv "$BINDIR/$name.pre-shift" "$BINDIR/$name"
         else
@@ -187,6 +187,13 @@ if [ "$SYSTEMD_UNIT" = "1" ]; then
     as_root mkdir -p "$CONFIGDIR/tls" "$STATEDIR" /run/shift
     as_root chmod 0750 "$STATEDIR"
     as_root chmod 0755 /run/shift
+    # The agent hands its Unix socket to the 'shift' group so the CLI can
+    # reach it without root; create the group if it does not exist yet.
+    if ! getent group shift >/dev/null 2>&1; then
+        as_root groupadd --system shift >/dev/null 2>&1 \
+            || as_root addgroup --system shift >/dev/null 2>&1 \
+            || log "WARNING: could not create group 'shift'; only root can reach the agent socket"
+    fi
     if [ ! -f "$CONFIGDIR/agent.json" ]; then
         as_root install -m 0640 "$REPO_DIR/deployments/systemd/agent.json.example" "$CONFIGDIR/agent.json"
         config_installed=1
@@ -215,6 +222,6 @@ fi
 rm -f "$HOME/.cache/shift-install/checksums.txt"
 log "Installation complete"
 printf '%s\n' \
-    "  CLI:   $BINDIR/shift" \
-    "  Check: $BINDIR/shift doctor" \
+    "  CLI:   $BINDIR/shiftgate" \
+    "  Check: $BINDIR/shiftgate doctor" \
     "  Agent: systemd requires TLS configuration; see docs/installation.md"

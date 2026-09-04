@@ -112,7 +112,7 @@ The icon script needs no third-party packages — it is a stdlib PNG writer.
 
 - Agent logs are slog-based; set `"log_level": "debug"` in the agent config
   for stage-by-stage migration output.
-- `shift doctor` runs the same health checks the API exposes at
+- `shiftgate doctor` runs the same health checks the API exposes at
   `/v1/doctor`.
 - A migration's event log (`GET /v1/migrations/{id}`) records every stage
   transition, failure code, and byte count — start there before reading

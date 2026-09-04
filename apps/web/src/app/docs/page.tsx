@@ -106,7 +106,7 @@ export default function DocsIndexPage() {
           </p>
           <pre className="code-block text-sm">
             <code>{`make build
-./bin/shift doctor`}</code>
+./bin/shiftgate doctor`}</code>
           </pre>
         </div>
 

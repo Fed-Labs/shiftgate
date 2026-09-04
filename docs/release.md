@@ -30,7 +30,7 @@ For each target (linux-amd64 is the supported one):
 
 ```bash
 go build -trimpath -o shift-agent-v1.2.3 ./cmd/shift-agent
-go build -trimpath -o shift-v1.2.3 ./cmd/shift
+go build -trimpath -o shiftgate-v1.2.3 ./cmd/shift
 go build -trimpath -o shift-control-v1.2.3 ./cmd/shift-control
 ```
 
@@ -90,15 +90,15 @@ per machine) and the agents' `/v1/updates` status.
 
 ## 7. If something goes wrong
 
-`shift update rollback` reinstalls the preserved previous binary (three
+`shiftgate update rollback` reinstalls the preserved previous binary (three
 backups are kept by default) with no network access, and the version that
-was undone is blocked from reinstalling. `shift update unblock VERSION`
+was undone is blocked from reinstalling. `shiftgate update unblock VERSION`
 re-arms it deliberately. A release whose install failed is blocked the same
 way — the block list is how the fleet remembers a bad release.
 
 For a release that must be withdrawn entirely: remove it from the feed and
 push a new signed feed. Machines that already installed it need
-`shift update rollback` or a fixed release on top; a withdrawn release does
+`shiftgate update rollback` or a fixed release on top; a withdrawn release does
 not uninstall itself.
 
 ## What we never do

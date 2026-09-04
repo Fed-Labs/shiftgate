@@ -49,7 +49,7 @@ func main() {
 }
 
 func run(arguments []string, stdout, stderr io.Writer) error {
-	global := flag.NewFlagSet("shift", flag.ContinueOnError)
+	global := flag.NewFlagSet("shiftgate", flag.ContinueOnError)
 	global.SetOutput(stderr)
 	settings := options{stdout: stdout, stderr: stderr, timeout: 30 * time.Second}
 	global.StringVar(&settings.agentEndpoint, "agent", defaultAgentEndpoint(), "SHIFT agent endpoint")
@@ -221,7 +221,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		return workloadCreate(ctx, client, settings, args)
 	case "inspect":
 		if len(args) != 1 {
-			return usageError("usage: shift workload inspect ID")
+			return usageError("usage: shiftgate workload inspect ID")
 		}
 		value, err := client.Workload(ctx, args[0])
 		if err != nil {
@@ -230,7 +230,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		return writeJSON(settings.stdout, value)
 	case "start", "pause", "resume":
 		if len(args) != 1 {
-			return usageError("usage: shift workload " + subcommand + " ID")
+			return usageError("usage: shiftgate workload " + subcommand + " ID")
 		}
 		value, err := client.WorkloadAction(ctx, args[0], subcommand, struct{}{})
 		if err != nil {
@@ -242,7 +242,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		flags.SetOutput(settings.stderr)
 		timeout := flags.Int("timeout", 10, "graceful stop timeout in seconds")
 		if len(args) == 0 {
-			return usageError("usage: shift workload stop ID [--timeout SECONDS]")
+			return usageError("usage: shiftgate workload stop ID [--timeout SECONDS]")
 		}
 		id := args[0]
 		if err := flags.Parse(args[1:]); err != nil {
@@ -255,7 +255,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		return printWorkload(settings, value)
 	case "delete":
 		if len(args) != 1 {
-			return usageError("usage: shift workload delete ID")
+			return usageError("usage: shiftgate workload delete ID")
 		}
 		if err := client.DeleteWorkload(ctx, args[0]); err != nil {
 			return operationError(err)
@@ -266,7 +266,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		return nil
 	case "logs":
 		if len(args) == 0 {
-			return usageError("usage: shift workload logs ID [--tail LINES]")
+			return usageError("usage: shiftgate workload logs ID [--tail LINES]")
 		}
 		flags := flag.NewFlagSet("workload logs", flag.ContinueOnError)
 		flags.SetOutput(settings.stderr)
@@ -287,7 +287,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 
 func workloadCreate(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 0 {
-		return usageError("usage: shift workload create NAME --path PATH -- COMMAND [ARGS...]")
+		return usageError("usage: shiftgate workload create NAME --path PATH -- COMMAND [ARGS...]")
 	}
 	name := arguments[0]
 	flags := flag.NewFlagSet("workload create", flag.ContinueOnError)
@@ -386,7 +386,7 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 		return writer.Flush()
 	case "create":
 		if len(arguments) < 2 {
-			return usageError("usage: shift checkpoint create WORKLOAD [options]")
+			return usageError("usage: shiftgate checkpoint create WORKLOAD [options]")
 		}
 		flags := flag.NewFlagSet("checkpoint create", flag.ContinueOnError)
 		flags.SetOutput(settings.stderr)
@@ -435,7 +435,7 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 		return nil
 	case "mirror":
 		if len(arguments) != 2 {
-			return usageError("usage: shift checkpoint mirror ID")
+			return usageError("usage: shiftgate checkpoint mirror ID")
 		}
 		result, err := client.MirrorCheckpoint(ctx, arguments[1])
 		if err != nil {
@@ -448,7 +448,7 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 		return nil
 	case "inspect":
 		if len(arguments) != 2 {
-			return usageError("usage: shift checkpoint inspect ID")
+			return usageError("usage: shiftgate checkpoint inspect ID")
 		}
 		manifest, err := client.Checkpoint(ctx, arguments[1])
 		if err != nil {
@@ -462,7 +462,7 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 
 func runRestore(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 0 {
-		return usageError("usage: shift restore CHECKPOINT [--timeout SECONDS]")
+		return usageError("usage: shiftgate restore CHECKPOINT [--timeout SECONDS]")
 	}
 	flags := flag.NewFlagSet("restore", flag.ContinueOnError)
 	flags.SetOutput(settings.stderr)
@@ -483,7 +483,7 @@ func runRestore(ctx context.Context, client *agentclient.Client, settings option
 
 func runMigrate(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 0 {
-		return usageError("usage: shift migrate WORKLOAD --to https://HOST:PORT [options]")
+		return usageError("usage: shiftgate migrate WORKLOAD --to https://HOST:PORT [options]")
 	}
 	workload := arguments[0]
 	flags := flag.NewFlagSet("migrate", flag.ContinueOnError)
@@ -680,7 +680,7 @@ func printMigration(writer io.Writer, migration model.Migration) {
 
 func runFork(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 0 {
-		return usageError("usage: shift fork WORKLOAD [--name NAME] [--root PATH] [--checkpoint ID] [--activate]\n       shift fork list\n       shift fork inspect FORK")
+		return usageError("usage: shiftgate fork WORKLOAD [--name NAME] [--root PATH] [--checkpoint ID] [--activate]\n       shiftgate fork list\n       shiftgate fork inspect FORK")
 	}
 	switch arguments[0] {
 	case "list":
@@ -700,7 +700,7 @@ func runFork(ctx context.Context, client *agentclient.Client, settings options, 
 		return writer.Flush()
 	case "inspect":
 		if len(arguments) < 2 {
-			return usageError("usage: shift fork inspect FORK")
+			return usageError("usage: shiftgate fork inspect FORK")
 		}
 		record, err := client.Fork(ctx, arguments[1])
 		if err != nil {
@@ -732,13 +732,13 @@ func runFork(ctx context.Context, client *agentclient.Client, settings options, 
 	if record.Activated {
 		fmt.Fprintf(settings.stdout, "  process:     running as PID %d\n", record.PID)
 	} else {
-		fmt.Fprintln(settings.stdout, "  process:     not started; run shift restore with the fork checkpoint or shift fork --activate")
+		fmt.Fprintln(settings.stdout, "  process:     not started; run shiftgate restore with the fork checkpoint or shiftgate fork --activate")
 	}
 	return nil
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, `Usage: shift [--agent ENDPOINT] [--control-url URL] [--json] COMMAND
+	fmt.Fprintln(writer, `Usage: shiftgate [--agent ENDPOINT] [--control-url URL] [--json] COMMAND
 
 Agent commands (local machine):
   doctor                         Check local migration prerequisites
@@ -756,7 +756,7 @@ Agent commands (local machine):
   completion bash|zsh|fish        Generate shell completion
   version                         Print version
 
-Control-plane commands (shift login first; --control-url or SHIFT_CONTROL_URL):
+Control-plane commands (shiftgate login first; --control-url or SHIFT_CONTROL_URL):
   login [--sso]                    Log in and store a session (single sign-on with --sso)
   logout                          Revoke the session and clear the stored tokens
   whoami                          Show identity and organizations
@@ -771,17 +771,17 @@ With --control-url set, 'machines' and 'workloads' show the fleet view.`)
 
 func completion(writer io.Writer, arguments []string) error {
 	if len(arguments) != 1 {
-		return usageError("usage: shift completion bash|zsh|fish")
+		return usageError("usage: shiftgate completion bash|zsh|fish")
 	}
 	commands := "doctor machines workloads workload checkpoint restore fork migrate status update logs login logout whoami plans fleet marketplace version"
 	switch arguments[0] {
 	case "bash":
-		fmt.Fprintf(writer, "complete -W %q shift\n", commands)
+		fmt.Fprintf(writer, "complete -W %q shiftgate\n", commands)
 	case "zsh":
-		fmt.Fprintf(writer, "#compdef shift\n_arguments '1:command:(%s)'\n", strings.ReplaceAll(commands, " ", " "))
+		fmt.Fprintf(writer, "#compdef shiftgate\n_arguments '1:command:(%s)'\n", strings.ReplaceAll(commands, " ", " "))
 	case "fish":
 		for _, command := range strings.Fields(commands) {
-			fmt.Fprintf(writer, "complete -c shift -f -n '__fish_use_subcommand' -a %s\n", command)
+			fmt.Fprintf(writer, "complete -c shiftgate -f -n '__fish_use_subcommand' -a %s\n", command)
 		}
 	default:
 		return usageError("unsupported shell " + arguments[0])

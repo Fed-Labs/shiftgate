@@ -3,7 +3,7 @@
 .vscode/
 .DS_Store
 bin/
-dist/
+/dist/
 coverage/
 tmp/
 data/

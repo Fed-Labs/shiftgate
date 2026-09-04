@@ -51,7 +51,7 @@ export default function DownloadPage() {
                   <code>{`git clone <repository-url> shift
 cd shift
 sudo ./install.sh
-shift doctor`}</code>
+shiftgate doctor`}</code>
                 </pre>
               </Card>
             </div>
@@ -102,7 +102,7 @@ shift doctor`}</code>
                         <Badge variant="success">Available</Badge>
                       </td>
                       <td className="py-2.5 text-text-secondary hidden sm:table-cell">
-                        Modern kernel with CRIU-required features; `shift doctor` is authoritative
+                        Modern kernel with CRIU-required features; `shiftgate doctor` is authoritative
                       </td>
                     </tr>
                     <tr>

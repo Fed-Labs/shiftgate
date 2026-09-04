@@ -3,7 +3,7 @@ import { Container, Section } from "@/components/ui";
 
 export const metadata: Metadata = {
   title: "CLI Reference",
-  description: "Reference for the shift commands implemented by this agent with syntax, flags, and behavior.",
+  description: "Reference for the shiftgate commands implemented by this agent with syntax, flags, and behavior.",
 };
 
 interface Command {
@@ -24,12 +24,12 @@ const COMMAND_GROUPS: CommandGroup[] = [
     commands: [
       {
         name: "doctor",
-        syntax: "shift doctor",
+        syntax: "shiftgate doctor",
         description: "Verify the local Linux host, CRIU kernel support, GNU tar, state paths, and agent prerequisites.",
       },
       {
         name: "status",
-        syntax: "shift status",
+        syntax: "shiftgate status",
         description: "Show local agent health, machine identity, workload count, and recent activity.",
       },
     ],
@@ -39,22 +39,22 @@ const COMMAND_GROUPS: CommandGroup[] = [
     commands: [
       {
         name: "machines",
-        syntax: "shift machines",
+        syntax: "shiftgate machines",
         description: "Show machines known to the control plane, including identity, capabilities, and recent status metadata.",
       },
       {
         name: "identity",
-        syntax: "shift identity",
+        syntax: "shiftgate identity",
         description: "Show the local agent's generated Ed25519 machine identity.",
       },
       {
         name: "machine",
-        syntax: "shift machine",
+        syntax: "shiftgate machine",
         description: "Inspect local hardware, kernel, storage, GPU inventory, and CRIU capabilities.",
       },
       {
         name: "global option",
-        syntax: "shift --agent unix://PATH|https://HOST:PORT",
+        syntax: "shiftgate --agent unix://PATH|https://HOST:PORT",
         description: "Select the local agent endpoint for every command; remote endpoints require mTLS credentials.",
       },
     ],
@@ -64,13 +64,13 @@ const COMMAND_GROUPS: CommandGroup[] = [
     commands: [
       {
         name: "workload list",
-        syntax: "shift workloads",
+        syntax: "shiftgate workloads",
         description: "List workloads managed by the selected agent.",
         flags: ["--json"],
       },
       {
         name: "workload create",
-        syntax: "shift workload create NAME --path PATH -- COMMAND [ARGS...]",
+        syntax: "shiftgate workload create NAME --path PATH -- COMMAND [ARGS...]",
         description: "Register an explicitly scoped local workload with the connected agent; use --start to launch it immediately.",
         flags: [
           "--name <name>",
@@ -85,12 +85,12 @@ const COMMAND_GROUPS: CommandGroup[] = [
       },
       {
         name: "workload inspect",
-        syntax: "shift workload inspect ID",
+        syntax: "shiftgate workload inspect ID",
         description: "Show a workload spec, runtime state, process identity, and latest checkpoint reference.",
       },
       {
         name: "workload stop",
-        syntax: "shift workload stop ID [--timeout SECONDS]",
+        syntax: "shiftgate workload stop ID [--timeout SECONDS]",
         description: "Stop a running process group and release its runtime record after the grace period.",
         flags: ["--timeout <seconds>"],
       },
@@ -101,24 +101,24 @@ const COMMAND_GROUPS: CommandGroup[] = [
     commands: [
       {
         name: "checkpoint list",
-        syntax: "shift checkpoints [WORKLOAD]",
+        syntax: "shiftgate checkpoints [WORKLOAD]",
         description: "List checkpoint summaries retained by the selected agent.",
         flags: ["--json"],
       },
       {
         name: "checkpoint create",
-        syntax: "shift checkpoint create WORKLOAD [--parent CHECKPOINT_ID]",
+        syntax: "shiftgate checkpoint create WORKLOAD [--parent CHECKPOINT_ID]",
         description: "Create a full checkpoint by default, or an incremental checkpoint when a retained parent is supplied.",
         flags: ["--parent <checkpoint-id>", "--leave-running", "--tcp-state", "--timeout <seconds>"],
       },
       {
         name: "restore",
-        syntax: "shift restore CHECKPOINT_ID [--timeout SECONDS]",
+        syntax: "shiftgate restore CHECKPOINT_ID [--timeout SECONDS]",
         description: "Restore locally through the selected agent, validate health, and commit only after validation succeeds.",
       },
       {
         name: "mirror",
-        syntax: "shift checkpoint mirror CHECKPOINT_ID",
+        syntax: "shiftgate checkpoint mirror CHECKPOINT_ID",
         description: "Retry publication to configured local or S3-compatible object storage after a transient failure.",
       },
     ],
@@ -128,7 +128,7 @@ const COMMAND_GROUPS: CommandGroup[] = [
     commands: [
       {
         name: "migrate",
-        syntax: "shift migrate WORKLOAD --to https://HOST:PORT --machine-id DESTINATION_ID",
+        syntax: "shiftgate migrate WORKLOAD --to https://HOST:PORT --machine-id DESTINATION_ID",
         description: "Migrate a running workload to a different machine. SHIFTGATE checkpoints the workload, transfers state, restores on the target, and validates before switching.",
         flags: [
           "--mode live|cold",
@@ -150,7 +150,7 @@ const COMMAND_GROUPS: CommandGroup[] = [
       },
       {
         name: "output",
-        syntax: "shift --json COMMAND",
+        syntax: "shiftgate --json COMMAND",
         description: "Emit machine-readable JSON for supported commands.",
       },
     ],

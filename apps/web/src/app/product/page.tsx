@@ -93,19 +93,19 @@ const useCases = [
   {
     title: "Desktop ↔ Laptop continuity",
     description: "Start a build on one Linux host. Checkpoint it, restore it on another compatible Linux host, and continue from the captured compiler process state and scoped files.",
-    workflow: ["shift checkpoint create build-42", "shift migrate build-42 --to https://host:8443"],
+    workflow: ["shiftgate checkpoint create build-42", "shiftgate migrate build-42 --to https://host:8443"],
   },
   {
     title: "CI workloads to faster hardware",
     description:
       "Move checkpointed CI work to a faster Linux runner after compatibility checks, rather than re-running completed stages.",
-    workflow: ["shift workloads", "shift migrate ci-job-891 --to https://runner:8443"],
+    workflow: ["shiftgate workloads", "shiftgate migrate ci-job-891 --to https://runner:8443"],
   },
   {
     title: "ML training to GPU machines",
     description:
       "Prepare data and validate non-GPU pipeline logic first. GPU context movement requires an explicit vendor checkpoint adapter and matching hardware; otherwise restart that stage safely from a checkpoint.",
-    workflow: ["shift checkpoint create training-run-7", "shift migrate training-run-7 --to https://gpu-node:8443"],
+    workflow: ["shiftgate checkpoint create training-run-7", "shiftgate migrate training-run-7 --to https://gpu-node:8443"],
   },
 ];
 

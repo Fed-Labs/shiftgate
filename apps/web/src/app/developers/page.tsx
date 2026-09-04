@@ -15,23 +15,23 @@ const fadeUp = {
 
 const cliCommands = [
   {
-    cmd: "shift machines",
+    cmd: "shiftgate machines",
     description: "Show machines known to the control plane",
   },
   {
-    cmd: "shift workloads",
+    cmd: "shiftgate workloads",
     description: "Show workloads managed by the selected agent",
   },
   {
-    cmd: "shift checkpoint create my-workload",
+    cmd: "shiftgate checkpoint create my-workload",
     description: "Capture a running workload through CRIU",
   },
   {
-    cmd: "shift migrate my-workload --to https://host:8443 --machine-id ID",
+    cmd: "shiftgate migrate my-workload --to https://host:8443 --machine-id ID",
     description: "Migrate to an authenticated peer agent",
   },
   {
-    cmd: "shift status",
+    cmd: "shiftgate status",
     description: "Show current migration status and agent health",
   },
 ];
@@ -128,31 +128,31 @@ export default function DevelopersPage() {
                   <Mono className="text-sm text-text-muted"># See what&apos;s running</Mono>
                   <div className="flex items-start gap-3">
                     <span className="text-text-muted text-xs select-none shrink-0 w-4">$</span>
-                    <Mono className="text-sm text-text-secondary">shift workloads</Mono>
+                    <Mono className="text-sm text-text-secondary">shiftgate workloads</Mono>
                   </div>
                   <div className="h-2" />
                   <Mono className="text-sm text-text-muted"># Checkpoint a workload</Mono>
                   <div className="flex items-start gap-3">
                     <span className="text-text-muted text-xs select-none shrink-0 w-4">$</span>
-                    <Mono className="text-sm text-text-secondary">shift checkpoint create training-run-7</Mono>
+                    <Mono className="text-sm text-text-secondary">shiftgate checkpoint create training-run-7</Mono>
                   </div>
                   <div className="h-2" />
                   <Mono className="text-sm text-text-muted"># Move to an authenticated peer and wait</Mono>
                   <div className="flex items-start gap-3">
                     <span className="text-text-muted text-xs select-none shrink-0 w-4">$</span>
-                    <Mono className="text-sm text-text-secondary">shift migrate training-run-7 --wait --to https://target:8443 --machine-id ID</Mono>
+                    <Mono className="text-sm text-text-secondary">shiftgate migrate training-run-7 --wait --to https://target:8443 --machine-id ID</Mono>
                   </div>
                   <div className="h-2" />
                   <Mono className="text-sm text-text-muted"># Inspect workload logs</Mono>
                   <div className="flex items-start gap-3">
                     <span className="text-text-muted text-xs select-none shrink-0 w-4">$</span>
-                    <Mono className="text-sm text-text-secondary">shift logs workload-id</Mono>
+                    <Mono className="text-sm text-text-secondary">shiftgate logs workload-id</Mono>
                   </div>
                   <div className="h-2" />
                   <Mono className="text-sm text-text-muted"># List local workloads after the move</Mono>
                   <div className="flex items-start gap-3">
                     <span className="text-text-muted text-xs select-none shrink-0 w-4">$</span>
-                    <Mono className="text-sm text-text-secondary">shift workloads</Mono>
+                    <Mono className="text-sm text-text-secondary">shiftgate workloads</Mono>
                   </div>
                 </div>
               </Card>

@@ -68,7 +68,7 @@ only. It is never a production posture.
 ### Verify a host is migration-capable
 
 ```bash
-shift doctor
+shiftgate doctor
 sudo criu check
 ```
 
@@ -139,13 +139,13 @@ Use the update system rather than reimaging:
 2. Machines install per their update policy (`mandatory` or staged with a
    percentage) and swap the binary at a safe point — never mid-migration.
 3. Watch versions in the control-plane machine inventory;
-   `shift update status` on a host shows pending/installed/blocked.
-4. A bad release is undone with `shift update rollback`; the undone version
+   `shiftgate update status` on a host shows pending/installed/blocked.
+4. A bad release is undone with `shiftgate update rollback`; the undone version
    is blocked from reinstalling itself.
 
 ## Day-2 checklist
 
-- [ ] `criu check` green on every agent host (part of `shift doctor`).
+- [ ] `criu check` green on every agent host (part of `shiftgate doctor`).
 - [ ] Certificates: expiry dates on the fleet's peer certificates tracked
       like any other TLS estate; one CA, one rotation story.
 - [ ] Database backups scheduled and restore-tested.

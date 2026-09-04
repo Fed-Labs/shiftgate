@@ -7,7 +7,7 @@
 3. Provision the agent certificate and CA files referenced by that configuration.
 4. Copy `deployments/systemd/agent.env.example` to `/etc/shift/agent.env` only when
    configuring object storage; keep it root-owned and mode `0600`.
-5. Enable `deployments/systemd/shift-agent.service` and run `shift doctor`.
+5. Enable `deployments/systemd/shift-agent.service` and run `shiftgate doctor`.
 
 The Unix socket should be owned by root and the intended local operator group. Keep the
 state directory on a filesystem with enough space for the largest checkpoint plus a
@@ -46,9 +46,9 @@ An update is never swapped in blindly. The staged binary must answer `--version`
 version the release signed, the machine must not be running a migration, restore, fork, or
 incoming transfer, and a release that cannot speak the control plane's current protocol or
 read the on-disk configuration and state schemas is refused. The previous binaries are
-preserved — three by default — so `shift update rollback` restores one without network
+preserved — three by default — so `shiftgate update rollback` restores one without network
 access, and the version it undid is blocked so the loop cannot immediately reinstall it.
-A release whose install failed is blocked the same way; `shift update unblock VERSION`
+A release whose install failed is blocked the same way; `shiftgate update unblock VERSION`
 re-arms it.
 
 Publishing is done with `shift-release`: `keygen` creates a signing key pair, `sign` signs
@@ -66,7 +66,7 @@ workload keys or plaintext workload environment metadata.
 
 Checkpoint creation commits the encrypted checkpoint locally before attempting the mirror.
 A transient mirror failure therefore does not discard the checkpoint. Retry publication
-after fixing credentials or connectivity with `shift checkpoint mirror CHECKPOINT_ID`.
+after fixing credentials or connectivity with `shiftgate checkpoint mirror CHECKPOINT_ID`.
 The command is idempotent and verifies objects already present. Stale multipart uploads
 can be inspected and cleaned through the object-store implementation's lifecycle tooling;
 the agent also exposes the cleanup operation internally for scheduled maintenance.
@@ -106,12 +106,12 @@ so no web redirect needs to be registered.
 Once configured, an organization admin claims an email domain:
 
 ```sh
-shift fleet sso --enforce example.com    # claim the domain for single sign-on
-shift fleet sso                          # read the enforcement state
-shift fleet sso --disable                # release the claim
+shiftgate fleet sso --enforce example.com    # claim the domain for single sign-on
+shiftgate fleet sso                          # read the enforcement state
+shiftgate fleet sso --disable                # release the claim
 ```
 
-From that moment the domain's users authenticate with `shift login --sso`, and password
+From that moment the domain's users authenticate with `shiftgate login --sso`, and password
 login and self-service registration for the domain are refused. A domain can be claimed by
 one organization at a time; a federated login automatically joins the enforcing
 organization as a viewer.
@@ -127,7 +127,7 @@ re-activates the same account with its history intact.
 
 Each organization owns three retention windows, in days: audit events, checkpoints, and
 the grace period for already-deleted storage objects. Read and change them with
-`shift fleet retention [--audit-days N] [--checkpoint-days N] [--deleted-storage-days N]`
+`shiftgate fleet retention [--audit-days N] [--checkpoint-days N] [--deleted-storage-days N]`
 (admin role required); an omitted flag leaves its window unchanged and `0` is the
 deliberate keep-forever policy. Every change lands in the audit trail as
 `retention.update`.

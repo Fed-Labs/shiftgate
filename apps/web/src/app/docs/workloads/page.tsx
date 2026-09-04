@@ -89,7 +89,7 @@ export default function WorkloadsPage() {
           <h2 className="text-xl font-semibold mb-4">Creating a workload</h2>
           <div className="rounded-lg border border-border bg-bg-elevated p-5">
             <pre className="text-sm">
-              <code className="text-accent">{`shift workload create demo \\
+              <code className="text-accent">{`shiftgate workload create demo \\
   --path "$PWD/demo" \\
   --start -- /usr/bin/python3 -m http.server 8080`}</code>
             </pre>

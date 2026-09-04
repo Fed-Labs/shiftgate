@@ -8,7 +8,7 @@ commits the move only after destination health validation.
 The repository contains three runnable programs:
 
 - `shift-agent`: privileged local workload, checkpoint, restore, and migration daemon.
-- `shift`: local and fleet command-line client.
+- `shiftgate`: local and fleet command-line client. Named after the gate it opens — the bare name `shift` is a POSIX shell builtin, so a binary called `shift` can never be typed.
 - `shift-control`: authenticated fleet metadata and orchestration API backed by PostgreSQL.
 
 The primary supported target is Linux x86_64. Other operating systems are represented by
@@ -27,20 +27,20 @@ curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/instal
 ```
 
 The service needs root, so the installer uses sudo when it must; everything
-afterward is the unprivileged `shift` CLI. After it finishes:
+afterward is the unprivileged `shiftgate` CLI. After it finishes:
 
 ```bash
-shift doctor                                             # verify the machine can checkpoint
-shift workload create demo --path ~/demo -- python3 -m http.server 8080
-shift workload start demo
-shift checkpoint create demo                             # freeze to an encrypted snapshot
-shift checkpoint list                                    # find the snapshot id
-shift restore CHECKPOINT_ID                              # bring it back
+shiftgate doctor                                             # verify the machine can checkpoint
+shiftgate workload create demo --path ~/demo -- python3 -m http.server 8080
+shiftgate workload start demo
+shiftgate checkpoint create demo                             # freeze to an encrypted snapshot
+shiftgate checkpoint list                                    # find the snapshot id
+shiftgate restore CHECKPOINT_ID                              # bring it back
 ```
 
 The agent answers on `/run/shift/agent.sock`; CLI commands find it there by
 default. A second machine with its own install is a migration target:
-`shift migrate demo --to https://host:8443` (see below for the peer TLS that
+`shiftgate migrate demo --to https://host:8443` (see below for the peer TLS that
 a remote listener requires).
 
 ### From a repository checkout
@@ -50,10 +50,10 @@ Prerequisites: Go 1.24+, CRIU 4+, GNU tar, and Linux with checkpoint/restore ena
 ```bash
 make build
 sudo ./bin/shift-agent --state-dir /var/lib/shift --listen unix:///run/shift/agent.sock
-./bin/shift doctor
-./bin/shift workload create demo --path "$PWD" -- /usr/bin/python3 -m http.server 8080
-./bin/shift workload start demo
-./bin/shift checkpoint create demo
+./bin/shiftgatedoctor
+./bin/shiftgateworkload create demo --path "$PWD" -- /usr/bin/python3 -m http.server 8080
+./bin/shiftgateworkload start demo
+./bin/shiftgatecheckpoint create demo
 ```
 
 Optional checkpoint mirroring can use local disk or an S3-compatible store. Configure the
@@ -63,7 +63,7 @@ ciphertext and the encrypted manifest envelope are uploaded; workload keys remai
 state. If a checkpoint is saved locally but mirroring fails, retry it with:
 
 ```bash
-./bin/shift checkpoint mirror CHECKPOINT_ID
+./bin/shiftgatecheckpoint mirror CHECKPOINT_ID
 ```
 
 For an unprivileged local evaluation, use a writable socket and state directory. Process
@@ -101,18 +101,18 @@ create or dispatch CLI workload operations.
 ```bash
 mkdir -p ./data
 ./bin/shift-agent --state-dir ./data --listen unix://./data/agent.sock
-./bin/shift --agent unix://./data/agent.sock doctor
+./bin/shiftgate--agent unix://./data/agent.sock doctor
 ```
 
-The same `shift` binary manages a control-plane session and the fleet. Login stores the
+The same `shiftgate` binary manages a control-plane session and the fleet. Login stores the
 session under `~/.config/shift/cli-session.json` (0600) keyed to the control plane's URL;
 the password is prompted with echo disabled and never accepted as a flag:
 
 ```bash
-./bin/shift --control-url http://127.0.0.1:8090 login --email operator@example.com
-./bin/shift machines                 # fleet view while a control plane is configured
-./bin/shift fleet entitlement
-./bin/shift marketplace inventory
+./bin/shiftgate--control-url http://127.0.0.1:8090 login --email operator@example.com
+./bin/shiftgatemachines                 # fleet view while a control plane is configured
+./bin/shiftgatefleet entitlement
+./bin/shiftgatemarketplace inventory
 ```
 
 See [the CLI documentation](docs/cli.md) for the fleet, marketplace, and update commands.

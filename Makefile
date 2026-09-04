@@ -6,7 +6,7 @@ all: test build
 
 build:
 	mkdir -p bin
-	go build -trimpath -o bin/shift ./cmd/shift
+	go build -trimpath -o bin/shiftgate ./cmd/shift
 	go build -trimpath -o bin/shift-agent ./cmd/shift-agent
 	go build -trimpath -o bin/shift-control ./cmd/shift-control
 
@@ -14,7 +14,7 @@ agent:
 	go build -trimpath -o bin/shift-agent ./cmd/shift-agent
 
 cli:
-	go build -trimpath -o bin/shift ./cmd/shift
+	go build -trimpath -o bin/shiftgate ./cmd/shift
 
 control:
 	go build -trimpath -o bin/shift-control ./cmd/shift-control
@@ -73,16 +73,16 @@ desktop-bundle:
 
 # Release artifacts for the one-command installer. Asset names carry no
 # version so a release URL's "latest/download" redirect always resolves;
-# the binaries themselves answer --version and the update system verifies
-# the version a release document signs.
+# the binaries themselves answer `shiftgate version` and the update system
+# verifies the version a release document signs.
 dist: build
 	mkdir -p dist
-	tar -czf dist/shift-linux-amd64.tar.gz -C bin shift shift-agent shift-control
-	sha256sum dist/shift-linux-amd64.tar.gz >dist/shift-linux-amd64.tar.gz.sha256
-	printf 'shift %s (linux-amd64)\n' "$$(awk '/const Version/ {print $$4}' internal/config/config.go | tr -d '"')" \
-		| tee dist/shift-linux-amd64.txt
+	tar -czf dist/shiftgate-linux-amd64.tar.gz -C bin shiftgate shift-agent shift-control
+	sha256sum dist/shiftgate-linux-amd64.tar.gz >dist/shiftgate-linux-amd64.tar.gz.sha256
+	printf 'shiftgate %s (linux-amd64)\n' "$$(awk '/const Version/ {print $$4}' internal/config/config.go | tr -d '"')" \
+		| tee dist/shiftgate-linux-amd64.txt
 	@echo 'publish the three files in dist/ as release assets; the installer fetches'
-	@echo 'them from https://github.com/Fed-Labs/shiftgate/releases/latest/download/shift-linux-amd64.tar.gz'
+	@echo 'them from https://github.com/Fed-Labs/shiftgate/releases/latest/download/shiftgate-linux-amd64.tar.gz'
 
 clean:
 	rm -rf bin dist apps/desktop/dist apps/desktop/node_modules apps/desktop/src-tauri/target

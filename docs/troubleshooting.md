@@ -4,10 +4,10 @@ Symptoms, causes, and fixes — in the order operators actually hit them.
 Every diagnosis below starts with a command, because every answer below is
 something the system reports about itself.
 
-## First: `shift doctor`
+## First: `shiftgate doctor`
 
 ```bash
-shift doctor
+shiftgate doctor
 ```
 
 It runs the same checks the agent exposes at `GET /v1/doctor`: CRIU
@@ -62,7 +62,7 @@ source workload**. The migration record shows `ROLLED_BACK` with
 `source_preserved: true` and the failure code. Read the event log:
 
 ```bash
-shift status MIGRATION_ID
+shiftgate status MIGRATION_ID
 ```
 
 If the record shows `FAILED` with "rollback requires operator
@@ -77,7 +77,7 @@ Run the restore and read the error; it names the failing step:
 - Chunk integrity errors (AEAD authentication failed) mean the chunk store
   is corrupted. This is a fail-closed by design — restore never proceeds
   over unverifiable state. Re-cover from the object-store mirror:
-  `shift checkpoint mirror CHECKPOINT_ID` is idempotent and re-fetches
+  `shiftgate checkpoint mirror CHECKPOINT_ID` is idempotent and re-fetches
   missing objects.
 - Port reservation errors mean another workload on this machine holds the
   declared host port; the restore refuses before touching anything.
@@ -117,12 +117,12 @@ The staged binary is swapped in only when the agent can restart safely —
 not during a migration, restore, fork, or incoming transfer. Check:
 
 ```bash
-shift update status
+shiftgate update status
 ```
 
 `pending_restart` means exactly that; it swaps at the next safe point.
-`shift update rollback` undoes a completed swap; the undone version is
-blocked from reinstalling until `shift update unblock VERSION`.
+`shiftgate update rollback` undoes a completed swap; the undone version is
+blocked from reinstalling until `shiftgate update unblock VERSION`.
 
 ## Where the facts live
 
