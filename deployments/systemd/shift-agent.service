@@ -15,12 +15,16 @@ Group=root
 UMask=0077
 StateDirectory=shift
 RuntimeDirectory=shift
+# The agent checkpoints and restores workloads rooted anywhere on the
+# filesystem, so the sandbox keeps only the OS directories read-only. It
+# must not hide /home or mount the whole tree read-only (ProtectSystem=strict,
+# ProtectHome) — that fails every restore whose workload root lives outside
+# /var/lib/shift — and it must allow AF_NETLINK, which CRIU needs to
+# enumerate network state; without it CRIU's kernel-feature detection fails
+# before any dump can start.
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=read-only
-ProtectSystem=strict
-ReadWritePaths=/var/lib/shift /run/shift
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_NET_ADMIN CAP_SETGID CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
 AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_NET_ADMIN CAP_SETGID CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE
 LimitNOFILE=1048576

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"syscall"
 	"time"
 
 	"shift.dev/shift/internal/checkpoint"
@@ -301,6 +302,26 @@ func (c *Client) UpdateUnblock(ctx context.Context, version string) (update.Stat
 	return result, err
 }
 
+// agentHint names what to check when the agent cannot be reached, for the
+// three ways a Unix-socket dial actually fails: the socket not existing (the
+// agent is not running), nothing accepting on it (a stale socket), and
+// permission denied (the caller is not in the socket's group).
+func agentHint(err error) string {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Op != "dial" || opErr.Net != "unix" {
+		return ""
+	}
+	switch {
+	case errors.Is(err, syscall.ENOENT):
+		return " — the agent socket does not exist; is shift-agent running? (systemctl status shift-agent)"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return " — nothing is listening on the agent socket; restart the agent (systemctl restart shift-agent)"
+	case errors.Is(err, syscall.EACCES):
+		return " — permission denied on the agent socket; join the 'shift' group and log in again (newgrp shift)"
+	}
+	return ""
+}
+
 func (c *Client) do(ctx context.Context, method, requestPath string, input, output any) error {
 	var body io.Reader
 	if input != nil {
@@ -322,7 +343,7 @@ func (c *Client) do(ctx context.Context, method, requestPath string, input, outp
 	}
 	response, err := c.http.Do(request)
 	if err != nil {
-		return fmt.Errorf("connect to SHIFT agent: %w", err)
+		return fmt.Errorf("connect to SHIFT agent: %w%s", err, agentHint(err))
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {

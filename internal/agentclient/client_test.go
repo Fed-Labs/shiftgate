@@ -6,7 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -76,6 +81,25 @@ func TestClientDecodesAPIErrors(t *testing.T) {
 	}
 	if apiError.Status != http.StatusNotFound || apiError.Code != "WORKLOAD_NOT_FOUND" {
 		t.Fatalf("unexpected API error: %#v", apiError)
+	}
+}
+
+func TestAgentHintNamesSocketFailures(t *testing.T) {
+	dial := func(err error) error {
+		return &url.Error{Op: "Get", URL: "http://shift-agent/v1/doctor", Err: &net.OpError{Op: "dial", Net: "unix", Err: &os.SyscallError{Syscall: "connect", Err: err}}}
+	}
+	if hint := agentHint(dial(syscall.ENOENT)); !strings.Contains(hint, "shift-agent running") {
+		t.Fatalf("missing socket must hint at the service, got %q", hint)
+	}
+	if hint := agentHint(dial(syscall.ECONNREFUSED)); !strings.Contains(hint, "restart the agent") {
+		t.Fatalf("refused socket must hint at a restart, got %q", hint)
+	}
+	if hint := agentHint(dial(syscall.EACCES)); !strings.Contains(hint, "shift' group") {
+		t.Fatalf("denied socket must hint at the group, got %q", hint)
+	}
+	tcp := &url.Error{Op: "Get", URL: "http://shift-agent/v1/doctor", Err: &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}}
+	if hint := agentHint(tcp); hint != "" {
+		t.Fatalf("non-unix dial must carry no hint, got %q", hint)
 	}
 }
 

@@ -19,7 +19,7 @@ import (
 	"shift.dev/shift/internal/persistence"
 )
 
-const Version = "0.1.2"
+const Version = "0.1.4"
 
 // AgentConfigVersion is the on-disk agent configuration schema this build reads
 // and writes. It is compared against a release's config schema so an update that
