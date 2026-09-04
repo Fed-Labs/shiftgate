@@ -207,7 +207,17 @@ if [ "$SYSTEMD_UNIT" = "1" ]; then
         die "remote peer TLS files referenced by the example config are missing"
     fi
     as_root install -m 0644 "$REPO_DIR/deployments/systemd/shift-agent.service" /etc/systemd/system/shift-agent.service
-    if as_root systemctl enable --now shift-agent.service; then
+    # enable --now starts an inactive unit but never restarts a running one —
+    # an upgrade must replace the running agent, or the old binary keeps
+    # serving the local API until the next reboot.
+    service_started() {
+        if as_root systemctl is-active --quiet shift-agent.service; then
+            as_root systemctl restart shift-agent.service
+        else
+            as_root systemctl enable --now shift-agent.service
+        fi
+    }
+    if service_started; then
         log "Agent service enabled"
     else
         as_root systemctl disable --failed shift-agent.service >/dev/null 2>&1 || true

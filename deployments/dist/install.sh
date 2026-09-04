@@ -232,10 +232,21 @@ WantedBy=multi-user.target
 EOF
     as_root install -m 0644 "$WORKDIR/shift-agent.service" /etc/systemd/system/shift-agent.service
     as_root systemctl daemon-reload
-    if as_root systemctl enable --now shift-agent.service; then
-        log "Agent service enabled and started"
+    # enable --now starts an inactive unit but never restarts a running one —
+    # an upgrade must replace the running agent, or the old binary keeps
+    # serving the local API until the next reboot.
+    if as_root systemctl is-active --quiet shift-agent.service; then
+        if as_root systemctl restart shift-agent.service; then
+            log "Agent service restarted on the new binary"
+        else
+            log "WARNING: service failed to restart; check 'journalctl -u shift-agent'"
+        fi
     else
-        log "WARNING: service failed to start; check 'journalctl -u shift-agent'"
+        if as_root systemctl enable --now shift-agent.service; then
+            log "Agent service enabled and started"
+        else
+            log "WARNING: service failed to start; check 'journalctl -u shift-agent'"
+        fi
     fi
 fi
 
