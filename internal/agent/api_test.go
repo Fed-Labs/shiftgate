@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,5 +119,31 @@ func TestLocalAPIRetriesCheckpointMirror(t *testing.T) {
 	}
 	if _, err := remote.Head(context.Background(), "checkpoints/"+manifest.ID+"/manifest.enc.json"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDoctorCRIUMessage(t *testing.T) {
+	healthy := model.CRIUCapabilities{Installed: true, Healthy: true, Version: "Version: 4.2"}
+	if got := doctorCRIUMessage(healthy); got != "Version: 4.2" {
+		t.Fatalf("healthy check must show the version, got %q", got)
+	}
+	failed := model.CRIUCapabilities{
+		Installed: true,
+		Version:   "Version: 4.2",
+		Errors:    []string{"Error (criu.c:123): kernel doesn't support xxx\nsecond line"},
+	}
+	got := doctorCRIUMessage(failed)
+	if strings.Contains(got, "\n") {
+		t.Fatalf("failed check must collapse to one line, got %q", got)
+	}
+	if !strings.Contains(got, "kernel doesn't support xxx") || !strings.Contains(got, "second line") {
+		t.Fatalf("failed check must name the kernel gap, got %q", got)
+	}
+	if !strings.HasPrefix(got, "Version: 4.2 — ") {
+		t.Fatalf("failed check must lead with the version, got %q", got)
+	}
+	noVersion := model.CRIUCapabilities{Installed: true, Errors: []string{"exec: not found"}}
+	if got := doctorCRIUMessage(noVersion); got != "exec: not found" {
+		t.Fatalf("missing version must show only the error, got %q", got)
 	}
 }

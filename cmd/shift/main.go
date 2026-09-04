@@ -39,7 +39,7 @@ func (e exitError) Error() string { return e.err.Error() }
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, "shift:", err)
+		fmt.Fprintln(os.Stderr, "shiftgate:", err)
 		var exit exitError
 		if errors.As(err, &exit) {
 			os.Exit(exit.code)

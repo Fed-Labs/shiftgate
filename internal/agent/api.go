@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -148,12 +149,27 @@ func (s *Service) handleIdentity(writer http.ResponseWriter, _ *http.Request) {
 	writeAPIJSON(writer, http.StatusOK, s.identity.Machine)
 }
 
+// doctorCRIUMessage renders the CRIU check's message. A healthy check shows
+// the version; a failed one must show why — criu check's own output, which
+// names the missing kernel capability — or the failure is undiagnosable from
+// the doctor table alone.
+func doctorCRIUMessage(criu model.CRIUCapabilities) string {
+	if criu.Healthy || len(criu.Errors) == 0 {
+		return criu.Version
+	}
+	detail := strings.Join(strings.Fields(strings.Join(criu.Errors, "; ")), " ")
+	if criu.Version == "" {
+		return detail
+	}
+	return criu.Version + " — " + detail
+}
+
 func (s *Service) handleDoctor(writer http.ResponseWriter, request *http.Request) {
 	capabilities, err := s.inventory.Inspect(request.Context())
 	checks := []doctorCheck{
 		{Name: "platform", OK: model.CurrentPlatformSupported(), Message: capabilities.OS + "/" + capabilities.Architecture},
 		{Name: "privileges", OK: os.Geteuid() == 0, Message: "agent effective uid " + strconv.Itoa(os.Geteuid())},
-		{Name: "criu", OK: capabilities.CRIU.Installed && capabilities.CRIU.Healthy, Message: capabilities.CRIU.Version},
+		{Name: "criu", OK: capabilities.CRIU.Installed && capabilities.CRIU.Healthy, Message: doctorCRIUMessage(capabilities.CRIU)},
 		{Name: "cgroup_v2", OK: capabilities.Features["cgroup_v2"], Message: "cgroup v2 workload isolation"},
 		{Name: "archive", OK: capabilities.Features["gnu_tar"], Message: "GNU tar with metadata support"},
 	}

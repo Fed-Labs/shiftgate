@@ -78,7 +78,7 @@ desktop-bundle:
 dist: build
 	mkdir -p dist
 	tar -czf dist/shiftgate-linux-amd64.tar.gz -C bin shiftgate shift-agent shift-control
-	sha256sum dist/shiftgate-linux-amd64.tar.gz >dist/shiftgate-linux-amd64.tar.gz.sha256
+	cd dist && sha256sum shiftgate-linux-amd64.tar.gz >shiftgate-linux-amd64.tar.gz.sha256
 	printf 'shiftgate %s (linux-amd64)\n' "$$(awk '/const Version/ {print $$4}' internal/config/config.go | tr -d '"')" \
 		| tee dist/shiftgate-linux-amd64.txt
 	@echo 'publish the three files in dist/ as release assets; the installer fetches'
