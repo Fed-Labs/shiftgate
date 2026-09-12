@@ -16,6 +16,11 @@ type Plan struct {
 	Features        []string `json:"features"`
 	MaxMachines     int      `json:"max_machines"`
 	MaxStorageBytes int64    `json:"max_storage_bytes"`
+	// LiveMigration is the structured twin of the "Live migration" feature
+	// string: the control plane reads it to gate live-mode migrations, so the
+	// tiering the pricing page shows and the tiering the server enforces are
+	// the same value.
+	LiveMigration bool `json:"live_migration"`
 }
 
 // Unlimited and Custom mark negotiated or unmetered values.
@@ -37,6 +42,7 @@ func Catalog() []Plan {
 			Features:        []string{"2 machines", "10 GB checkpoint storage", "Cold migration mode", "Community support"},
 			MaxMachines:     2,
 			MaxStorageBytes: 10 * 1024 * 1024 * 1024,
+			LiveMigration:   false,
 		},
 		{
 			Key:             "pro",
@@ -46,6 +52,7 @@ func Catalog() []Plan {
 			Features:        []string{"10 machines", "500 GB checkpoint storage", "Live migration", "Checkpoint history & lineage", "Priority support"},
 			MaxMachines:     10,
 			MaxStorageBytes: 500 * 1024 * 1024 * 1024,
+			LiveMigration:   true,
 		},
 		{
 			Key:             "business",
@@ -53,9 +60,10 @@ func Catalog() []Plan {
 			PriceCents:      9900,
 			PerSeat:         true,
 			Description:     "Teams, permissions, audit logs.",
-			Features:        []string{"Unlimited machines", "2 TB checkpoint storage", "Team members & roles", "Audit logging", "SSO (SAML)", "Priority support"},
+			Features:        []string{"Unlimited machines", "2 TB checkpoint storage", "Team members & roles", "Audit logging", "SSO (OIDC) & SCIM provisioning", "Priority support"},
 			MaxMachines:     Unlimited,
 			MaxStorageBytes: 2 * 1024 * 1024 * 1024 * 1024,
+			LiveMigration:   true,
 		},
 		{
 			Key:             "enterprise",
@@ -65,6 +73,7 @@ func Catalog() []Plan {
 			Features:        []string{"Unlimited everything", "Self-hosted option", "Custom data residency", "Dedicated support engineer", "SLA", "On-premise deployment"},
 			MaxMachines:     Unlimited,
 			MaxStorageBytes: Unlimited,
+			LiveMigration:   true,
 		},
 	}
 }

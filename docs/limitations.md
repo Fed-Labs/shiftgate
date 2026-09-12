@@ -57,6 +57,12 @@
   the source preserved and running. The final checkpoint remains authoritative and
   the workload is stopped for the final transfer; the pre-dump passes reduce, never
   eliminate, the frozen transfer. Transparent filesystem copy-on-write is not assumed.
+  Plan tiering: live mode dispatched through the control plane — the migration job
+  route or the agent command dispatcher — requires a paid plan (the free tier is
+  cold-only, enforced as `LIVE_MIGRATION_PLAN_REQUIRED`). A peer-to-peer
+  `shiftgate migrate --mode live` between your own agents never touches the control
+  plane, so the platform cannot gate it; the tier applies to platform-mediated
+  migrations only.
 - Periodic checkpoint policies snapshot a running workload every interval (floor 10
   seconds) without stopping it. Each periodic snapshot is a full checkpoint — every
   retained snapshot restores on its own, at the cost of full-size storage per snapshot —

@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui";
 import { cn } from "@/lib/utils";
@@ -29,6 +29,19 @@ export function MigrateDialog({ workload, machines, onClose, onMigrated }: Migra
   const candidates = machines.filter(
     (m) => m.machine_id !== workload.machine_id && m.agent_url && m.status !== "disabled" && m.status !== "offline"
   );
+  // The plan decides whether live mode is offered at all: the free tier is
+  // cold-only and the control plane enforces it (LIVE_MIGRATION_PLAN_REQUIRED).
+  // The entitlement fetch is advisory — if it fails, the options stay open and
+  // the server's refusal is the gate that shows.
+  const entitlementQuery = useQuery({
+    queryKey: ["entitlement", orgId],
+    queryFn: () => api.getEntitlement(orgId),
+    staleTime: 60_000,
+  });
+  const liveGated = entitlementQuery.data?.plan === "free";
+  useEffect(() => {
+    if (liveGated) setMode("cold");
+  }, [liveGated]);
 
   const migrate = useMutation({
     mutationFn: async () => {
@@ -160,6 +173,8 @@ export function MigrateDialog({ workload, machines, onClose, onMigrated }: Migra
                 title="Live"
                 description="Pre-copy passes while it runs; a short freeze for the final delta"
                 onClick={() => setMode("live")}
+                disabled={liveGated}
+                note={liveGated ? "Paid plan feature — the free tier is cold-only" : undefined}
               />
             </div>
           </div>
@@ -217,24 +232,31 @@ function ModeOption({
   title,
   description,
   onClick,
+  disabled,
+  note,
 }: {
   selected: boolean;
   title: string;
   description: string;
   onClick: () => void;
+  disabled?: boolean;
+  note?: string;
 }) {
   return (
     <button
-      onClick={onClick}
+      onClick={() => !disabled && onClick()}
+      disabled={disabled}
       className={cn(
         "text-left px-3 py-2.5 border transition-colors",
-        selected ? "border-accent bg-accent/5" : "border-border-subtle hover:border-border-strong"
+        selected && !disabled ? "border-accent bg-accent/5" : "border-border-subtle",
+        disabled ? "opacity-50 cursor-not-allowed" : "hover:border-border-strong"
       )}
     >
-      <p className={cn("font-mono text-[11px] tracking-[0.12em] mb-1", selected ? "text-accent" : "text-text-secondary")}>
+      <p className={cn("font-mono text-[11px] tracking-[0.12em] mb-1", selected && !disabled ? "text-accent" : "text-text-secondary")}>
         {title.toUpperCase()}
       </p>
       <p className="text-[10px] text-text-muted leading-snug">{description}</p>
+      {note && <p className="text-[10px] text-status-warning leading-snug mt-1">{note}</p>}
     </button>
   );
 }

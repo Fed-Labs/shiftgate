@@ -31,6 +31,7 @@ export interface PlanCatalogEntry {
   features: string[];
   max_machines: number; // -1 = unlimited
   max_storage_bytes: number; // -1 = unlimited
+  live_migration: boolean; // false on the free (cold-only) tier
 }
 
 export type APIKeyScope =

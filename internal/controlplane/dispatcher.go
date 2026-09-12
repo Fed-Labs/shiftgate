@@ -181,6 +181,9 @@ func (server *Server) handleAgentCommand(writer http.ResponseWriter, request *ht
 			writeError(writer, http.StatusNotFound, "WORKLOAD_NOT_FOUND", "workload was not found on this machine")
 			return
 		}
+		if !server.requireLiveMigrationPlan(writer, request, organizationID, input.Mode) {
+			return
+		}
 		mode := model.MigrationCold
 		if input.Mode == "live" {
 			mode = model.MigrationLive

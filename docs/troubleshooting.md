@@ -99,6 +99,15 @@ intervention", the rollback itself hit an error (dead peer, resume
 failure) — the source root is still on disk; the failure reason names the
 step.
 
+## Dashboard or API migration returns 402 LIVE_MIGRATION_PLAN_REQUIRED
+
+The organization's plan is the free tier, which is cold-only. Live mode
+dispatched through the control plane — the migration job route or the
+dashboard's MOVE dialog — requires a paid plan. Re-dispatch with the cold
+mode (the default), or upgrade the plan in billing. A `shiftgate migrate
+--mode live` run from a machine's CLI talks peer-to-peer and never touches
+the control plane, so it is not subject to the tier.
+
 ## Restore fails but the checkpoint exists
 
 Run the restore and read the error; it names the failing step:

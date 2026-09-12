@@ -371,6 +371,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/MigrationJob' }
+        '402':
+          description: Live migration mode requires a paid plan; the free tier is cold-only.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v1/organizations/{organizationID}/audit:
     parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
     get:
@@ -1539,6 +1544,7 @@ components:
           items: { type: string }
         max_machines: { type: integer, description: -1 means unlimited }
         max_storage_bytes: { type: integer, format: int64, description: -1 means unlimited }
+        live_migration: { type: boolean, description: Whether the plan's tier may dispatch live-mode migrations; the free tier is cold-only }
     CheckoutRequest:
       type: object
       required: [plan, success_url, cancel_url]

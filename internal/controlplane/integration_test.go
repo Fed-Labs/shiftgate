@@ -101,6 +101,23 @@ func TestPostgreSQLControlPlaneFlow(t *testing.T) {
 		t.Fatalf("unexpected migration job: %#v", migration)
 	}
 
+	// The free tier is cold-only: both platform-mediated migration paths —
+	// the migration job route and the agent command dispatcher — refuse a
+	// live mode before any work starts.
+	var liveMigrationError ErrorResponse
+	postJSON(t, client, organizationPath+"/migrations", CreateMigrationRequest{WorkloadID: workload.ID, SourceMachineID: machine.MachineID, DestinationMachineID: destination.MachineID, Mode: "live"}, http.StatusPaymentRequired, &liveMigrationError, authHeader)
+	if liveMigrationError.Code != "LIVE_MIGRATION_PLAN_REQUIRED" {
+		t.Fatalf("free plan live migration was not refused: %#v", liveMigrationError)
+	}
+	postJSON(t, client, organizationPath+"/machines/"+machine.MachineID+"/commands", AgentCommandRequest{
+		Action: "migrate", WorkloadID: workload.ID, DestinationID: destination.MachineID, Mode: "live",
+	}, http.StatusPaymentRequired, &liveMigrationError, authHeader)
+	if liveMigrationError.Code != "LIVE_MIGRATION_PLAN_REQUIRED" {
+		t.Fatalf("free plan live dispatch was not refused: %#v", liveMigrationError)
+	}
+	// The dispatcher's gate runs before the agent is even contacted, so this
+	// ordering also proves the refusal is the plan check, not the
+	// unreachable-agent error the cold command below reports.
 	var agentError ErrorResponse
 	postJSON(t, client, organizationPath+"/machines/machine-source/commands", AgentCommandRequest{
 		Action: "start", WorkloadID: workload.ID,
@@ -259,6 +276,21 @@ func TestPostgreSQLControlPlaneFlow(t *testing.T) {
 	}
 	if upgraded.StripeCustomerID != "cus_integration_1" {
 		t.Fatalf("subscription webhook did not store the customer: %#v", upgraded)
+	}
+	// The paid plan unlocks live mode on both paths: the job route accepts
+	// it, and the dispatcher proceeds past the plan gate to the (unreachable)
+	// agent.
+	var liveMigration MigrationJob
+	postJSON(t, client, organizationPath+"/migrations", CreateMigrationRequest{WorkloadID: workload.ID, SourceMachineID: machine.MachineID, DestinationMachineID: destination.MachineID, Mode: "live"}, http.StatusAccepted, &liveMigration, authHeader)
+	if liveMigration.Mode != "live" {
+		t.Fatalf("pro plan live migration was refused: %#v", liveMigration)
+	}
+	var dispatchError ErrorResponse
+	postJSON(t, client, organizationPath+"/machines/"+machine.MachineID+"/commands", AgentCommandRequest{
+		Action: "migrate", WorkloadID: workload.ID, DestinationID: destination.MachineID, Mode: "live",
+	}, http.StatusBadGateway, &dispatchError, authHeader)
+	if dispatchError.Code != "AGENT_UNREACHABLE" {
+		t.Fatalf("pro plan live dispatch did not pass the plan gate: %#v", dispatchError)
 	}
 	var portal map[string]string
 	postJSON(t, client, organizationPath+"/billing/portal", map[string]any{"return_url": "https://app.example.com/billing"}, http.StatusOK, &portal, authHeader)

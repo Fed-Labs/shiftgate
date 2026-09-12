@@ -46,7 +46,7 @@ const FEATURES = [
     icon: KeyRound,
     title: "SSO integration",
     description:
-      "Connect your identity provider. SAML 2.0 and OIDC support for seamless authentication across your organization.",
+      "Connect your identity provider. OIDC single sign-on and SCIM user provisioning for seamless authentication across your organization.",
   },
   {
     icon: ClipboardList,

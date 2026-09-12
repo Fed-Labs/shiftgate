@@ -293,9 +293,9 @@ func TestCloneRecoversInterruptedSet(t *testing.T) {
 		ID: "forged-set", CheckpointID: manifest.ID, SourceWorkloadID: fixture.source.Spec.ID,
 		SourceRootPath: fixture.root, Count: 1, Parallel: 1, State: CloneCloning,
 		SetDirectory: setDirectory, StagingRoot: filepath.Join(setDirectory, "staging"),
-		ImagesRoot:  filepath.Join(setDirectory, "images"),
-		Members:     []CloneMember{{Index: 1, WorkloadID: orphan.Spec.ID, Name: "orphan-clone", RootPath: orphanRoot, State: "MATERIALIZING", CreatedWorkload: true}},
-		CreatedAt:   time.Now().UTC().Add(-time.Minute), UpdatedAt: time.Now().UTC().Add(-time.Minute),
+		ImagesRoot: filepath.Join(setDirectory, "images"),
+		Members:    []CloneMember{{Index: 1, WorkloadID: orphan.Spec.ID, Name: "orphan-clone", RootPath: orphanRoot, State: "MATERIALIZING", CreatedWorkload: true}},
+		CreatedAt:  time.Now().UTC().Add(-time.Minute), UpdatedAt: time.Now().UTC().Add(-time.Minute),
 	}
 	if err := fixture.cloner.put(forged); err != nil {
 		t.Fatal(err)
@@ -391,4 +391,3 @@ func TestCloneSpecificationDerivesDistinctIdentities(t *testing.T) {
 		t.Fatalf("lineage: %+v", first.Lineage)
 	}
 }
-
