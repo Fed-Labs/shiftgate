@@ -21,7 +21,7 @@ import (
 func TestCLIOverUnixSocket(t *testing.T) {
 	stateDir := t.TempDir()
 	socketPath := stateDir + "/agent.sock"
-	probe, probeErr := net.Listen("unix", socketPath)
+	probe, probeErr := (&net.ListenConfig{}).Listen(context.Background(), "unix", socketPath)
 	if probeErr != nil {
 		t.Skipf("Unix socket integration is unavailable in this environment: %v", probeErr)
 	}

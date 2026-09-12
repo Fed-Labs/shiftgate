@@ -128,7 +128,7 @@ func (Checker) Check(manifest model.CheckpointManifest, destination model.Machin
 	return report
 }
 
-func kernelVersion(value string) (int, int, bool) {
+func kernelVersion(value string) (major, minor int, ok bool) {
 	parts := strings.SplitN(value, ".", 3)
 	if len(parts) < 2 {
 		return 0, 0, false

@@ -461,12 +461,12 @@ func decompressGzip(sourcePath, targetPath string) error {
 	if err != nil {
 		return fmt.Errorf("open compressed artifact: %w", err)
 	}
-	defer source.Close()
+	defer func() { _ = source.Close() }()
 	reader, err := gzip.NewReader(source)
 	if err != nil {
 		return fmt.Errorf("read compressed artifact: %w", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("create decompressed artifact: %w", err)
@@ -490,7 +490,7 @@ func fileDigest(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("open %s: %w", path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	digest := sha256.New()
 	if _, err := io.Copy(digest, file); err != nil {
 		return "", fmt.Errorf("read %s: %w", path, err)
@@ -503,7 +503,7 @@ func copyFile(sourcePath, targetPath string, mode os.FileMode) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", sourcePath, err)
 	}
-	defer source.Close()
+	defer func() { _ = source.Close() }()
 	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", targetPath, err)
@@ -531,7 +531,7 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return fmt.Errorf("open %s for sync: %w", path, err)
 	}
-	defer directory.Close()
+	defer func() { _ = directory.Close() }()
 	if err := directory.Sync(); err != nil && !errors.Is(err, os.ErrInvalid) {
 		return fmt.Errorf("sync %s: %w", path, err)
 	}

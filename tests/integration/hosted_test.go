@@ -98,7 +98,7 @@ func registerHostedMachine(t *testing.T, env hostedEnv, machineID, agentURL stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	request, err := http.NewRequest(http.MethodPost,
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		fmt.Sprintf("%s/v1/organizations/%s/machines", env.controlURL, env.orgID), bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)

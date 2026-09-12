@@ -19,7 +19,7 @@ func (store *Store) ApplyStripeSubscription(ctx context.Context, eventID, eventT
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	command, err := tx.Exec(ctx, `INSERT INTO stripe_events(event_id,event_type,payload) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, eventID, eventType, payload)
 	if err != nil {
 		return false, err

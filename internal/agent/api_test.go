@@ -36,8 +36,8 @@ func TestLocalAPIWorkloadOwnership(t *testing.T) {
 		WorkingDir: workloadRoot, UID: os.Geteuid(), GID: os.Getegid(),
 	}
 	body, _ := json.Marshal(spec)
-	request := httptest.NewRequest(http.MethodPost, "/v1/workloads", bytes.NewReader(body))
-	request = request.WithContext(context.WithValue(request.Context(), credentialsContextKey{}, peerCredentials{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}))
+	ownerContext := context.WithValue(context.Background(), credentialsContextKey{}, peerCredentials{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())})
+	request := httptest.NewRequestWithContext(ownerContext, http.MethodPost, "/v1/workloads", bytes.NewReader(body))
 	response := httptest.NewRecorder()
 	service.localHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusCreated {
@@ -47,8 +47,8 @@ func TestLocalAPIWorkloadOwnership(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	unauthorized := httptest.NewRequest(http.MethodGet, "/v1/workloads/"+created.Spec.ID, nil)
-	unauthorized = unauthorized.WithContext(context.WithValue(unauthorized.Context(), credentialsContextKey{}, peerCredentials{UID: uint32(os.Geteuid() + 1), GID: uint32(os.Getegid() + 1)}))
+	otherContext := context.WithValue(context.Background(), credentialsContextKey{}, peerCredentials{UID: uint32(os.Geteuid() + 1), GID: uint32(os.Getegid() + 1)})
+	unauthorized := httptest.NewRequestWithContext(otherContext, http.MethodGet, "/v1/workloads/"+created.Spec.ID, nil)
 	unauthorizedResponse := httptest.NewRecorder()
 	service.localHandler().ServeHTTP(unauthorizedResponse, unauthorized)
 	if unauthorizedResponse.Code != http.StatusForbidden {
@@ -65,7 +65,7 @@ func TestHealthRequiresLocalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/health", nil)
 	response := httptest.NewRecorder()
 	service.localHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {
@@ -103,7 +103,7 @@ func TestLocalAPIRetriesCheckpointMirror(t *testing.T) {
 	}
 	service.checkpoints.SetMirror(checkpoint.NewMirror(remote, service.chunks, service.repository))
 
-	request := httptest.NewRequest(http.MethodPost, "/v1/checkpoints/"+manifest.ID+"/mirror", nil)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/checkpoints/"+manifest.ID+"/mirror", nil)
 	request = request.WithContext(context.WithValue(request.Context(), credentialsContextKey{}, peerCredentials{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}))
 	response := httptest.NewRecorder()
 	service.localHandler().ServeHTTP(response, request)
@@ -160,7 +160,7 @@ func localCall(t *testing.T, service *Service, method, requestPath string, input
 		}
 		body = bytes.NewReader(encoded)
 	}
-	request := httptest.NewRequest(method, requestPath, body)
+	request := httptest.NewRequestWithContext(context.Background(), method, requestPath, body)
 	if input != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}

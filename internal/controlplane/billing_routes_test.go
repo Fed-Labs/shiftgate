@@ -23,7 +23,11 @@ func newBillingTestServer(t *testing.T, configuration config.ControlPlane) *http
 
 func TestHandlePlansServesCatalog(t *testing.T) {
 	httpServer := newBillingTestServer(t, config.DefaultControlPlane())
-	response, err := httpServer.Client().Get(httpServer.URL + "/v1/plans")
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, httpServer.URL+"/v1/plans", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := httpServer.Client().Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +68,7 @@ func TestHandlePlansServesCatalog(t *testing.T) {
 func checkoutCall(t *testing.T, configuration config.ControlPlane, body string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 	server := New(configuration, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	request := httptest.NewRequest(http.MethodPost, "/v1/organizations/org_1/billing/checkout", strings.NewReader(body))
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/organizations/org_1/billing/checkout", strings.NewReader(body))
 	request = request.WithContext(context.WithValue(request.Context(), principalContextKey, Principal{UserID: "user_1", Email: "admin@example.com", Role: RoleAdmin}))
 	request.Header.Set("Content-Type", "application/json")
 	request.SetPathValue("organizationID", "org_1")
@@ -138,7 +142,7 @@ func TestCheckoutPerSeatRequiresSeats(t *testing.T) {
 
 func TestCheckoutUnauthenticatedRoute(t *testing.T) {
 	httpServer := newBillingTestServer(t, config.DefaultControlPlane())
-	request, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/organizations/org_1/billing/checkout", strings.NewReader(`{"plan":"pro"}`))
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, httpServer.URL+"/v1/organizations/org_1/billing/checkout", strings.NewReader(`{"plan":"pro"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +158,7 @@ func TestCheckoutUnauthenticatedRoute(t *testing.T) {
 
 func TestPortalRequiresConfiguration(t *testing.T) {
 	server := New(config.DefaultControlPlane(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	request := httptest.NewRequest(http.MethodPost, "/v1/organizations/org_1/billing/portal", strings.NewReader(`{}`))
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/organizations/org_1/billing/portal", strings.NewReader(`{}`))
 	request = request.WithContext(context.WithValue(request.Context(), principalContextKey, Principal{UserID: "user_1", Role: RoleAdmin}))
 	request.SetPathValue("organizationID", "org_1")
 	recorder := httptest.NewRecorder()
@@ -182,7 +186,7 @@ func TestResolveSubscriptionLimitsPrefersCatalog(t *testing.T) {
 	if machines != 10 {
 		t.Fatalf("machines = %d, want the pro catalog limit", machines)
 	}
-	plan, storage, machines = resolveSubscriptionLimits(map[string]string{"plan": "business"})
+	_, storage, machines = resolveSubscriptionLimits(map[string]string{"plan": "business"})
 	if storage != 2*1024*1024*1024*1024 || machines != -1 {
 		t.Fatalf("business limits = (%d, %d), want 2 TiB and unlimited", storage, machines)
 	}

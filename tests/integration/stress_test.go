@@ -25,7 +25,7 @@ import (
 
 // runCommand runs a system command, returning its error.
 func runCommand(name string, arguments ...string) error {
-	command := exec.Command(name, arguments...)
+	command := exec.CommandContext(context.Background(), name, arguments...)
 	command.Stdout = nil
 	command.Stderr = nil
 	return command.Run()
@@ -219,7 +219,7 @@ type latencyProxy struct {
 
 func startLatencyProxy(t *testing.T, target string, delay time.Duration) *latencyProxy {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen for latency proxy: %v", err)
 	}
@@ -245,7 +245,7 @@ func (p *latencyProxy) acceptLoop() {
 
 func (p *latencyProxy) handle(client net.Conn) {
 	defer client.Close()
-	upstream, err := net.Dial("tcp", p.target)
+	upstream, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", p.target)
 	if err != nil {
 		return
 	}

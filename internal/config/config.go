@@ -192,7 +192,7 @@ func (c *Agent) Validate() error {
 		if err != nil || remote.Scheme != "tcp" || remote.Host == "" {
 			return errors.New("remote_listen must be a tcp:// address")
 		}
-		if c.InsecureDevelopment == false && (c.TLS.CertificateFile == "" || c.TLS.PrivateKeyFile == "" || c.TLS.ClientCAFile == "") {
+		if !c.InsecureDevelopment && (c.TLS.CertificateFile == "" || c.TLS.PrivateKeyFile == "" || c.TLS.ClientCAFile == "") {
 			return errors.New("remote TCP listeners require mutual TLS certificate, key, and client CA")
 		}
 	}
@@ -265,7 +265,8 @@ func LoadAgent(path string) (Agent, error) {
 		configuration.SetStateDir(configuration.StateDir)
 	}
 	applyAgentEnvironment(&configuration)
-	return configuration, configuration.Validate()
+	err := configuration.Validate()
+	return configuration, err
 }
 
 func applyAgentEnvironment(configuration *Agent) {
@@ -381,7 +382,7 @@ func configuredObjectStorePaths(path string) (localRoot, stateDir bool, err erro
 	if err != nil {
 		return false, false, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	var document struct {
 		ObjectStore map[string]json.RawMessage `json:"object_store"`
 	}

@@ -15,7 +15,7 @@ func (store *Store) CreateMachine(ctx context.Context, record MachineRecord, aud
 	if err != nil {
 		return MachineRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var maximum int
 	if err := tx.QueryRow(ctx, `SELECT max_machines FROM entitlements WHERE organization_id=$1 FOR UPDATE`, record.OrganizationID).Scan(&maximum); err != nil {
 		return MachineRecord{}, err
@@ -88,7 +88,7 @@ func (store *Store) UpdateMachineHeartbeat(ctx context.Context, organizationID, 
 	if err != nil {
 		return MachineRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var record MachineRecord
 	err = tx.QueryRow(ctx, `UPDATE machines SET name=COALESCE(NULLIF($3,''),name),agent_url=COALESCE(NULLIF($4,''),agent_url),capabilities=COALESCE($5,capabilities),status=$6,last_seen_at=now(),updated_at=now()
 		WHERE organization_id=$1 AND machine_id=$2

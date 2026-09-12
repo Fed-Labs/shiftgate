@@ -144,7 +144,7 @@ func (s *S3) Get(ctx context.Context, key string, writer io.Writer) (ObjectInfo,
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	expected := strings.ToLower(strings.TrimSpace(response.Header.Get("X-Amz-Meta-Sha256")))
 	if expected != "" {
 		if expected, err = expectedHash(expected); err != nil {
@@ -210,7 +210,7 @@ func (s *S3) InitiateMultipart(ctx context.Context, key string, totalSize int64,
 	if err != nil {
 		return MultipartUpload{}, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	var result initiateMultipartResult
 	if err := xml.NewDecoder(response.Body).Decode(&result); err != nil || strings.TrimSpace(result.UploadID) == "" {
 		return MultipartUpload{}, fmt.Errorf("%w: invalid initiate response", ErrRemote)
@@ -246,7 +246,7 @@ func (s *S3) UploadPart(ctx context.Context, uploadID string, number int, reader
 	if err != nil {
 		return PartInfo{}, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	_, _ = io.Copy(io.Discard, response.Body)
 	part := PartInfo{Number: number, Size: size, SHA256: expected, ETag: trimQuotes(response.Header.Get("ETag"))}
 	if part.ETag == "" {
@@ -282,7 +282,7 @@ func (s *S3) ListParts(ctx context.Context, uploadID string) ([]PartInfo, error)
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	var result listPartsResult
 	if err := xml.NewDecoder(response.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("%w: invalid list-parts response", ErrRemote)
@@ -517,7 +517,7 @@ func (s *S3) doURL(ctx context.Context, method string, target *url.URL, headers 
 	s.sign(request)
 	response, err := s.client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrRemote, err)
+		return nil, fmt.Errorf("%w: %w", ErrRemote, err)
 	}
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
 		return response, nil
@@ -537,7 +537,7 @@ func (s *S3) sign(request *http.Request) {
 // cannot produce a signature mixed from two credential generations.
 // payloadHash is the hex SHA-256 the server should verify the body against;
 // the empty string means UNSIGNED-PAYLOAD, which S3 accepts but STS does not.
-func (s *S3) signService(request *http.Request, service string, payloadHash string) {
+func (s *S3) signService(request *http.Request, service, payloadHash string) {
 	if payloadHash == "" {
 		payloadHash = "UNSIGNED-PAYLOAD"
 	}
@@ -577,7 +577,7 @@ func (s *S3) SetCredentials(accessKeyID, secretAccessKey, sessionToken string) {
 	s.sessionToken = sessionToken
 }
 
-func canonicalHeaders(request *http.Request) (string, string) {
+func canonicalHeaders(request *http.Request) (canonical, signed string) {
 	values := map[string][]string{"host": {request.URL.Host}}
 	for name, entries := range request.Header {
 		lower := strings.ToLower(strings.TrimSpace(name))
@@ -687,7 +687,7 @@ func (s *S3) loadUploadState(uploadID string) (s3UploadState, error) {
 	if err != nil {
 		return s3UploadState{}, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	var state s3UploadState
 	if err := json.NewDecoder(file).Decode(&state); err != nil || state.Upload.UploadID != uploadID {
 		return s3UploadState{}, ErrInvalidUpload

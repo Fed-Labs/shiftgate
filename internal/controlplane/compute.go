@@ -271,7 +271,7 @@ func (server *Server) schedulableOffers(ctx context.Context, organizationID stri
 // restore-compatibility check the migration engine runs. It also returns the
 // captured state size, which is more trustworthy than a client-supplied figure.
 // An empty workloadID searches every checkpoint in the organization.
-func (server *Server) checkpointManifest(ctx context.Context, organizationID, workloadID, checkpointID string) (model.CheckpointManifest, int64, bool, error) {
+func (server *Server) checkpointManifest(ctx context.Context, organizationID, workloadID, checkpointID string) (manifest model.CheckpointManifest, stateBytes int64, found bool, err error) {
 	records, err := server.database.Checkpoints(ctx, organizationID, workloadID)
 	if err != nil {
 		return model.CheckpointManifest{}, 0, false, err

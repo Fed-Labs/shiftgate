@@ -83,7 +83,7 @@ func TestGPUValuesFlag(t *testing.T) {
 
 func TestCheckpointMirrorCommand(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "agent.sock")
-	listener, err := net.Listen("unix", socketPath)
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "unix", socketPath)
 	if err != nil {
 		t.Skipf("Unix socket integration is unavailable in this environment: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestCheckpointMirrorCommand(t *testing.T) {
 // against, so it must never be truncated.
 func TestMachineCommandPrintsIdentity(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "agent.sock")
-	listener, err := net.Listen("unix", socketPath)
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "unix", socketPath)
 	if err != nil {
 		t.Skipf("Unix socket integration is unavailable in this environment: %v", err)
 	}

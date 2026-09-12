@@ -9,7 +9,7 @@ import (
 	"unsafe"
 )
 
-// WorkloadExecCommand is the argv[1] the agent binary recognises as the
+// WorkloadExecCommand is the argv[1] the agent binary recognizes as the
 // workload-exec shim. A privileged agent launches every workload by
 // re-executing itself with this verb: the shim installs the seccomp filter
 // below and then replaces itself with the workload's command, so the workload

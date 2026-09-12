@@ -113,7 +113,7 @@ func totalMemory() (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("open meminfo: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -251,7 +251,7 @@ func cpuFlags() []string {
 	if err != nil {
 		return nil
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()

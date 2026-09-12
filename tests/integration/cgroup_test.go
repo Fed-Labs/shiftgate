@@ -7,6 +7,7 @@ package integration
 // process is gone is removed outright.
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -30,7 +31,7 @@ func TestCgroupRemoveOccupiedAndEmpty(t *testing.T) {
 	if err := os.MkdirAll(workloadPath, 0o755); err != nil {
 		t.Fatalf("create workload cgroup: %v", err)
 	}
-	sleep := exec.Command("sleep", "300")
+	sleep := exec.CommandContext(context.Background(), "sleep", "300")
 	if err := sleep.Start(); err != nil {
 		t.Fatal(err)
 	}

@@ -69,9 +69,9 @@ func (e *lazyTestEngine) Restore(_ context.Context, options RestoreOptions) (int
 	if e.restoreDelay > 0 {
 		time.Sleep(e.restoreDelay)
 	}
-	command := exec.Command("/bin/sh", "-c", "while true; do sleep 1; done")
+	command := exec.CommandContext(context.Background(), "/bin/sh", "-c", "while true; do sleep 1; done")
 	// A restored tree leads its own session, the way the runtime manager
-	// scopes its group-wide signalling; reproduce that so adoption and resume
+	// scopes its group-wide signaling; reproduce that so adoption and resume
 	// run against a genuinely session-leading pid.
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
@@ -95,7 +95,7 @@ func newFakeLazyDaemon(t *testing.T, imagesDirectory string) (*fakeLazyDaemon, e
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nwhile true; do sleep 1; done\n"), 0o700); err != nil {
 		return nil, err
 	}
-	command := exec.Command(script)
+	command := exec.CommandContext(context.Background(), script)
 	// The kernel's shebang handling drops argv[0] and prepends the interpreter
 	// and script path, so the daemon's own spelling starts at the second
 	// element — the command line ends up carrying "lazy-pages" and the image

@@ -50,7 +50,7 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, installed)
 		}
-		fmt.Fprintf(settings.stdout, "Installed %s (was %s). Restart the agent service to run it.\n", installed.Version, installed.PreviousVersion)
+		_, _ = fmt.Fprintf(settings.stdout, "Installed %s (was %s). Restart the agent service to run it.\n", installed.Version, installed.PreviousVersion)
 		return nil
 	case "rollback":
 		flags := flag.NewFlagSet("update rollback", flag.ContinueOnError)
@@ -66,7 +66,7 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, installed)
 		}
-		fmt.Fprintf(settings.stdout, "Rolled back to %s (was %s). Restart the agent service to run it.\n", installed.Version, installed.PreviousVersion)
+		_, _ = fmt.Fprintf(settings.stdout, "Rolled back to %s (was %s). Restart the agent service to run it.\n", installed.Version, installed.PreviousVersion)
 		return nil
 	case "block":
 		if len(args) < 1 {
@@ -85,7 +85,7 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, status)
 		}
-		fmt.Fprintf(settings.stdout, "Version %s is blocked on this machine.\n", args[0])
+		_, _ = fmt.Fprintf(settings.stdout, "Version %s is blocked on this machine.\n", args[0])
 		return nil
 	case "unblock":
 		if len(args) != 1 {
@@ -98,7 +98,7 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, status)
 		}
-		fmt.Fprintf(settings.stdout, "Version %s is allowed again on this machine.\n", args[0])
+		_, _ = fmt.Fprintf(settings.stdout, "Version %s is allowed again on this machine.\n", args[0])
 		return nil
 	default:
 		return usageError("unknown update subcommand " + subcommand)
@@ -109,41 +109,41 @@ func printUpdateStatus(settings options, status update.Status) error {
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, status)
 	}
-	fmt.Fprintf(settings.stdout, "agent %s on channel %s, policy %s\n", status.CurrentVersion, status.Channel, status.Policy)
+	_, _ = fmt.Fprintf(settings.stdout, "agent %s on channel %s, policy %s\n", status.CurrentVersion, status.Channel, status.Policy)
 	if status.PendingVersion != "" {
-		fmt.Fprintf(settings.stdout, "pending restart: %s\n", status.PendingVersion)
+		_, _ = fmt.Fprintf(settings.stdout, "pending restart: %s\n", status.PendingVersion)
 	}
 	if status.LastCheckedAt != nil {
-		fmt.Fprintf(settings.stdout, "last checked:    %s\n", status.LastCheckedAt.Local().Format(time.DateTime))
+		_, _ = fmt.Fprintf(settings.stdout, "last checked:    %s\n", status.LastCheckedAt.Local().Format(time.DateTime))
 	}
 	if status.LastCheckError != "" {
-		fmt.Fprintf(settings.stdout, "last error:      %s\n", status.LastCheckError)
+		_, _ = fmt.Fprintf(settings.stdout, "last error:      %s\n", status.LastCheckError)
 	}
 	if status.Available != nil {
-		fmt.Fprintf(settings.stdout, "available:       %s%s\n", status.Available.Version, mandatoryMark(status.Available.Mandatory))
+		_, _ = fmt.Fprintf(settings.stdout, "available:       %s%s\n", status.Available.Version, mandatoryMark(status.Available.Mandatory))
 		if status.Available.Reason != "" {
-			fmt.Fprintf(settings.stdout, "  %s: %s\n", status.Available.Code, status.Available.Reason)
+			_, _ = fmt.Fprintf(settings.stdout, "  %s: %s\n", status.Available.Code, status.Available.Reason)
 		}
 	}
 	for _, evaluation := range status.Evaluations {
 		if !evaluation.Applicable && evaluation.Version != "" {
-			fmt.Fprintf(settings.stdout, "refused:         %s (%s)\n", evaluation.Version, evaluation.Code)
+			_, _ = fmt.Fprintf(settings.stdout, "refused:         %s (%s)\n", evaluation.Version, evaluation.Code)
 		}
 	}
 	for _, blocked := range status.Blocked {
-		fmt.Fprintf(settings.stdout, "blocked:         %s (%s)\n", blocked.Version, blocked.Reason)
+		_, _ = fmt.Fprintf(settings.stdout, "blocked:         %s (%s)\n", blocked.Version, blocked.Reason)
 	}
 	for _, backup := range status.Backups {
-		fmt.Fprintf(settings.stdout, "preserved:       %s from %s\n", backup.ID, backup.Version)
+		_, _ = fmt.Fprintf(settings.stdout, "preserved:       %s from %s\n", backup.ID, backup.Version)
 	}
 	if length := len(status.History); length > 0 {
-		fmt.Fprintln(settings.stdout, "history:")
+		_, _ = fmt.Fprintln(settings.stdout, "history:")
 		shown := status.History
 		if length > 10 {
 			shown = status.History[:10]
 		}
 		for _, event := range shown {
-			fmt.Fprintf(settings.stdout, "  %s %-11s %s -> %s %s\n",
+			_, _ = fmt.Fprintf(settings.stdout, "  %s %-11s %s -> %s %s\n",
 				event.At.Local().Format(time.DateTime), event.Kind, event.FromVersion, event.ToVersion, event.Detail)
 		}
 	}
@@ -155,7 +155,7 @@ func printUpdateEvaluations(settings options, evaluations []update.Evaluation) e
 		return writeJSON(settings.stdout, evaluations)
 	}
 	if len(evaluations) == 0 {
-		fmt.Fprintln(settings.stdout, "The feed publishes no releases.")
+		_, _ = fmt.Fprintln(settings.stdout, "The feed publishes no releases.")
 		return nil
 	}
 	for _, evaluation := range evaluations {
@@ -163,9 +163,9 @@ func printUpdateEvaluations(settings options, evaluations []update.Evaluation) e
 		if evaluation.Applicable {
 			state = "applicable"
 		}
-		fmt.Fprintf(settings.stdout, "%-10s %s%s\n", state, evaluation.Version, mandatoryMark(evaluation.Mandatory))
+		_, _ = fmt.Fprintf(settings.stdout, "%-10s %s%s\n", state, evaluation.Version, mandatoryMark(evaluation.Mandatory))
 		if evaluation.Reason != "" {
-			fmt.Fprintf(settings.stdout, "  %s: %s\n", evaluation.Code, evaluation.Reason)
+			_, _ = fmt.Fprintf(settings.stdout, "  %s: %s\n", evaluation.Code, evaluation.Reason)
 		}
 	}
 	return nil

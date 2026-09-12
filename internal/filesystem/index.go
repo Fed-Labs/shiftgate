@@ -67,7 +67,7 @@ func IndexTree(root string, exclusions []string) (TreeIndex, error) {
 			stamp.Size = stat.Size
 			stamp.MtimeSec, stamp.MtimeNS = stat.Mtim.Sec, stat.Mtim.Nsec
 			stamp.Inode = stat.Ino
-			stamp.Device = uint64(stat.Dev)
+			stamp.Device = stat.Dev
 		} else {
 			stamp.Size = info.Size()
 		}

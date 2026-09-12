@@ -65,7 +65,7 @@ func NewHTTPFeedSource(feedURL string, timeout time.Duration, client *http.Clien
 
 // Feed fetches and validates the feed document.
 func (source *HTTPFeedSource) Feed(ctx context.Context) (Feed, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source.url, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source.url, http.NoBody)
 	if err != nil {
 		return Feed{}, fmt.Errorf("build update feed request: %w", err)
 	}
@@ -100,11 +100,11 @@ type FileFeedSource struct {
 }
 
 // NewFileFeedSource builds a feed source over a local file.
-func NewFileFeedSource(path string) (*FileFeedSource, error) {
-	if strings.TrimSpace(path) == "" {
+func NewFileFeedSource(filePath string) (*FileFeedSource, error) {
+	if strings.TrimSpace(filePath) == "" {
 		return nil, errors.New("a file feed source requires a path")
 	}
-	return &FileFeedSource{path: path}, nil
+	return &FileFeedSource{path: filePath}, nil
 }
 
 // Feed reads and validates the feed document.
@@ -153,7 +153,7 @@ func (fetcher *HTTPFetcher) Fetch(ctx context.Context, artifact Artifact, into i
 	if parsed.Scheme != "https" || parsed.Host == "" {
 		return errors.New("artifact url must be an absolute https url")
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), http.NoBody)
 	if err != nil {
 		return fmt.Errorf("build artifact request: %w", err)
 	}

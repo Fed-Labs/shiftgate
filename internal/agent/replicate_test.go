@@ -47,7 +47,7 @@ func openReplicationSource(t *testing.T, advertisedURL string) *Service {
 // digests what arrives. The returned URL is what a failover policy carries.
 func servePeerListener(t *testing.T, service *Service) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

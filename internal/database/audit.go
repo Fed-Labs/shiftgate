@@ -30,7 +30,7 @@ func (store *Store) RecordAudit(ctx context.Context, input AuditInput) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if err := insertAudit(ctx, tx, input); err != nil {
 		return err
 	}

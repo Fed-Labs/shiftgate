@@ -472,7 +472,7 @@ func TestLiveSessionPassBounds(t *testing.T) {
 		t.Fatalf("pass cap should clamp to 16, got %d", live.PassLimit())
 	}
 	runPasses(t, live)
-	manifest, err := live.Finalize(context.Background())
+	_, err = live.Finalize(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +486,7 @@ func TestLiveSessionPassBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	runPasses(t, live)
-	manifest, err = live.Finalize(context.Background())
+	manifest, err := live.Finalize(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -149,7 +149,11 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 	if err := os.MkdirAll(imagesDirectory, 0o700); err != nil {
 		return model.CheckpointManifest{}, err
 	}
-	defer os.RemoveAll(staging)
+	defer func() {
+		if removeErr := os.RemoveAll(staging); removeErr != nil {
+			s.logger.Error("remove checkpoint staging", "path", staging, "error", removeErr)
+		}
+	}()
 	originallyRunning := workload.Status == model.WorkloadRunning
 	resumeOnFailure := originallyRunning
 	defer func() {

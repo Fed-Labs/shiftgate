@@ -52,7 +52,7 @@ func TestLiveMinIOAssumeRoleWrongSigning(t *testing.T) {
 	form.Set("Policy", `{"Version":"2012-10-17"}`)
 	form.Set("DurationSeconds", "900")
 	body := form.Encode()
-	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(endpoint, "/")+"/", strings.NewReader(body))
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, strings.TrimRight(endpoint, "/")+"/", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

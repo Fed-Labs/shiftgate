@@ -81,14 +81,15 @@ func (c *CRIU) StartLazyPages(ctx context.Context, imagesDirectory, workDirector
 	}
 	logPath := filepath.Join(workDirectory, "lazy-pages.log")
 	daemon := &lazyPagesDaemon{
-		command: exec.Command(c.binary, "lazy-pages",
+		command: exec.CommandContext(context.Background(), c.binary, "lazy-pages",
 			"-D", imagesDirectory, "-W", workDirectory, "-v4", "-o", filepath.Base(logPath)),
 		logPath: logPath,
 		done:    make(chan struct{}),
 	}
 	// The daemon must outlive this call, the restore, and the API request
-	// that caused it — exec.Command, never CommandContext, so nothing cancels
-	// it when the request ends.
+	// that caused it: it runs under a context that is never canceled, so
+	// nothing kills it when the request ends. Its lifetime is managed by
+	// the done channel and the process it serves.
 	if err := daemon.command.Start(); err != nil {
 		return nil, fmt.Errorf("start criu lazy-pages: %w", err)
 	}

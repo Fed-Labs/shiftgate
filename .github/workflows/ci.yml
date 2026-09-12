@@ -47,7 +47,9 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          # Pinned: "latest" once meant the config's v2 schema and the
+          # binary's expectations could drift apart under us.
+          version: v2.13.2
 
   test:
     runs-on: ubuntu-24.04
@@ -92,6 +94,10 @@ jobs:
           cache: true
       - name: Install CRIU
         run: |
+          # Ubuntu 24.04 dropped the criu package from its archive, so the
+          # distro source cannot provide it; the CRIU project's own PPA
+          # publishes current builds for noble (criu 4.2.x).
+          sudo add-apt-repository -y ppa:criu/ppa
           sudo apt-get update
           sudo apt-get install -y criu
           sudo criu check || true
@@ -126,6 +132,8 @@ jobs:
           cache: true
       - name: Install CRIU
         run: |
+          # Same as the e2e lane: noble has no criu package, the CRIU PPA does.
+          sudo add-apt-repository -y ppa:criu/ppa
           sudo apt-get update
           sudo apt-get install -y criu
           criu --version

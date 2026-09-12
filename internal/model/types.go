@@ -710,7 +710,9 @@ const (
 	MigrationFailed       MigrationStage = "FAILED"
 	MigrationRollingBack  MigrationStage = "ROLLING_BACK"
 	MigrationRolledBack   MigrationStage = "ROLLED_BACK"
-	MigrationCancelled    MigrationStage = "CANCELLED"
+	// The two-L spelling is the persisted stage value in existing migration
+	// rows and the dashboard's type union — it cannot be "corrected".
+	MigrationCancelled MigrationStage = "CANCELLED" //nolint:misspell // persisted stage value; the dashboard type union names it
 )
 
 // A failure at any pre-commit stage can enter ROLLING_BACK directly: a

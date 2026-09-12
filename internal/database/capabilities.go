@@ -82,7 +82,7 @@ func syncCapabilities(ctx context.Context, tx pgx.Tx, machineRecordID string, do
 // whose text capability equals a value, whose boolean capability is set, or
 // whose numeric capability meets a minimum (nil minimum = any value). It
 // returns full records — callers already want names and status, not just ids.
-func (store *Store) MachinesWithCapability(ctx context.Context, organizationID, capability string, kind string, minimum *float64) ([]MachineRecord, error) {
+func (store *Store) MachinesWithCapability(ctx context.Context, organizationID, capability, kind string, minimum *float64) ([]MachineRecord, error) {
 	var query string
 	var args []any
 	switch kind {
@@ -161,7 +161,7 @@ func (store *Store) SetRetentionPolicy(ctx context.Context, policy RetentionPoli
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx, `INSERT INTO retention_policies(organization_id,audit_retention_days,checkpoint_retention_days,deleted_storage_retention_days,updated_at)
 		VALUES($1,$2,$3,$4,now())
 		ON CONFLICT (organization_id) DO UPDATE SET audit_retention_days=$2,checkpoint_retention_days=$3,deleted_storage_retention_days=$4,updated_at=now()`,

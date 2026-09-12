@@ -207,7 +207,7 @@ func (server *Server) handleAgentCommand(writer http.ResponseWriter, request *ht
 			return
 		}
 		principal := principalFrom(request.Context())
-		jobRecord, jobErr := server.database.CreateMigrationForAgent(request.Context(), database.MigrationRecord{
+		_, jobErr := server.database.CreateMigrationForAgent(request.Context(), database.MigrationRecord{
 			ID: id, OrganizationID: organizationID, WorkloadID: workload.ID,
 			SourceMachineID: machineID, DestinationMachineID: destination.MachineID,
 			Mode: input.Mode, CreatedBy: principal.UserID,
@@ -230,7 +230,7 @@ func (server *Server) handleAgentCommand(writer http.ResponseWriter, request *ht
 			writeError(writer, http.StatusBadGateway, "MIGRATION_EVENT_RECONCILE_FAILED", eventErr.Error())
 			return
 		}
-		jobRecord, jobErr = server.database.UpdateMigrationStatus(request.Context(), organizationID, id, migrationJobStatus(result.Stage), progress, result.FailureReason, server.auditInput(request, "migration.progress", "migration", id, nil))
+		jobRecord, jobErr := server.database.UpdateMigrationStatus(request.Context(), organizationID, id, migrationJobStatus(result.Stage), progress, result.FailureReason, server.auditInput(request, "migration.progress", "migration", id, nil))
 		if jobErr != nil {
 			writeError(writer, http.StatusBadGateway, "MIGRATION_STATUS_RECONCILE_FAILED", jobErr.Error())
 			return
@@ -264,9 +264,8 @@ func writeAgentError(writer http.ResponseWriter, err error) {
 	var apiError *agentclient.APIError
 	if errors.As(err, &apiError) {
 		status := http.StatusBadGateway
-		if apiError.Status == http.StatusNotFound {
-			status = http.StatusNotFound
-		} else if apiError.Status == http.StatusBadRequest || apiError.Status == http.StatusConflict || apiError.Status == http.StatusForbidden {
+		switch apiError.Status {
+		case http.StatusBadRequest, http.StatusConflict, http.StatusForbidden, http.StatusNotFound:
 			status = apiError.Status
 		}
 		writeError(writer, status, "AGENT_COMMAND_FAILED", apiError.Message)
@@ -349,7 +348,8 @@ func migrationJobStatus(stage model.MigrationStage) string {
 	case model.MigrationFailed, model.MigrationRolledBack:
 		return "failed"
 	case model.MigrationCancelled:
-		return "cancelled"
+		// The two-L spelling is the job-status value the dashboard's MigrationStatus union carries.
+		return "cancelled" //nolint:misspell // wire value: matches the persisted migration status
 	default:
 		return "running"
 	}
@@ -485,7 +485,7 @@ func (server *Server) handleMigrationCancel(writer http.ResponseWriter, request 
 		writeAgentError(writer, err)
 		return
 	}
-	record, err := server.database.UpdateMigrationStatus(request.Context(), organizationID, migrationID, "cancelled", mustJSON(map[string]any{"stage": "CANCELLED", "progress": 0}), "", server.auditInput(request, "migration.cancel", "migration", migrationID, nil))
+	record, err := server.database.UpdateMigrationStatus(request.Context(), organizationID, migrationID, "cancelled", mustJSON(map[string]any{"stage": "CANCELLED", "progress": 0}), "", server.auditInput(request, "migration.cancel", "migration", migrationID, nil)) //nolint:misspell // persisted status vocabulary
 	if err != nil {
 		writeError(writer, http.StatusBadGateway, "MIGRATION_RECONCILE_FAILED", err.Error())
 		return

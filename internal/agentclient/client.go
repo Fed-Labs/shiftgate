@@ -198,7 +198,7 @@ func (c *Client) Logs(ctx context.Context, id string, tail int) (string, error) 
 	if tail > 0 {
 		requestPath += "?tail=" + fmt.Sprint(tail)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+requestPath, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+requestPath, http.NoBody)
 	if err != nil {
 		return "", err
 	}
@@ -206,7 +206,7 @@ func (c *Client) Logs(ctx context.Context, id string, tail int) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return "", decodeError(response)
 	}
@@ -475,7 +475,7 @@ func (c *Client) do(ctx context.Context, method, requestPath string, input, outp
 	if err != nil {
 		return fmt.Errorf("connect to SHIFT agent: %w%s", err, agentHint(err))
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return decodeError(response)
 	}

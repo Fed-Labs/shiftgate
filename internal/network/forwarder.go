@@ -77,14 +77,14 @@ func (forwarder *Forwarder) Mapping() model.PortMapping {
 // port that cannot be bound is a failed mapping, and the caller must surface
 // that instead of running the workload half-reachable.
 func (forwarder *Forwarder) Start(ctx context.Context) error {
-	listener, err := net.Listen(ProtocolTCP, fmt.Sprintf(":%d", forwarder.mapping.HostPort))
+	listener, err := (&net.ListenConfig{}).Listen(ctx, ProtocolTCP, fmt.Sprintf(":%d", forwarder.mapping.HostPort))
 	if err != nil {
 		return fmt.Errorf("bind host port %d: %w", forwarder.mapping.HostPort, err)
 	}
 	forwarder.mu.Lock()
 	if forwarder.closed {
 		forwarder.mu.Unlock()
-		listener.Close()
+		_ = listener.Close()
 		return fmt.Errorf("forwarder for %s was stopped before it started", forwarder.mapping)
 	}
 	forwarder.listener = listener
@@ -114,7 +114,7 @@ func (forwarder *Forwarder) acceptLoop(ctx context.Context, listener net.Listene
 		forwarder.idle.Add(1)
 		go func(client net.Conn) {
 			defer forwarder.idle.Done()
-			forwarder.handle(client)
+			forwarder.handle(ctx, client)
 		}(client)
 	}
 }
@@ -122,32 +122,32 @@ func (forwarder *Forwarder) acceptLoop(ctx context.Context, listener net.Listene
 // handle proxies one connection from start to finish: it holds a connection
 // slot until the pair has fully closed, so the cap bounds live connections,
 // not handoffs.
-func (forwarder *Forwarder) handle(client net.Conn) {
+func (forwarder *Forwarder) handle(ctx context.Context, client net.Conn) {
 	select {
 	case forwarder.slots <- struct{}{}:
 	default:
 		// At the connection cap: refuse by closing. A queued connection
 		// would appear accepted to the peer while carrying no traffic,
 		// which is worse than an honest refusal.
-		client.Close()
+		_ = client.Close()
 		return
 	}
 	defer func() { <-forwarder.slots }()
 
-	upstream, err := net.DialTimeout(ProtocolTCP, forwarder.upstream, forwardDialTimeout)
+	upstream, err := (&net.Dialer{Timeout: forwardDialTimeout}).DialContext(ctx, ProtocolTCP, forwarder.upstream)
 	if err != nil {
 		forwarder.log.Debug("forwarder could not reach workload listener",
 			slog.String("mapping", forwarder.mapping.String()),
 			slog.String("error", err.Error()))
-		client.Close()
+		_ = client.Close()
 		return
 	}
 	pair := &forwardedConn{client: client, upstream: upstream}
 	forwarder.mu.Lock()
 	if forwarder.closed {
 		forwarder.mu.Unlock()
-		client.Close()
-		upstream.Close()
+		_ = client.Close()
+		_ = upstream.Close()
 		return
 	}
 	forwarder.conns[pair] = struct{}{}
@@ -155,27 +155,30 @@ func (forwarder *Forwarder) handle(client net.Conn) {
 
 	copies := make(chan struct{}, 2)
 	go func() {
-		io.Copy(upstream, client)
+		// A copy that stops on error is the proxy's teardown signal: either
+		// side closing ends the exchange, and the half-close below tells the
+		// peer the stream is over.
+		_, _ = io.Copy(upstream, client)
 		halfClose(upstream)
 		copies <- struct{}{}
 	}()
 	go func() {
-		io.Copy(client, upstream)
+		_, _ = io.Copy(client, upstream)
 		halfClose(client)
 		copies <- struct{}{}
 	}()
 	<-copies
 	<-copies
 	forwarder.untrack(pair)
-	client.Close()
-	upstream.Close()
+	_ = client.Close()
+	_ = upstream.Close()
 }
 
 // halfClose signals end-of-stream in one direction so a peer that shut down
 // writes is not left waiting for a response that will never come.
 func halfClose(connection net.Conn) {
 	if tcp, ok := connection.(*net.TCPConn); ok {
-		tcp.CloseWrite()
+		_ = tcp.CloseWrite()
 	}
 }
 
@@ -235,8 +238,8 @@ func (forwarder *Forwarder) Drain(grace time.Duration) int {
 	}
 	remaining := forwarder.snapshot()
 	for _, pair := range remaining {
-		pair.client.Close()
-		pair.upstream.Close()
+		_ = pair.client.Close()
+		_ = pair.upstream.Close()
 	}
 	forwarder.idle.Wait()
 	return len(remaining)

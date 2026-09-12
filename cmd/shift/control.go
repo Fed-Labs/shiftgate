@@ -89,7 +89,7 @@ func runControlLogin(ctx context.Context, settings options, arguments []string) 
 	// control plane, which is the normal case for a hosted deployment.
 	reader := bufio.NewReader(os.Stdin)
 	if *email == "" {
-		fmt.Fprint(settings.stdout, "Email: ")
+		_, _ = fmt.Fprint(settings.stdout, "Email: ")
 		value, err := reader.ReadString('\n')
 		if err != nil {
 			return exitError{code: 3, err: fmt.Errorf("read email: %w", err)}
@@ -106,7 +106,7 @@ func runControlLogin(ctx context.Context, settings options, arguments []string) 
 	if *sso {
 		return runControlLoginSSO(ctx, settings, session, *email)
 	}
-	fmt.Fprint(settings.stdout, "Password: ")
+	_, _ = fmt.Fprint(settings.stdout, "Password: ")
 	password, err := termio.ReadPassword(os.Stdin)
 	if err != nil {
 		return exitError{code: 3, err: fmt.Errorf("read password: %w", err)}
@@ -121,7 +121,7 @@ func runControlLogin(ctx context.Context, settings options, arguments []string) 
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, map[string]any{"email": user.Email, "control_plane": session.Client().URL()})
 	}
-	fmt.Fprintf(settings.stdout, "Logged in as %s (%s). Session stored in %s.\n", user.DisplayName, user.Email, session.TokenStorePath())
+	_, _ = fmt.Fprintf(settings.stdout, "Logged in as %s (%s). Session stored in %s.\n", user.DisplayName, user.Email, session.TokenStorePath())
 	return nil
 }
 
@@ -135,20 +135,20 @@ func runControlLoginSSO(ctx context.Context, settings options, session *controlc
 	if err != nil {
 		return exitError{code: 3, err: fmt.Errorf("generate PKCE verifier: %w", err)}
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		return exitError{code: 3, err: fmt.Errorf("start loopback listener: %w", err)}
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	redirectURI := "http://" + listener.Addr().String() + "/callback"
 	authorization, err := session.Client().BeginSSO(ctx, email, redirectURI, challenge)
 	if err != nil {
 		return controlOperationError(err)
 	}
 	code, failure := listenForSSOCode(listener, authorization.State)
-	fmt.Fprintf(settings.stdout, "Continue in your browser:\n\n  %s\n\n", authorization.AuthorizationURL)
+	_, _ = fmt.Fprintf(settings.stdout, "Continue in your browser:\n\n  %s\n\n", authorization.AuthorizationURL)
 	if launcher, lookupErr := exec.LookPath("xdg-open"); lookupErr == nil {
-		_ = exec.Command(launcher, authorization.AuthorizationURL).Start()
+		_ = exec.CommandContext(context.Background(), launcher, authorization.AuthorizationURL).Start()
 	}
 	select {
 	case received := <-code:
@@ -159,7 +159,7 @@ func runControlLoginSSO(ctx context.Context, settings options, session *controlc
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, map[string]any{"email": user.Email, "control_plane": session.Client().URL()})
 		}
-		fmt.Fprintf(settings.stdout, "Logged in as %s (%s). Session stored in %s.\n", user.DisplayName, user.Email, session.TokenStorePath())
+		_, _ = fmt.Fprintf(settings.stdout, "Logged in as %s (%s). Session stored in %s.\n", user.DisplayName, user.Email, session.TokenStorePath())
 		return nil
 	case message := <-failure:
 		return exitError{code: 3, err: errors.New(message)}
@@ -174,7 +174,7 @@ func runControlLoginSSO(ctx context.Context, settings options, session *controlc
 // here with the authorization code and the state that must match the one the
 // flow started with. The browser gets a plain page to close; the channels
 // carry the outcome back to the waiting login.
-func listenForSSOCode(listener net.Listener, state string) (code chan string, failure chan string) {
+func listenForSSOCode(listener net.Listener, state string) (code, failure chan string) {
 	code = make(chan string, 1)
 	failure = make(chan string, 1)
 	server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -187,18 +187,18 @@ func listenForSSOCode(listener net.Listener, state string) (code chan string, fa
 		case query.Get("error") != "":
 			failure <- "the issuer reported " + query.Get("error")
 			writer.WriteHeader(http.StatusBadRequest)
-			fmt.Fprint(writer, "Login failed. You can close this tab.")
+			_, _ = fmt.Fprint(writer, "Login failed. You can close this tab.")
 		case query.Get("state") != state:
 			failure <- "the issuer returned an unexpected state; start the login again"
 			writer.WriteHeader(http.StatusBadRequest)
-			fmt.Fprint(writer, "Login failed. You can close this tab.")
+			_, _ = fmt.Fprint(writer, "Login failed. You can close this tab.")
 		case query.Get("code") != "":
 			code <- query.Get("code")
-			fmt.Fprint(writer, "Login complete. You can close this tab and return to the terminal.")
+			_, _ = fmt.Fprint(writer, "Login complete. You can close this tab and return to the terminal.")
 		default:
 			failure <- "the issuer returned no authorization code"
 			writer.WriteHeader(http.StatusBadRequest)
-			fmt.Fprint(writer, "Login failed. You can close this tab.")
+			_, _ = fmt.Fprint(writer, "Login failed. You can close this tab.")
 		}
 	})}
 	go func() { _ = server.Serve(listener) }()
@@ -243,7 +243,7 @@ func runControlLogout(ctx context.Context, settings options) error {
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, map[string]string{"status": "logged out"})
 	}
-	fmt.Fprintln(settings.stdout, "Logged out.")
+	_, _ = fmt.Fprintln(settings.stdout, "Logged out.")
 	return nil
 }
 
@@ -260,9 +260,9 @@ func runControlWhoami(ctx context.Context, settings options) error {
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, map[string]any{"email": session.UserEmail(), "control_plane": session.Client().URL(), "organizations": organizations})
 	}
-	fmt.Fprintf(settings.stdout, "%s on %s\n", session.UserEmail(), session.Client().URL())
+	_, _ = fmt.Fprintf(settings.stdout, "%s on %s\n", session.UserEmail(), session.Client().URL())
 	for _, organization := range organizations {
-		fmt.Fprintf(settings.stdout, "  %s  %s (%s)\n", organization.ID, organization.Name, organization.Role)
+		_, _ = fmt.Fprintf(settings.stdout, "  %s  %s (%s)\n", organization.ID, organization.Name, organization.Role)
 	}
 	return nil
 }
@@ -282,13 +282,13 @@ func runControlPlans(ctx context.Context, settings options) error {
 		return writeJSON(settings.stdout, plans)
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "KEY\tNAME\tPRICE\tMACHINES\tSTORAGE\tFEATURES")
+	_, _ = fmt.Fprintln(writer, "KEY\tNAME\tPRICE\tMACHINES\tSTORAGE\tFEATURES")
 	for _, plan := range plans {
 		price := "free"
 		if plan.PriceCents > 0 {
 			price = fmt.Sprintf("$%d/mo", plan.PriceCents/100)
 		}
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%s\t%s\n", plan.Key, plan.Name, price, plan.MaxMachines, humanBytes(plan.MaxStorageBytes), strings.Join(plan.Features, ", "))
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%s\t%s\n", plan.Key, plan.Name, price, plan.MaxMachines, humanBytes(plan.MaxStorageBytes), strings.Join(plan.Features, ", "))
 	}
 	return writer.Flush()
 }
@@ -321,31 +321,31 @@ func runControlStorage(ctx context.Context, settings options, arguments []string
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, status)
 	}
-	fmt.Fprintf(settings.stdout, "Organization %s\n", resolved)
+	_, _ = fmt.Fprintf(settings.stdout, "Organization %s\n", resolved)
 	if !status.Enabled {
-		fmt.Fprintln(settings.stdout, "Hosted storage: disabled — this control plane does not host checkpoint storage.")
-		fmt.Fprintln(settings.stdout, "Agents keep checkpoints locally; configure an S3 object store on the agent for a cloud copy.")
+		_, _ = fmt.Fprintln(settings.stdout, "Hosted storage: disabled — this control plane does not host checkpoint storage.")
+		_, _ = fmt.Fprintln(settings.stdout, "Agents keep checkpoints locally; configure an S3 object store on the agent for a cloud copy.")
 		return nil
 	}
 	overQuota := ""
 	if status.OverQuota {
 		overQuota = "  (OVER QUOTA — credential issuance suspended)"
 	}
-	fmt.Fprintf(settings.stdout, "Hosted storage: enabled%s\n", overQuota)
-	fmt.Fprintf(settings.stdout, "  Location:     %s / %s (prefix %s)\n", status.Endpoint, status.Bucket, status.Prefix)
-	fmt.Fprintf(settings.stdout, "  Usage:        %s / %s\n", humanBytes(status.UsedStorageBytes), humanBytes(status.MaxStorageBytes))
+	_, _ = fmt.Fprintf(settings.stdout, "Hosted storage: enabled%s\n", overQuota)
+	_, _ = fmt.Fprintf(settings.stdout, "  Location:     %s / %s (prefix %s)\n", status.Endpoint, status.Bucket, status.Prefix)
+	_, _ = fmt.Fprintf(settings.stdout, "  Usage:        %s / %s\n", humanBytes(status.UsedStorageBytes), humanBytes(status.MaxStorageBytes))
 	if status.LastReconciledAt != nil {
-		fmt.Fprintf(settings.stdout, "  Reconciled:   %s\n", status.LastReconciledAt.Local().Format(time.DateTime))
+		_, _ = fmt.Fprintf(settings.stdout, "  Reconciled:   %s\n", status.LastReconciledAt.Local().Format(time.DateTime))
 	}
-	fmt.Fprintln(settings.stdout)
-	fmt.Fprintln(settings.stdout, "Agent setup — add to the agent's environment for hosted mirroring:")
-	fmt.Fprintln(settings.stdout, "  SHIFT_OBJECTSTORE_ENABLED=true")
-	fmt.Fprintln(settings.stdout, "  SHIFT_OBJECTSTORE_BACKEND=control-plane")
-	fmt.Fprintf(settings.stdout, "  SHIFT_CONTROL_ORGANIZATION_ID=%s\n", resolved)
-	fmt.Fprintln(settings.stdout, "  SHIFT_CONTROL_MACHINE_ID=<this machine's id>")
-	fmt.Fprintln(settings.stdout, "  SHIFT_CONTROL_API_KEY=<machines-scope api key>")
-	fmt.Fprintln(settings.stdout, "Agents fetch short-lived scoped credentials from the control plane; no storage secrets are configured on the agent.")
-	fmt.Fprintln(settings.stdout, "(No SHIFT_CONTROL_URL needed — unset, agents talk to the platform endpoint.)")
+	_, _ = fmt.Fprintln(settings.stdout)
+	_, _ = fmt.Fprintln(settings.stdout, "Agent setup — add to the agent's environment for hosted mirroring:")
+	_, _ = fmt.Fprintln(settings.stdout, "  SHIFT_OBJECTSTORE_ENABLED=true")
+	_, _ = fmt.Fprintln(settings.stdout, "  SHIFT_OBJECTSTORE_BACKEND=control-plane")
+	_, _ = fmt.Fprintf(settings.stdout, "  SHIFT_CONTROL_ORGANIZATION_ID=%s\n", resolved)
+	_, _ = fmt.Fprintln(settings.stdout, "  SHIFT_CONTROL_MACHINE_ID=<this machine's id>")
+	_, _ = fmt.Fprintln(settings.stdout, "  SHIFT_CONTROL_API_KEY=<machines-scope api key>")
+	_, _ = fmt.Fprintln(settings.stdout, "Agents fetch short-lived scoped credentials from the control plane; no storage secrets are configured on the agent.")
+	_, _ = fmt.Fprintln(settings.stdout, "(No SHIFT_CONTROL_URL needed — unset, agents talk to the platform endpoint.)")
 	return nil
 }
 
@@ -469,7 +469,7 @@ func runFleetMachine(ctx context.Context, session *controlclient.Session, settin
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, machine)
 		}
-		fmt.Fprintf(settings.stdout, "Registered %s (%s).\n", machine.MachineID, machine.ID)
+		_, _ = fmt.Fprintf(settings.stdout, "Registered %s (%s).\n", machine.MachineID, machine.ID)
 		return nil
 	}
 	return nil
@@ -502,7 +502,7 @@ func runFleetMachineCapability(ctx context.Context, session *controlclient.Sessi
 		return controlOperationError(err)
 	}
 	if len(machines) == 0 {
-		fmt.Fprintf(settings.stderr, "no machines report capability %q\n", rest[0])
+		_, _ = fmt.Fprintf(settings.stderr, "no machines report capability %q\n", rest[0])
 		return nil
 	}
 	return printFleetMachines(settings, machines)
@@ -547,8 +547,8 @@ func runFleetRetention(ctx context.Context, session *controlclient.Session, sett
 		return writeJSON(settings.stdout, policy)
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "ORGANIZATION\tAUDIT\tCHECKPOINTS\tDELETED STORAGE\tUPDATED")
-	fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", shortID(policy.OrganizationID), windowOrForever(policy.AuditRetentionDays), windowOrForever(policy.CheckpointRetentionDays), windowOrForever(policy.DeletedStorageRetentionDays), policy.UpdatedAt.Local().Format(time.DateTime))
+	_, _ = fmt.Fprintln(writer, "ORGANIZATION\tAUDIT\tCHECKPOINTS\tDELETED STORAGE\tUPDATED")
+	_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", shortID(policy.OrganizationID), windowOrForever(policy.AuditRetentionDays), windowOrForever(policy.CheckpointRetentionDays), windowOrForever(policy.DeletedStorageRetentionDays), policy.UpdatedAt.Local().Format(time.DateTime))
 	return writer.Flush()
 }
 
@@ -599,9 +599,9 @@ func runFleetSSO(ctx context.Context, session *controlclient.Session, settings o
 	if state.Enforced {
 		status = "enforced for " + state.EmailDomain
 	}
-	fmt.Fprintf(settings.stdout, "single sign-on: %s\n", status)
+	_, _ = fmt.Fprintf(settings.stdout, "single sign-on: %s\n", status)
 	if state.Enforced {
-		fmt.Fprintln(settings.stdout, "the domain's accounts authenticate with `shiftgate login --sso`; passwords no longer work for them")
+		_, _ = fmt.Fprintln(settings.stdout, "the domain's accounts authenticate with `shiftgate login --sso`; passwords no longer work for them")
 	}
 	return nil
 }
@@ -638,9 +638,9 @@ func runFleetWorkload(ctx context.Context, session *controlclient.Session, setti
 		return writeJSON(settings.stdout, workloads)
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "ID\tNAME\tMACHINE\tUPDATED")
+	_, _ = fmt.Fprintln(writer, "ID\tNAME\tMACHINE\tUPDATED")
 	for _, workload := range workloads {
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", shortID(workload.ID), workload.Name, workload.MachineID, workload.UpdatedAt.Local().Format(time.DateTime))
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", shortID(workload.ID), workload.Name, workload.MachineID, workload.UpdatedAt.Local().Format(time.DateTime))
 	}
 	return writer.Flush()
 }
@@ -656,9 +656,9 @@ func runFleetMigration(ctx context.Context, session *controlclient.Session, sett
 			return writeJSON(settings.stdout, jobs)
 		}
 		writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(writer, "ID\tWORKLOAD\tMODE\tSTATUS\tSOURCE\tDESTINATION\tUPDATED")
+		_, _ = fmt.Fprintln(writer, "ID\tWORKLOAD\tMODE\tSTATUS\tSOURCE\tDESTINATION\tUPDATED")
 		for _, job := range jobs {
-			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", shortID(job.ID), job.WorkloadID, job.Mode, job.Status, shortID(job.SourceMachineID), shortID(job.DestinationMachineID), job.UpdatedAt.Local().Format(time.DateTime))
+			_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", shortID(job.ID), job.WorkloadID, job.Mode, job.Status, shortID(job.SourceMachineID), shortID(job.DestinationMachineID), job.UpdatedAt.Local().Format(time.DateTime))
 		}
 		return writer.Flush()
 	}
@@ -689,7 +689,7 @@ func runFleetMigration(ctx context.Context, session *controlclient.Session, sett
 	}
 	printControlMigration(settings, *found)
 	for _, event := range events {
-		fmt.Fprintf(settings.stdout, "  %s  %3.0f%%  %s\n", event.CreatedAt.Local().Format(time.DateTime), event.Progress*100, event.Message)
+		_, _ = fmt.Fprintf(settings.stdout, "  %s  %3.0f%%  %s\n", event.CreatedAt.Local().Format(time.DateTime), event.Progress*100, event.Message)
 	}
 	return nil
 }
@@ -711,9 +711,9 @@ func runFleetCheckpoint(ctx context.Context, session *controlclient.Session, set
 		return writeJSON(settings.stdout, checkpoints)
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "ID\tWORKLOAD\tMACHINE\tKIND\tPLAIN\tSTORED\tCREATED")
+	_, _ = fmt.Fprintln(writer, "ID\tWORKLOAD\tMACHINE\tKIND\tPLAIN\tSTORED\tCREATED")
 	for _, checkpoint := range checkpoints {
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", shortID(checkpoint.ID), shortID(checkpoint.WorkloadID), shortID(checkpoint.MachineID), checkpoint.Kind, humanBytes(checkpoint.PlainBytes), humanBytes(checkpoint.StoredBytes), checkpoint.CreatedAt.Local().Format(time.DateTime))
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", shortID(checkpoint.ID), shortID(checkpoint.WorkloadID), shortID(checkpoint.MachineID), checkpoint.Kind, humanBytes(checkpoint.PlainBytes), humanBytes(checkpoint.StoredBytes), checkpoint.CreatedAt.Local().Format(time.DateTime))
 	}
 	return writer.Flush()
 }
@@ -750,13 +750,13 @@ func runFleetUsage(ctx context.Context, session *controlclient.Session, settings
 		return writeJSON(settings.stdout, summaries)
 	}
 	if len(summaries) == 0 {
-		fmt.Fprintln(settings.stdout, "No metered usage in this period.")
+		_, _ = fmt.Fprintln(settings.stdout, "No metered usage in this period.")
 		return nil
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "KIND\tQUANTITY\tPERIOD")
+	_, _ = fmt.Fprintln(writer, "KIND\tQUANTITY\tPERIOD")
 	for _, summary := range summaries {
-		fmt.Fprintf(writer, "%s\t%d\t%s to %s\n", summary.Kind, summary.Quantity, summary.PeriodStart, summary.PeriodEnd)
+		_, _ = fmt.Fprintf(writer, "%s\t%d\t%s to %s\n", summary.Kind, summary.Quantity, summary.PeriodStart, summary.PeriodEnd)
 	}
 	return writer.Flush()
 }
@@ -772,13 +772,13 @@ func runFleetAPIKeys(ctx context.Context, session *controlclient.Session, settin
 			return writeJSON(settings.stdout, keys)
 		}
 		writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(writer, "ID\tNAME\tPREFIX\tSCOPES\tSTATUS")
+		_, _ = fmt.Fprintln(writer, "ID\tNAME\tPREFIX\tSCOPES\tSTATUS")
 		for _, key := range keys {
 			status := "active"
 			if key.RevokedAt != nil {
 				status = "revoked"
 			}
-			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", shortID(key.ID), key.Name, key.Prefix, strings.Join(key.Scopes, ","), status)
+			_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", shortID(key.ID), key.Name, key.Prefix, strings.Join(key.Scopes, ","), status)
 		}
 		return writer.Flush()
 	}
@@ -802,7 +802,7 @@ func runFleetAPIKeys(ctx context.Context, session *controlclient.Session, settin
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, created)
 		}
-		fmt.Fprintf(settings.stdout, "API key %s created. Secret (shown once, store it now):\n  %s\n", created.Name, created.Secret)
+		_, _ = fmt.Fprintf(settings.stdout, "API key %s created. Secret (shown once, store it now):\n  %s\n", created.Name, created.Secret)
 		return nil
 	case "revoke":
 		if len(args) != 1 {
@@ -811,7 +811,7 @@ func runFleetAPIKeys(ctx context.Context, session *controlclient.Session, settin
 		if err := session.RevokeAPIKey(ctx, organizationID, args[0]); err != nil {
 			return controlOperationError(err)
 		}
-		fmt.Fprintln(settings.stdout, "Revoked.")
+		_, _ = fmt.Fprintln(settings.stdout, "Revoked.")
 		return nil
 	default:
 		return usageError("unknown api-keys subcommand " + subcommand)
@@ -959,19 +959,19 @@ func runMarketplacePlace(ctx context.Context, session *controlclient.Session, se
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, placement)
 	}
-	fmt.Fprintf(settings.stdout, "Evaluated %d offers (trading %s).\n", placement.Evaluated, enabledDisabled(placement.TradingEnabled))
+	_, _ = fmt.Fprintf(settings.stdout, "Evaluated %d offers (trading %s).\n", placement.Evaluated, enabledDisabled(placement.TradingEnabled))
 	if len(placement.Candidates) == 0 {
-		fmt.Fprintln(settings.stdout, "No destination can take this workload.")
+		_, _ = fmt.Fprintln(settings.stdout, "No destination can take this workload.")
 	} else {
-		fmt.Fprintln(settings.stdout, "Candidates:")
+		_, _ = fmt.Fprintln(settings.stdout, "Candidates:")
 		for index, candidate := range placement.Candidates {
-			fmt.Fprintf(settings.stdout, "  %d. %s  %s  %s\n", index+1, candidate.MachineID, candidate.MachineName, candidateCurrency(candidate.HourlyMicros, candidate.Currency))
+			_, _ = fmt.Fprintf(settings.stdout, "  %d. %s  %s  %s\n", index+1, candidate.MachineID, candidate.MachineName, candidateCurrency(candidate.HourlyMicros, candidate.Currency))
 		}
 	}
 	if len(placement.Rejected) > 0 {
-		fmt.Fprintln(settings.stdout, "Rejected:")
+		_, _ = fmt.Fprintln(settings.stdout, "Rejected:")
 		for _, rejection := range placement.Rejected {
-			fmt.Fprintf(settings.stdout, "  %s  %s: %s\n", rejection.MachineID, rejection.Code, rejection.Reason)
+			_, _ = fmt.Fprintf(settings.stdout, "  %s  %s: %s\n", rejection.MachineID, rejection.Code, rejection.Reason)
 		}
 	}
 	return nil
@@ -1038,7 +1038,7 @@ func runMarketplacePublish(ctx context.Context, session *controlclient.Session, 
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, offer)
 	}
-	fmt.Fprintf(settings.stdout, "Published offer %s for machine %s.\n", offer.ID, offer.MachineID)
+	_, _ = fmt.Fprintf(settings.stdout, "Published offer %s for machine %s.\n", offer.ID, offer.MachineID)
 	return nil
 }
 
@@ -1060,7 +1060,7 @@ func runMarketplaceWithdraw(ctx context.Context, session *controlclient.Session,
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, withdrawn)
 	}
-	fmt.Fprintf(settings.stdout, "Withdrew offer %s.\n", withdrawn.ID)
+	_, _ = fmt.Fprintf(settings.stdout, "Withdrew offer %s.\n", withdrawn.ID)
 	return nil
 }
 
@@ -1080,13 +1080,13 @@ func runMarketplaceReservations(ctx context.Context, session *controlclient.Sess
 		return writeJSON(settings.stdout, reservations)
 	}
 	if len(reservations) == 0 {
-		fmt.Fprintln(settings.stdout, "No reservations.")
+		_, _ = fmt.Fprintln(settings.stdout, "No reservations.")
 		return nil
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "ID\tOFFER\tMACHINE\tWORKLOAD\tSTATE\tEXPIRES")
+	_, _ = fmt.Fprintln(writer, "ID\tOFFER\tMACHINE\tWORKLOAD\tSTATE\tEXPIRES")
 	for _, reservation := range reservations {
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", shortID(reservation.ID), shortID(reservation.OfferID), reservation.MachineID, reservation.WorkloadID, string(reservation.State), reservation.ExpiresAt.Local().Format(time.DateTime))
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", shortID(reservation.ID), shortID(reservation.OfferID), reservation.MachineID, reservation.WorkloadID, string(reservation.State), reservation.ExpiresAt.Local().Format(time.DateTime))
 	}
 	return writer.Flush()
 }
@@ -1130,8 +1130,8 @@ func runMarketplaceReserve(ctx context.Context, session *controlclient.Session, 
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, reservation)
 	}
-	fmt.Fprintf(settings.stdout, "Reserved %s on offer %s (machine %s) until %s.\n", reservation.ID, reservation.OfferID, reservation.MachineID, reservation.ExpiresAt.Local().Format(time.DateTime))
-	fmt.Fprintln(settings.stdout, "Commit it when the migration lands; release it otherwise.")
+	_, _ = fmt.Fprintf(settings.stdout, "Reserved %s on offer %s (machine %s) until %s.\n", reservation.ID, reservation.OfferID, reservation.MachineID, reservation.ExpiresAt.Local().Format(time.DateTime))
+	_, _ = fmt.Fprintln(settings.stdout, "Commit it when the migration lands; release it otherwise.")
 	return nil
 }
 
@@ -1163,7 +1163,7 @@ func runMarketplaceTransition(ctx context.Context, session *controlclient.Sessio
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, reservation)
 	}
-	fmt.Fprintf(settings.stdout, "Reservation %s is %s.\n", reservation.ID, string(reservation.State))
+	_, _ = fmt.Fprintf(settings.stdout, "Reservation %s is %s.\n", reservation.ID, string(reservation.State))
 	return nil
 }
 
@@ -1173,13 +1173,13 @@ func printFleetMachines(settings options, machines []controlclient.Machine) erro
 		return writeJSON(settings.stdout, machines)
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "MACHINE\tNAME\tSTATUS\tLAST SEEN\tAGENT")
+	_, _ = fmt.Fprintln(writer, "MACHINE\tNAME\tSTATUS\tLAST SEEN\tAGENT")
 	for _, machine := range machines {
 		lastSeen := "never"
 		if machine.LastSeenAt != nil {
 			lastSeen = machine.LastSeenAt.Local().Format(time.DateTime)
 		}
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", machine.MachineID, machine.Name, machine.Status, lastSeen, machine.AgentURL)
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", machine.MachineID, machine.Name, machine.Status, lastSeen, machine.AgentURL)
 	}
 	return writer.Flush()
 }
@@ -1190,9 +1190,9 @@ func printAuditEvents(settings options, events []controlclient.AuditEvent) error
 		return writeJSON(settings.stdout, events)
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "AT\tACTION\tRESOURCE\tACTOR")
+	_, _ = fmt.Fprintln(writer, "AT\tACTION\tRESOURCE\tACTOR")
 	for _, event := range events {
-		fmt.Fprintf(writer, "%s\t%s\t%s/%s\t%s\n", event.CreatedAt.Local().Format(time.DateTime), event.Action, event.ResourceType, shortID(event.ResourceID), shortID(event.ActorUserID))
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s/%s\t%s\n", event.CreatedAt.Local().Format(time.DateTime), event.Action, event.ResourceType, shortID(event.ResourceID), shortID(event.ActorUserID))
 	}
 	return writer.Flush()
 }
@@ -1202,9 +1202,9 @@ func printEntitlement(settings options, entitlement controlclient.Entitlement) e
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, entitlement)
 	}
-	fmt.Fprintf(settings.stdout, "Plan:      %s (%s)\n", entitlement.Plan, entitlement.Status)
-	fmt.Fprintf(settings.stdout, "Machines:  %d\n", entitlement.MaxMachines)
-	fmt.Fprintf(settings.stdout, "Storage:   %s of %s used\n", humanBytes(entitlement.UsedStorageBytes), humanBytes(entitlement.MaxStorageBytes))
+	_, _ = fmt.Fprintf(settings.stdout, "Plan:      %s (%s)\n", entitlement.Plan, entitlement.Status)
+	_, _ = fmt.Fprintf(settings.stdout, "Machines:  %d\n", entitlement.MaxMachines)
+	_, _ = fmt.Fprintf(settings.stdout, "Storage:   %s of %s used\n", humanBytes(entitlement.UsedStorageBytes), humanBytes(entitlement.MaxStorageBytes))
 	return nil
 }
 
@@ -1214,13 +1214,13 @@ func printComputeOffers(settings options, offers []controlclient.ComputeOffer) e
 		return writeJSON(settings.stdout, offers)
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "OFFER\tMACHINE\tCPU\tMEMORY\tSTATUS")
+	_, _ = fmt.Fprintln(writer, "OFFER\tMACHINE\tCPU\tMEMORY\tSTATUS")
 	for _, offer := range offers {
 		status := string(offer.Availability.Status)
 		if offer.WithdrawnAt != nil {
 			status = "withdrawn"
 		}
-		fmt.Fprintf(writer, "%s\t%s\t%.1f\t%s\t%s\n", shortID(offer.ID), offer.MachineID, offer.Exposed.CPUCount, humanBytes(int64(offer.Exposed.MemoryBytes)), status)
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%.1f\t%s\t%s\n", shortID(offer.ID), offer.MachineID, offer.Exposed.CPUCount, humanBytes(int64(offer.Exposed.MemoryBytes)), status)
 	}
 	return writer.Flush()
 }
@@ -1231,11 +1231,11 @@ func printComputeInventory(settings options, inventory controlclient.ComputeInve
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, inventory)
 	}
-	fmt.Fprintf(settings.stdout, "Public trading: %s. %d offer(s) schedulable.\n", enabledDisabled(inventory.TradingEnabled), len(inventory.Offers))
+	_, _ = fmt.Fprintf(settings.stdout, "Public trading: %s. %d offer(s) schedulable.\n", enabledDisabled(inventory.TradingEnabled), len(inventory.Offers))
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "OFFER\tMACHINE\tTRUST\tCPU\tMEMORY\tPRICE")
+	_, _ = fmt.Fprintln(writer, "OFFER\tMACHINE\tTRUST\tCPU\tMEMORY\tPRICE")
 	for _, offer := range inventory.Offers {
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%.1f\t%s\t%s\n", shortID(offer.ID), offer.MachineName, string(offer.Trust), offer.Available.CPUCount, humanBytes(int64(offer.Available.MemoryBytes)), candidateCurrency(offer.Pricing.CPUHourMicros, offer.Pricing.Currency))
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%.1f\t%s\t%s\n", shortID(offer.ID), offer.MachineName, string(offer.Trust), offer.Available.CPUCount, humanBytes(int64(offer.Available.MemoryBytes)), candidateCurrency(offer.Pricing.CPUHourMicros, offer.Pricing.Currency))
 	}
 	return writer.Flush()
 }
@@ -1243,9 +1243,9 @@ func printComputeInventory(settings options, inventory controlclient.ComputeInve
 // printControlMigration renders one control-plane migration job. settings is
 // the output plumbing the caller already holds.
 func printControlMigration(settings options, job controlclient.MigrationJob) {
-	fmt.Fprintf(settings.stdout, "Migration %s: %s %s -> %s (%s mode)\n", job.ID, job.Status, job.SourceMachineID, job.DestinationMachineID, job.Mode)
+	_, _ = fmt.Fprintf(settings.stdout, "Migration %s: %s %s -> %s (%s mode)\n", job.ID, job.Status, job.SourceMachineID, job.DestinationMachineID, job.Mode)
 	if job.ErrorMessage != "" {
-		fmt.Fprintf(settings.stdout, "  error: %s\n", job.ErrorMessage)
+		_, _ = fmt.Fprintf(settings.stdout, "  error: %s\n", job.ErrorMessage)
 	}
 }
 

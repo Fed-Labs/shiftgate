@@ -12,7 +12,6 @@ import (
 )
 
 type fakeSTS struct {
-	mu            chan struct{}
 	policy        string
 	duration      string
 	sawSTS        bool

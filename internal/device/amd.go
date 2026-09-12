@@ -93,7 +93,7 @@ func amdDRMCards() []amdCard {
 	return cards
 }
 
-var cardNameRegexp = regexp.MustCompile(`^card[0-9]+$`)
+var cardNameRegexp = regexp.MustCompile(`^card\d+$`)
 
 // amdRenderNodes lists the DRI render nodes currently registered on the
 // machine, e.g. /dev/dri/renderD128.

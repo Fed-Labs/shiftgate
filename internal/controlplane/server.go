@@ -101,7 +101,7 @@ func (server *Server) Run(ctx context.Context) error {
 		IdleTimeout:       90 * time.Second,
 	}
 	errorsChannel := make(chan error, 1)
-	listener, err := net.Listen("tcp", server.config.Listen)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", server.config.Listen)
 	if err != nil {
 		return fmt.Errorf("listen control plane on %s: %w", server.config.Listen, err)
 	}

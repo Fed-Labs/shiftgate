@@ -316,7 +316,7 @@ func (s *Service) Run(ctx context.Context) error {
 			s.reporter.Stop()
 		}()
 	}
-	localListener, localTLS, localPath, err := s.listener(s.config.Listen, false)
+	localListener, localTLS, localPath, err := s.listener(ctx, s.config.Listen, false)
 	if err != nil {
 		return err
 	}
@@ -329,10 +329,10 @@ func (s *Service) Run(ctx context.Context) error {
 	errorsChannel := make(chan error, 2)
 	go serveHTTP(localServer, localListener, localTLS, errorsChannel)
 	if localPath != "" {
-		defer os.Remove(localPath)
+		defer func() { _ = os.Remove(localPath) }()
 	}
 	if s.config.RemoteListen != "" {
-		remoteListener, remoteTLS, _, err := s.listener(s.config.RemoteListen, true)
+		remoteListener, remoteTLS, _, err := s.listener(ctx, s.config.RemoteListen, true)
 		if err != nil {
 			_ = localServer.Close()
 			return err
@@ -403,7 +403,7 @@ func (s *Service) objectStoreCleanupLoop(ctx context.Context) {
 	}
 }
 
-func (s *Service) listener(endpoint string, remote bool) (net.Listener, *tls.Config, string, error) {
+func (s *Service) listener(ctx context.Context, endpoint string, remote bool) (net.Listener, *tls.Config, string, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, nil, "", err
@@ -424,7 +424,7 @@ func (s *Service) listener(endpoint string, remote bool) (net.Listener, *tls.Con
 				return nil, nil, "", err
 			}
 		}
-		listener, err := net.Listen("unix", parsed.Path)
+		listener, err := (&net.ListenConfig{}).Listen(ctx, "unix", parsed.Path)
 		if err != nil {
 			return nil, nil, "", err
 		}
@@ -453,7 +453,7 @@ func (s *Service) listener(endpoint string, remote bool) (net.Listener, *tls.Con
 		}
 		return credentialListener{Listener: listener}, nil, parsed.Path, nil
 	case "tcp":
-		listener, err := net.Listen("tcp", parsed.Host)
+		listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", parsed.Host)
 		if err != nil {
 			return nil, nil, "", err
 		}

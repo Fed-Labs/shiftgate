@@ -444,7 +444,7 @@ func (s *Service) handleWorkloadLogs(writer http.ResponseWriter, request *http.R
 		writeAPIError(writer, http.StatusNotFound, "LOGS_NOT_FOUND", err.Error())
 		return
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = io.Copy(writer, reader)
 }

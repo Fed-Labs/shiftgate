@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -97,7 +98,7 @@ func TestLoadRejectsSessionsFromAnotherControlPlane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Load("https://this.example.com"); err != ErrNoSession {
+	if _, err := store.Load("https://this.example.com"); !errors.Is(err, ErrNoSession) {
 		t.Fatalf("expected ErrNoSession for a foreign control plane, got %v", err)
 	}
 }

@@ -38,12 +38,6 @@ func (fake *fakeControlPlane) setMode(mode string) {
 	fake.mode = mode
 }
 
-func (fake *fakeControlPlane) count() int {
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	return fake.requests
-}
-
 func (fake *fakeControlPlane) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/storage/credentials") {
 		writer.WriteHeader(http.StatusNotFound)

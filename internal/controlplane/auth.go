@@ -97,12 +97,12 @@ func verifyPassword(password, encoded, pepper string) bool {
 	return subtle.ConstantTimeCompare(actual, expected) == 1
 }
 
-func newToken(prefix string) (string, []byte, error) {
+func newToken(prefix string) (token string, raw []byte, err error) {
 	value := make([]byte, 32)
 	if _, err := rand.Read(value); err != nil {
 		return "", nil, err
 	}
-	token := prefix + base64.RawURLEncoding.EncodeToString(value)
+	token = prefix + base64.RawURLEncoding.EncodeToString(value)
 	return token, value, nil
 }
 

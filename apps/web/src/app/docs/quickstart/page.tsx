@@ -82,7 +82,7 @@ export default function QuickstartPage() {
           </h1>
           <p className="text-text-secondary max-w-2xl text-lg leading-relaxed">
             Run a real checkpoint-backed workflow in five steps. The examples use
-            the installed agent's default socket; production agents require
+            the installed agent&apos;s default socket; production agents require
             mutual TLS.
           </p>
         </div>

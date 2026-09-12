@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,7 +27,7 @@ func performCORSRequest(origins []string, request *http.Request) (*httptest.Resp
 }
 
 func TestCORSServesAllowedOrigin(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/me", nil)
 	request.Header.Set("Origin", "http://localhost:3001")
 	response, reached := performCORSRequest([]string{"http://localhost:3001"}, request)
 	if !reached {
@@ -41,7 +42,7 @@ func TestCORSServesAllowedOrigin(t *testing.T) {
 }
 
 func TestCORSPreflightIsAnsweredByTheMiddleware(t *testing.T) {
-	request := httptest.NewRequest(http.MethodOptions, "/v1/auth/register", nil)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodOptions, "/v1/auth/register", nil)
 	request.Header.Set("Origin", "http://localhost:3001")
 	request.Header.Set("Access-Control-Request-Method", http.MethodPost)
 	request.Header.Set("Access-Control-Request-Headers", "authorization, content-type")
@@ -69,7 +70,7 @@ func TestCORSPreflightIsAnsweredByTheMiddleware(t *testing.T) {
 }
 
 func TestCORSServesUnlistedOriginsWithoutCORSHeaders(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/me", nil)
 	// Same host, different port: an origin is scheme, host, and port together.
 	request.Header.Set("Origin", "http://localhost:3000")
 	response, reached := performCORSRequest([]string{"http://localhost:3001"}, request)
@@ -82,7 +83,7 @@ func TestCORSServesUnlistedOriginsWithoutCORSHeaders(t *testing.T) {
 }
 
 func TestCORSPassesOriginlessRequestsThrough(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/me", nil)
 	response, reached := performCORSRequest([]string{"http://localhost:3001"}, request)
 	if !reached {
 		t.Fatal("CLI and agent requests carry no Origin and must pass through")
@@ -93,7 +94,7 @@ func TestCORSPassesOriginlessRequestsThrough(t *testing.T) {
 }
 
 func TestCORSAllowsNoBrowserOriginByDefault(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/v1/me", nil)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/me", nil)
 	request.Header.Set("Origin", "http://localhost:3001")
 	response, reached := performCORSRequest(nil, request)
 	if !reached {
@@ -111,7 +112,7 @@ func TestHandlerChainAnswersPreflight(t *testing.T) {
 	configuration := config.DefaultControlPlane()
 	configuration.AllowedOrigins = []string{"http://localhost:3001"}
 	server := New(configuration, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	request := httptest.NewRequest(http.MethodOptions, "/v1/auth/register", nil)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodOptions, "/v1/auth/register", nil)
 	request.Header.Set("Origin", "http://localhost:3001")
 	request.Header.Set("Access-Control-Request-Method", http.MethodPost)
 	recorder := httptest.NewRecorder()

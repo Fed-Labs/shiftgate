@@ -104,7 +104,7 @@ func keygen(arguments []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(output, "Private key written to %s\nPublic key written to %s\nTrusted-key entry:\n%s\n", *privatePath, *publicPath, encoded)
+	_, _ = fmt.Fprintf(output, "Private key written to %s\nPublic key written to %s\nTrusted-key entry:\n%s\n", *privatePath, *publicPath, encoded)
 	return nil
 }
 
@@ -132,7 +132,7 @@ func trustedKey(arguments []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(output, string(encoded))
+	_, _ = fmt.Fprintln(output, string(encoded))
 	return nil
 }
 
@@ -169,7 +169,7 @@ func sign(arguments []string, output io.Writer) error {
 	if err := persistence.WriteJSON(*outputPath, signed, 0o644); err != nil {
 		return err
 	}
-	fmt.Fprintf(output, "Release %s (%s) signed by key %s and written to %s.\n", signed.Release.Version, signed.Release.Channel, signer.KeyID(), *outputPath)
+	_, _ = fmt.Fprintf(output, "Release %s (%s) signed by key %s and written to %s.\n", signed.Release.Version, signed.Release.Channel, signer.KeyID(), *outputPath)
 	return nil
 }
 
@@ -213,7 +213,7 @@ func feed(arguments []string, output io.Writer) error {
 	if err := persistence.WriteJSON(*outputPath, document, 0o644); err != nil {
 		return err
 	}
-	fmt.Fprintf(output, "Feed for channel %s with %d release(s) written to %s.\n", document.Channel, len(document.Releases), *outputPath)
+	_, _ = fmt.Fprintf(output, "Feed for channel %s with %d release(s) written to %s.\n", document.Channel, len(document.Releases), *outputPath)
 	return nil
 }
 
@@ -252,15 +252,15 @@ func verify(arguments []string, output io.Writer) error {
 		signedBy, err := ring.Verify(signed)
 		if err != nil {
 			failed = true
-			fmt.Fprintf(output, "UNTRUSTED %s: %v\n", signed.Release.Version, err)
+			_, _ = fmt.Fprintf(output, "UNTRUSTED %s: %v\n", signed.Release.Version, err)
 			continue
 		}
-		fmt.Fprintf(output, "trusted   %s signed by %s\n", signed.Release.Version, strings.Join(signedBy, ", "))
+		_, _ = fmt.Fprintf(output, "trusted   %s signed by %s\n", signed.Release.Version, strings.Join(signedBy, ", "))
 	}
 	if failed {
 		return errors.New("one or more releases did not meet the signature threshold")
 	}
-	fmt.Fprintf(output, "All %d release(s) meet a threshold of %d.\n", len(document.Releases), *threshold)
+	_, _ = fmt.Fprintf(output, "All %d release(s) meet a threshold of %d.\n", len(document.Releases), *threshold)
 	return nil
 }
 

@@ -89,7 +89,7 @@ func DiscoverDependencies(command []string, root string, environment []string) (
 		if interpreter != "" {
 			resolved := interpreter
 			if !filepath.IsAbs(interpreter) {
-				resolved = filepath.Join("/", interpreter)
+				resolved = filepath.Clean("/" + interpreter)
 			}
 			if err := walk(resolved, DependencyInterpreter); err != nil {
 				return err
@@ -125,7 +125,7 @@ func elfDependencies(path string) (needed []string, interpreter string, err erro
 	if err != nil {
 		return nil, "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	for _, program := range file.Progs {
 		if program.Type == elf.PT_INTERP {
 			raw := make([]byte, program.Filesz)
@@ -153,7 +153,7 @@ func shebangInterpreter(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	reader := bufio.NewReader(io.LimitReader(file, 256))
 	line, err := reader.ReadString('\n')
 	if err != nil && line == "" {
@@ -179,7 +179,7 @@ func shebangInterpreter(path string) (string, error) {
 // resolves directly, a path inside the workload root is honored, and a bare
 // name is resolved through PATH like the runtime manager does when starting
 // the process.
-func resolveCommand(command string, root string) (string, error) {
+func resolveCommand(command, root string) (string, error) {
 	if filepath.IsAbs(command) {
 		return command, nil
 	}
@@ -204,7 +204,7 @@ func resolveCommand(command string, root string) (string, error) {
 // resolveLibrary finds a DT_NEEDED library, preferring copies inside the
 // workload root — a self-contained root's libraries travel with the
 // checkpoint, the host's do not.
-func resolveLibrary(name string, root string, environment []string) (string, bool) {
+func resolveLibrary(name, root string, environment []string) (string, bool) {
 	directories := make([]string, 0, len(librarySearchDirs)*2+8)
 	for _, directory := range librarySearchDirs {
 		directories = append(directories, filepath.Join(root, directory))
@@ -235,7 +235,7 @@ func libraryPaths(environment []string) []string {
 				continue
 			}
 			if !filepath.IsAbs(directory) {
-				directory = filepath.Join("/", directory)
+				directory = "/" + directory
 			}
 			paths = append(paths, filepath.Clean(directory))
 		}

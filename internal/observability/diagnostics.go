@@ -12,7 +12,7 @@ import (
 const (
 	OutcomeSuccess   = "success"
 	OutcomeFailure   = "failure"
-	OutcomeCancelled = "cancelled"
+	OutcomeCancelled = "cancelled" //nolint:misspell // metric label; matches the CANCELLED stage vocabulary
 )
 
 // Diagnostics records SHIFT's operational series: migration outcomes,

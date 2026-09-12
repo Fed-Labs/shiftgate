@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -75,8 +76,8 @@ func TestClientDecodesAPIErrors(t *testing.T) {
 		return testResponse(http.StatusNotFound, model.ErrorResponse{Code: "WORKLOAD_NOT_FOUND", Message: "missing workload"}), nil
 	})
 	_, err := client.Workload(context.Background(), "missing")
-	apiError, ok := err.(*APIError)
-	if !ok {
+	var apiError *APIError
+	if !errors.As(err, &apiError) {
 		t.Fatalf("expected APIError, got %T: %v", err, err)
 	}
 	if apiError.Status != http.StatusNotFound || apiError.Code != "WORKLOAD_NOT_FOUND" {

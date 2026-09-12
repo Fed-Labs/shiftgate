@@ -252,26 +252,31 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 	// it, a plain copy where it does not. This is what makes a clone set cost
 	// one extraction plus N cheap clones instead of N full decrypt-and-extract
 	// passes over the same chunks.
-	if err = os.MkdirAll(setDirectory, 0o700); err != nil {
+	err = os.MkdirAll(setDirectory, 0o700)
+	if err != nil {
 		return record, err
 	}
-	if err = os.MkdirAll(record.StagingRoot, 0o700); err != nil {
+	err = os.MkdirAll(record.StagingRoot, 0o700)
+	if err != nil {
 		return record, err
 	}
-	if err = extractDirectory(ctx, c.service.chunks, manifest.Workload.ID, filesystemAsset, record.StagingRoot); err != nil {
+	err = extractDirectory(ctx, c.service.chunks, manifest.Workload.ID, filesystemAsset, record.StagingRoot)
+	if err != nil {
 		return record, err
 	}
 	extractedRoot, err := validateExtractedRoot(record.StagingRoot, filepath.Base(sourceRoot))
 	if err != nil {
 		return record, err
 	}
-	if err = materializeProcessChain(ctx, c.service.repository, c.service.chunks, manifest, filepath.Dir(record.ImagesRoot)); err != nil {
+	err = materializeProcessChain(ctx, c.service.repository, c.service.chunks, manifest, filepath.Dir(record.ImagesRoot))
+	if err != nil {
 		return record, err
 	}
 	if info, statErr := os.Stat(record.ImagesRoot); statErr != nil || !info.IsDir() {
 		return record, errors.New("checkpoint process image directory is missing")
 	}
-	if err = c.transition(&record, CloneCloning, ""); err != nil {
+	err = c.transition(&record, CloneCloning, "")
+	if err != nil {
 		return record, err
 	}
 	// Bounded worker pool. The first member failure cancels the workers'
@@ -310,7 +315,8 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 		return record, failure
 	}
 	record.DurationMS = time.Since(now).Milliseconds()
-	if err = c.commit(&record); err != nil {
+	err = c.commit(&record)
+	if err != nil {
 		return record, err
 	}
 	c.logger.Info("checkpoint cloned", "clone_id", record.ID, "checkpoint_id", manifest.ID,
@@ -368,7 +374,7 @@ func (c *Cloner) cloneMember(ctx context.Context, record *CloneRecord, manifest 
 	// The copy is copy-on-write where the filesystem allows it, so on btrfs
 	// or xfs it costs nothing but metadata.
 	memberDirectory := filepath.Join(record.SetDirectory, fmt.Sprintf("member-%d", target.Index))
-	if err = os.MkdirAll(memberDirectory, 0o700); err != nil {
+	if err := os.MkdirAll(memberDirectory, 0o700); err != nil {
 		return err
 	}
 	memberImages := filepath.Join(memberDirectory, "images")

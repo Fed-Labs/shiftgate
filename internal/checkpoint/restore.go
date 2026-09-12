@@ -212,20 +212,24 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 			}
 		}
 	}()
-	if err = os.MkdirAll(stagingRoot, 0o700); err != nil {
+	err = os.MkdirAll(stagingRoot, 0o700)
+	if err != nil {
 		return record, err
 	}
-	if err = os.MkdirAll(restoreDirectory, 0o700); err != nil {
+	err = os.MkdirAll(restoreDirectory, 0o700)
+	if err != nil {
 		return record, err
 	}
-	if err = extractDirectory(ctx, r.service.chunks, manifest.Workload.ID, filesystemAsset, stagingRoot); err != nil {
+	err = extractDirectory(ctx, r.service.chunks, manifest.Workload.ID, filesystemAsset, stagingRoot)
+	if err != nil {
 		return record, err
 	}
 	restoredRoot, err := validateExtractedRoot(stagingRoot, filepath.Base(targetRoot))
 	if err != nil {
 		return record, err
 	}
-	if err = materializeProcessChain(ctx, r.service.repository, r.service.chunks, manifest, restoreDirectory); err != nil {
+	err = materializeProcessChain(ctx, r.service.repository, r.service.chunks, manifest, restoreDirectory)
+	if err != nil {
 		return record, err
 	}
 	imagesDirectory := filepath.Join(restoreDirectory, "images")
@@ -236,7 +240,8 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 		if targetInfo.Mode()&os.ModeSymlink != 0 {
 			return record, errors.New("refusing to replace a symlinked workload root")
 		}
-		if err = os.Rename(targetRoot, backupRoot); err != nil {
+		err = os.Rename(targetRoot, backupRoot)
+		if err != nil {
 			return record, fmt.Errorf("preserve destination root: %w", err)
 		}
 	} else if !errors.Is(lstatErr, os.ErrNotExist) {
@@ -244,7 +249,8 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	} else {
 		record.BackupRoot = ""
 	}
-	if err = materializeRoot(restoredRoot, targetRoot); err != nil {
+	err = materializeRoot(restoredRoot, targetRoot)
+	if err != nil {
 		if record.BackupRoot != "" {
 			_ = os.Rename(record.BackupRoot, targetRoot)
 		}
@@ -252,10 +258,12 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	}
 	record.State = RestoreFilesystemSwitched
 	record.UpdatedAt = time.Now().UTC()
-	if err = syncDir(parentDirectory); err != nil {
+	err = syncDir(parentDirectory)
+	if err != nil {
 		return record, err
 	}
-	if err = r.records.Put(record.ID, record); err != nil {
+	err = r.records.Put(record.ID, record)
+	if err != nil {
 		return record, err
 	}
 	_, created, err := r.service.runtime.PrepareRestore(manifest.Workload)
@@ -263,7 +271,8 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 		return record, err
 	}
 	record.CreatedWorkload = created
-	if err = r.records.Put(record.ID, record); err != nil {
+	err = r.records.Put(record.ID, record)
+	if err != nil {
 		return record, err
 	}
 	// The frozen source this checkpoint left as its rollback copy must not
@@ -275,7 +284,8 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	if previous := record.PreviousWorkload; previous != nil && previous.Process != nil &&
 		previous.Status == model.WorkloadCheckpointed &&
 		linuxplatform.ProcessAlive(previous.Process.PID, previous.Process.ProcStartTicks) {
-		if err = r.service.runtime.ParkFrozenSource(*previous, record.ID); err != nil {
+		err = r.service.runtime.ParkFrozenSource(*previous, record.ID)
+		if err != nil {
 			return record, fmt.Errorf("park the frozen source for the restore: %w", err)
 		}
 	}
@@ -343,10 +353,12 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	record.PID = pid
 	record.State = RestoreProcessRunning
 	record.UpdatedAt = time.Now().UTC()
-	if err = r.records.Put(record.ID, record); err != nil {
+	err = r.records.Put(record.ID, record)
+	if err != nil {
 		return record, err
 	}
-	if err = r.validateHealth(ctx, manifest.Workload); err != nil {
+	err = r.validateHealth(ctx, manifest.Workload)
+	if err != nil {
 		return record, err
 	}
 	// The process is up and healthy: publish its listeners and tell it what
@@ -374,7 +386,8 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	}
 	record.State = RestoreValidated
 	record.UpdatedAt = time.Now().UTC()
-	if err = r.records.Put(record.ID, record); err != nil {
+	err = r.records.Put(record.ID, record)
+	if err != nil {
 		return record, err
 	}
 	r.logger.Info("checkpoint restored and validated", "restore_id", record.ID, "checkpoint_id", checkpointID, "pid", pid, "duration", time.Since(restoreStarted))
@@ -462,7 +475,7 @@ func materializeProcessChain(ctx context.Context, repository *Repository, chunks
 // runs; the pass numbers must be contiguous from 1, because each pass's
 // images parent the previous pass's — a gap is a chain restore can never
 // resolve.
-func processImageAssets(manifest model.CheckpointManifest) (model.AssetManifest, []model.AssetManifest, error) {
+func processImageAssets(manifest model.CheckpointManifest) (final model.AssetManifest, passes []model.AssetManifest, err error) {
 	final, ok := assetByName(manifest.Assets, "process-state")
 	if !ok {
 		return model.AssetManifest{}, nil, fmt.Errorf("checkpoint %s has no process-state asset", manifest.ID)
@@ -483,7 +496,7 @@ func processImageAssets(manifest model.CheckpointManifest) (model.AssetManifest,
 		}
 		byIndex[number] = asset
 	}
-	passes := make([]model.AssetManifest, 0, len(byIndex))
+	passes = make([]model.AssetManifest, 0, len(byIndex))
 	for index := 1; index <= len(byIndex); index++ {
 		asset, present := byIndex[index]
 		if !present {
@@ -670,7 +683,11 @@ func (r *Restorer) rollback(ctx context.Context, record *RestoreRecord, reason s
 			if renameErr := os.Rename(record.TargetRoot, failedRoot); renameErr != nil {
 				return renameErr
 			}
-			defer os.RemoveAll(failedRoot)
+			defer func() {
+				if removeErr := os.RemoveAll(failedRoot); removeErr != nil {
+					r.logger.Error("remove the failed restore root", "path", failedRoot, "error", removeErr)
+				}
+			}()
 		}
 		if record.BackupRoot != "" {
 			if _, err := os.Lstat(record.BackupRoot); err == nil {
@@ -687,9 +704,10 @@ func (r *Restorer) rollback(ctx context.Context, record *RestoreRecord, reason s
 	if err := r.service.runtime.UnparkFrozenSource(record.WorkloadID, record.ID); err != nil {
 		r.logger.Error("reinstate the parked frozen source", "workload_id", record.WorkloadID, "restore_id", record.ID, "error", err)
 	}
-	if record.CreatedWorkload {
+	switch {
+	case record.CreatedWorkload:
 		_ = r.service.runtime.Delete(record.WorkloadID)
-	} else if record.PreviousWorkload != nil {
+	case record.PreviousWorkload != nil:
 		previous := *record.PreviousWorkload
 		if previous.Process != nil && !linuxplatform.ProcessAlive(previous.Process.PID, previous.Process.ProcStartTicks) {
 			// The frozen source was reaped because its listening sockets
@@ -709,7 +727,7 @@ func (r *Restorer) rollback(ctx context.Context, record *RestoreRecord, reason s
 				r.logger.Error("resume the checkpointed source after restore rollback", "workload_id", record.WorkloadID, "error", resumeErr)
 			}
 		}
-	} else {
+	default:
 		_ = r.service.runtime.MarkRestoreFailed(record.WorkloadID, reason)
 	}
 	_ = os.RemoveAll(record.StagingRoot)
@@ -865,13 +883,13 @@ func runHealthCheck(ctx context.Context, workload model.WorkloadSpec, check mode
 		if err := requireLoopbackHost(parsed.Hostname()); err != nil {
 			return err
 		}
-		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), http.NoBody)
 		client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 		response, err := client.Do(request)
 		if err != nil {
 			return err
 		}
-		defer response.Body.Close()
+		defer func() { _ = response.Body.Close() }()
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		if response.StatusCode < 200 || response.StatusCode >= 400 {
 			return fmt.Errorf("health endpoint returned %s", response.Status)
@@ -944,6 +962,6 @@ func syncDir(path string) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func() { _ = directory.Close() }()
 	return directory.Sync()
 }

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -186,7 +187,7 @@ func (provider *Provider) ExchangeCode(ctx context.Context, code, redirectURI, v
 	if err != nil {
 		return TokenResponse{}, fmt.Errorf("exchange authorization code: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	var tokens TokenResponse
 	if err := decodeBody(response, &tokens); err != nil {
 		return TokenResponse{}, err
@@ -297,7 +298,7 @@ type tokenHeader struct {
 
 // splitToken takes a compact JWS apart. The returned header keeps its decoded
 // form; payload and signature stay raw because their consumers differ.
-func splitToken(token string) (tokenHeader, []byte, []byte, error) {
+func splitToken(token string) (header tokenHeader, payload, signature []byte, err error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return tokenHeader{}, nil, nil, errors.New("ID token is not a compact JWS")
@@ -306,15 +307,14 @@ func splitToken(token string) (tokenHeader, []byte, []byte, error) {
 	if err != nil {
 		return tokenHeader{}, nil, nil, fmt.Errorf("decode ID-token header: %w", err)
 	}
-	var header tokenHeader
 	if err := json.Unmarshal(headerJSON, &header); err != nil {
 		return tokenHeader{}, nil, nil, fmt.Errorf("decode ID-token header: %w", err)
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	payload, err = base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		return tokenHeader{}, nil, nil, fmt.Errorf("decode ID-token payload: %w", err)
 	}
-	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	signature, err = base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
 		return tokenHeader{}, nil, nil, fmt.Errorf("decode ID-token signature: %w", err)
 	}
@@ -425,7 +425,14 @@ func (key JWK) publicKey() (crypto.PublicKey, error) {
 		if x.Cmp(elliptic.P256().Params().N) >= 0 || y.Cmp(elliptic.P256().Params().N) >= 0 {
 			return nil, fmt.Errorf("key %q carries out-of-range coordinates", key.Kid)
 		}
-		if !elliptic.P256().IsOnCurve(x, y) {
+		// On-curve validation without the deprecated low-level API: parsing
+		// the point as an ecdh key performs the same check, and rejects
+		// anything not on P-256.
+		point := make([]byte, 65)
+		point[0] = 4
+		x.FillBytes(point[1:33])
+		y.FillBytes(point[33:])
+		if _, ecdhErr := ecdh.P256().NewPublicKey(point); ecdhErr != nil {
 			return nil, fmt.Errorf("key %q is not a point on P-256", key.Kid)
 		}
 		return &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}, nil
@@ -480,7 +487,7 @@ func verifySignature(publicKey crypto.PublicKey, algorithm string, signingInput,
 
 // fetchJSON GETs endpoint and decodes into target.
 func fetchJSON(ctx context.Context, httpClient *http.Client, endpoint string, target any) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
 		return err
 	}
@@ -489,7 +496,7 @@ func fetchJSON(ctx context.Context, httpClient *http.Client, endpoint string, ta
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	return decodeBody(response, target)
 }
 

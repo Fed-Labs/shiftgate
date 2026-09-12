@@ -14,7 +14,7 @@ func (store *Store) Register(ctx context.Context, userID, email, passwordHash, d
 	if err != nil {
 		return UserRecord{}, OrganizationRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	now := time.Now().UTC()
 	user := UserRecord{ID: userID, Email: email, PasswordHash: passwordHash, DisplayName: displayName, CreatedAt: now}
 	if _, err := tx.Exec(ctx, `INSERT INTO users(id,email,password_hash,display_name,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$5)`, userID, email, passwordHash, displayName, now); err != nil {

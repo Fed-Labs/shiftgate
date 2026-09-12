@@ -462,7 +462,11 @@ http.server.HTTPServer(("127.0.0.1", %d), Handler).serve_forever()
 
 	fetch := func() string {
 		client := &http.Client{Timeout: 5 * time.Second}
-		response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+		request, requestErr := http.NewRequestWithContext(context.Background(), http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/", port), http.NoBody)
+		if requestErr != nil {
+			return ""
+		}
+		response, err := client.Do(request)
 		if err != nil {
 			return ""
 		}

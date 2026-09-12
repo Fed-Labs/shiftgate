@@ -202,11 +202,11 @@ func (o *Orchestrator) Preflight(ctx context.Context, request CreateRequest) (Pr
 	}
 	peer, err := o.clients(request.Destination)
 	if err != nil {
-		return PreflightResult{}, fmt.Errorf("%w: %v", ErrDestinationUnreachable, err)
+		return PreflightResult{}, fmt.Errorf("%w: %w", ErrDestinationUnreachable, err)
 	}
 	destination, err := peer.Machine(ctx)
 	if err != nil {
-		return PreflightResult{}, fmt.Errorf("%w: %v", ErrDestinationUnreachable, err)
+		return PreflightResult{}, fmt.Errorf("%w: %w", ErrDestinationUnreachable, err)
 	}
 	if destination.MachineID == o.identity.Machine.ID {
 		return PreflightResult{}, ErrDestinationIsSource
@@ -879,7 +879,9 @@ func (o *Orchestrator) handleCancellation(ctx context.Context, id string, peer P
 		return
 	}
 	_ = o.update(id, func(value *model.Migration) error {
-		value.FailureCode = "MIGRATION_CANCELLED"
+		// The spelling matches the persisted failure code; both Ls are part
+		// of the API surface recorded in existing migration rows.
+		value.FailureCode = "MIGRATION_CANCELLED" //nolint:misspell // persisted failure code in existing migration rows
 		value.FailureReason = cause.Error()
 		value.SourcePreserved = true
 		value.Metrics.Downtime = downtime
@@ -917,10 +919,11 @@ func (o *Orchestrator) handleCancellation(ctx context.Context, id string, peer P
 		}
 		return nil
 	})
-	o.recordSourceOutcome(id, migration.WorkloadID, migration.Network, network.StatusFailed, "migration cancelled: "+cause.Error())
+	// The two-L spelling matches the failure code this rollback records.
+	o.recordSourceOutcome(id, migration.WorkloadID, migration.Network, network.StatusFailed, "migration cancelled: "+cause.Error()) //nolint:misspell // matches the persisted failure-code vocabulary
 	migration, _ = o.records.Get(id)
 	if len(rollbackErrors) == 0 && model.CanTransition(migration.Stage, model.MigrationCancelled) {
-		_ = o.transition(id, model.MigrationCancelled, "migration cancelled; source workload preserved", 1)
+		_ = o.transition(id, model.MigrationCancelled, "migration cancelled; source workload preserved", 1) //nolint:misspell // stage vocabulary
 		o.recordOutcome(id, observability.OutcomeCancelled, downtime)
 	} else if len(rollbackErrors) > 0 && model.CanTransition(migration.Stage, model.MigrationFailed) {
 		_ = o.transition(id, model.MigrationFailed, "cancellation rollback requires operator intervention", migrationProgress(migration.Stage))

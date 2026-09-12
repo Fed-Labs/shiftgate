@@ -72,7 +72,7 @@ func run(arguments []string, stdout, stderr io.Writer) error {
 		if settings.jsonOutput {
 			return writeJSON(stdout, map[string]string{"version": config.Version})
 		}
-		fmt.Fprintln(stdout, "SHIFT", config.Version)
+		_, _ = fmt.Fprintln(stdout, "SHIFT", config.Version)
 		return nil
 	}
 	if command == "completion" {
@@ -156,7 +156,7 @@ func runDoctor(ctx context.Context, client *agentclient.Client, settings options
 		if check.OK {
 			status = "OK"
 		}
-		fmt.Fprintf(settings.stdout, "%-5s %-20s %s\n", status, check.Name, check.Message)
+		_, _ = fmt.Fprintf(settings.stdout, "%-5s %-20s %s\n", status, check.Name, check.Message)
 	}
 	if !result.Healthy {
 		return exitError{code: 3, err: errors.New("one or more required checks failed")}
@@ -174,9 +174,9 @@ func runMachine(ctx context.Context, client *agentclient.Client, settings option
 	}
 	// The full machine id, not a truncation: it is the value another
 	// machine's `migrate --machine-id` pin must match exactly.
-	fmt.Fprintf(settings.stdout, "MACHINE %s\n", machine.MachineID)
+	_, _ = fmt.Fprintf(settings.stdout, "MACHINE %s\n", machine.MachineID)
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "NAME\tOS\tARCH\tCPU\tMEMORY\tGPU\tRUNTIMES\tCRIU")
+	_, _ = fmt.Fprintln(writer, "NAME\tOS\tARCH\tCPU\tMEMORY\tGPU\tRUNTIMES\tCRIU")
 	gpu := "-"
 	if len(machine.GPUs) > 0 {
 		gpu = machine.GPUs[0].Vendor + " " + machine.GPUs[0].Model
@@ -197,7 +197,7 @@ func runMachine(ctx context.Context, client *agentclient.Client, settings option
 	if machine.CRIU.Healthy {
 		criu = machine.CRIU.Version
 	}
-	fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", machine.Hostname, machine.Distribution, machine.Architecture, machine.CPUs, humanBytes(int64(machine.MemoryBytes)), gpu, runtimes, criu)
+	_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", machine.Hostname, machine.Distribution, machine.Architecture, machine.CPUs, humanBytes(int64(machine.MemoryBytes)), gpu, runtimes, criu)
 	return writer.Flush()
 }
 
@@ -217,14 +217,14 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 			return writeJSON(settings.stdout, values)
 		}
 		writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(writer, "NAME\tSTATUS\tPID\tROOT\tCHECKPOINT")
+		_, _ = fmt.Fprintln(writer, "NAME\tSTATUS\tPID\tROOT\tCHECKPOINT")
 		for _, workload := range values {
 			pid := "-"
 			if workload.Process != nil {
 				pid = strconv.Itoa(workload.Process.PID)
 			}
 			checkpointID := shortID(workload.LatestCheckpointID)
-			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", workload.Spec.Name, workload.Status, pid, workload.Spec.RootPath, checkpointID)
+			_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", workload.Spec.Name, workload.Status, pid, workload.Spec.RootPath, checkpointID)
 		}
 		return writer.Flush()
 	case "create":
@@ -282,10 +282,10 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 			if policy.KeepLast > 0 {
 				keepNote = fmt.Sprintf("the last %d checkpoints", policy.KeepLast)
 			}
-			fmt.Fprintf(settings.stdout, "checkpoint policy: every %s, retaining %s\n",
+			_, _ = fmt.Fprintf(settings.stdout, "checkpoint policy: every %s, retaining %s\n",
 				(time.Duration(policy.IntervalSeconds) * time.Second).String(), keepNote)
 		} else {
-			fmt.Fprintln(settings.stdout, "checkpoint policy: disabled")
+			_, _ = fmt.Fprintln(settings.stdout, "checkpoint policy: disabled")
 		}
 		return nil
 	case "failover":
@@ -332,10 +332,10 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 			if installed.KeepLast > 0 {
 				keepNote = fmt.Sprintf("the last %d checkpoints", installed.KeepLast)
 			}
-			fmt.Fprintf(settings.stdout, "failover policy: replicate to %s, standby retains %s\n", installed.AgentURL, keepNote)
-			fmt.Fprintln(settings.stdout, "the newest checkpoint is pushed on the next scheduler pass (a few seconds)")
+			_, _ = fmt.Fprintf(settings.stdout, "failover policy: replicate to %s, standby retains %s\n", installed.AgentURL, keepNote)
+			_, _ = fmt.Fprintln(settings.stdout, "the newest checkpoint is pushed on the next scheduler pass (a few seconds)")
 		} else {
-			fmt.Fprintln(settings.stdout, "failover policy: disabled; the standby duty is withdrawn on the next pass")
+			_, _ = fmt.Fprintln(settings.stdout, "failover policy: disabled; the standby duty is withdrawn on the next pass")
 		}
 		return nil
 	case "start", "pause", "resume":
@@ -371,7 +371,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 			return operationError(err)
 		}
 		if !settings.jsonOutput {
-			fmt.Fprintln(settings.stdout, "Workload deleted.")
+			_, _ = fmt.Fprintln(settings.stdout, "Workload deleted.")
 		}
 		return nil
 	case "logs":
@@ -388,7 +388,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		if err != nil {
 			return operationError(err)
 		}
-		fmt.Fprint(settings.stdout, content)
+		_, _ = fmt.Fprint(settings.stdout, content)
 		return nil
 	default:
 		return usageError("unknown workload subcommand " + subcommand)
@@ -506,9 +506,9 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 			return writeJSON(settings.stdout, values)
 		}
 		writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(writer, "ID\tWORKLOAD\tKIND\tCREATED\tPLAIN\tSTORED")
+		_, _ = fmt.Fprintln(writer, "ID\tWORKLOAD\tKIND\tCREATED\tPLAIN\tSTORED")
 		for _, value := range values {
-			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", shortID(value.ID), value.WorkloadName, value.Kind, value.CreatedAt.Local().Format(time.DateTime), humanBytes(value.PlainBytes), humanBytes(value.StoredBytes))
+			_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", shortID(value.ID), value.WorkloadName, value.Kind, value.CreatedAt.Local().Format(time.DateTime), humanBytes(value.PlainBytes), humanBytes(value.StoredBytes))
 		}
 		return writer.Flush()
 	case "create":
@@ -538,7 +538,7 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, manifest)
 		}
-		fmt.Fprintf(settings.stdout, "Checkpoint %s created. %s -> %s, deduplicated %s, duration %s.\n", shortID(manifest.ID), humanBytes(manifest.Metrics.PlainBytes), humanBytes(manifest.Metrics.StoredBytes), humanBytes(manifest.Metrics.DeduplicatedBytes), manifest.Metrics.Duration.Round(time.Millisecond))
+		_, _ = fmt.Fprintf(settings.stdout, "Checkpoint %s created. %s -> %s, deduplicated %s, duration %s.\n", shortID(manifest.ID), humanBytes(manifest.Metrics.PlainBytes), humanBytes(manifest.Metrics.StoredBytes), humanBytes(manifest.Metrics.DeduplicatedBytes), manifest.Metrics.Duration.Round(time.Millisecond))
 		if capture := manifest.Filesystem; capture.Filesystem != "" {
 			source := "the frozen workload root"
 			if capture.Snapshot != "" {
@@ -548,7 +548,7 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 			if capture.ChangedFiles+capture.AddedFiles+capture.DeletedFiles > 0 {
 				changes = fmt.Sprintf("; %d changed, %d added, %d deleted since the previous checkpoint", capture.ChangedFiles, capture.AddedFiles, capture.DeletedFiles)
 			}
-			fmt.Fprintf(settings.stdout, "Filesystem: %s, captured from %s%s.\n", capture.Filesystem, source, changes)
+			_, _ = fmt.Fprintf(settings.stdout, "Filesystem: %s, captured from %s%s.\n", capture.Filesystem, source, changes)
 		}
 		if len(manifest.Dependencies) > 0 {
 			outside := 0
@@ -557,7 +557,7 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 					outside++
 				}
 			}
-			fmt.Fprintf(settings.stdout, "Dependencies: %d of %d resolved files live outside the workload root and do not travel with the checkpoint.\n", outside, len(manifest.Dependencies))
+			_, _ = fmt.Fprintf(settings.stdout, "Dependencies: %d of %d resolved files live outside the workload root and do not travel with the checkpoint.\n", outside, len(manifest.Dependencies))
 		}
 		return nil
 	case "mirror":
@@ -571,7 +571,7 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, result)
 		}
-		fmt.Fprintf(settings.stdout, "Checkpoint %s mirrored: %d objects, %s.\n", shortID(result.CheckpointID), result.Objects, humanBytes(result.Bytes))
+		_, _ = fmt.Fprintf(settings.stdout, "Checkpoint %s mirrored: %d objects, %s.\n", shortID(result.CheckpointID), result.Objects, humanBytes(result.Bytes))
 		return nil
 	case "inspect":
 		if len(arguments) != 2 {
@@ -605,11 +605,11 @@ func runRestore(ctx context.Context, client *agentclient.Client, settings option
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, record)
 	}
-	fmt.Fprintf(settings.stdout, "Checkpoint restored and committed. Process PID: %d\n", record.PID)
+	_, _ = fmt.Fprintf(settings.stdout, "Checkpoint restored and committed. Process PID: %d\n", record.PID)
 	// The same clock measures both paths, so the two numbers can be compared:
 	// eager pays the full memory load before the process exists, lazy pays it
 	// as the workload runs.
-	fmt.Fprintf(settings.stdout, "time to first execution: %d ms%s\n", record.TimeToFirstExecutionMS,
+	_, _ = fmt.Fprintf(settings.stdout, "time to first execution: %d ms%s\n", record.TimeToFirstExecutionMS,
 		map[bool]string{true: " (lazy: memory pages are still streaming in on demand)", false: ""}[record.Lazy])
 	return nil
 }
@@ -645,7 +645,7 @@ func runMigrate(ctx context.Context, client *agentclient.Client, settings option
 			Mode:        model.MigrationMode(*mode), PreCopyPasses: *preCopyPasses, TimeoutSeconds: *timeout,
 		})
 	}
-	migration, err := client.CreateMigration(ctx, agentclient.MigrationCreateRequest{
+	record, err := client.CreateMigration(ctx, agentclient.MigrationCreateRequest{
 		WorkloadID:  workload,
 		Destination: model.Destination{MachineID: *machineID, AgentURL: *destination, ServerName: *serverName},
 		Mode:        model.MigrationMode(*mode), PreCopyPasses: *preCopyPasses, TimeoutSeconds: *timeout,
@@ -655,12 +655,12 @@ func runMigrate(ctx context.Context, client *agentclient.Client, settings option
 	}
 	if !*wait {
 		if settings.jsonOutput {
-			return writeJSON(settings.stdout, migration)
+			return writeJSON(settings.stdout, record)
 		}
-		fmt.Fprintln(settings.stdout, migration.ID)
+		_, _ = fmt.Fprintln(settings.stdout, record.ID)
 		return nil
 	}
-	return waitForMigration(ctx, client, settings, migration.ID)
+	return waitForMigration(ctx, client, settings, record.ID)
 }
 
 // runMigrateDryRun is `migrate --dry-run`: the agent reaches the destination
@@ -695,20 +695,20 @@ func printPreflight(output io.Writer, result migration.PreflightResult) {
 	if mode == "" {
 		mode = string(model.MigrationCold)
 	}
-	fmt.Fprintf(output, "Preflight for workload %s (mode %s)\n", result.Workload.Name, mode)
-	fmt.Fprintf(output, "destination: %s on %s — %s/%s, kernel %s, CRIU %s, %s memory\n",
+	_, _ = fmt.Fprintf(output, "Preflight for workload %s (mode %s)\n", result.Workload.Name, mode)
+	_, _ = fmt.Fprintf(output, "destination: %s on %s — %s/%s, kernel %s, CRIU %s, %s memory\n",
 		shortID(result.Destination.MachineID), result.Destination.Hostname,
 		result.Destination.OS, result.Destination.Architecture, result.Destination.Kernel,
 		criuVersion(result.Destination.CRIU), humanBytes(int64(result.Destination.MemoryBytes)))
-	fmt.Fprintf(output, "source:      %s on %s — %s/%s, kernel %s\n",
+	_, _ = fmt.Fprintf(output, "source:      %s on %s — %s/%s, kernel %s\n",
 		shortID(result.SourceMachine.MachineID), result.SourceMachine.Hostname,
 		result.SourceMachine.OS, result.SourceMachine.Architecture, result.SourceMachine.Kernel)
-	fmt.Fprintf(output, "network:     %s\n", result.Network.Summary)
+	_, _ = fmt.Fprintf(output, "network:     %s\n", result.Network.Summary)
 	verdict := "yes — the migration would be admitted"
 	if !result.Report.Compatible {
 		verdict = "no — the migration would be rejected"
 	}
-	fmt.Fprintf(output, "compatible:  %s\n", verdict)
+	_, _ = fmt.Fprintf(output, "compatible:  %s\n", verdict)
 	var rejections, warnings []model.CompatibilityIssue
 	for _, issue := range result.Report.Issues {
 		if issue.Severity == "error" {
@@ -718,19 +718,19 @@ func printPreflight(output io.Writer, result migration.PreflightResult) {
 		}
 	}
 	if len(rejections) > 0 {
-		fmt.Fprintf(output, "\nrejections (%d) — each of these fails the migration:\n", len(rejections))
+		_, _ = fmt.Fprintf(output, "\nrejections (%d) — each of these fails the migration:\n", len(rejections))
 		for _, issue := range rejections {
-			fmt.Fprintf(output, "  %s [%s] %s — %s\n", issue.Code, issue.Resource, issue.Description, issue.Adaptation)
+			_, _ = fmt.Fprintf(output, "  %s [%s] %s — %s\n", issue.Code, issue.Resource, issue.Description, issue.Adaptation)
 		}
 	}
 	if len(warnings) > 0 {
-		fmt.Fprintf(output, "\nwarnings (%d) — the migration proceeds, but check these:\n", len(warnings))
+		_, _ = fmt.Fprintf(output, "\nwarnings (%d) — the migration proceeds, but check these:\n", len(warnings))
 		for _, issue := range warnings {
-			fmt.Fprintf(output, "  %s [%s] %s — %s\n", issue.Code, issue.Resource, issue.Description, issue.Adaptation)
+			_, _ = fmt.Fprintf(output, "  %s [%s] %s — %s\n", issue.Code, issue.Resource, issue.Description, issue.Adaptation)
 		}
 	}
 	if len(rejections) == 0 && len(warnings) == 0 {
-		fmt.Fprintln(output, "\nno compatibility issues found")
+		_, _ = fmt.Fprintln(output, "\nno compatibility issues found")
 	}
 }
 
@@ -750,11 +750,11 @@ func runFailover(ctx context.Context, client *agentclient.Client, settings optio
 		return writeJSON(settings.stdout, entries)
 	}
 	if len(entries) == 0 {
-		fmt.Fprintln(settings.stdout, "No failover policies are active. Install one with: shiftgate workload failover NAME --to URL")
+		_, _ = fmt.Fprintln(settings.stdout, "No failover policies are active. Install one with: shiftgate workload failover NAME --to URL")
 		return nil
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "WORKLOAD\tSTANDBY\tLAST CHECKPOINT\tPUSHED\tKEEP\tERROR")
+	_, _ = fmt.Fprintln(writer, "WORKLOAD\tSTANDBY\tLAST CHECKPOINT\tPUSHED\tKEEP\tERROR")
 	for _, entry := range entries {
 		pushed := "-"
 		if !entry.LastPushAt.IsZero() {
@@ -764,7 +764,7 @@ func runFailover(ctx context.Context, client *agentclient.Client, settings optio
 		if entry.KeepLast > 0 {
 			keep = strconv.Itoa(entry.KeepLast)
 		}
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			workloadLabel(entry.WorkloadName, entry.WorkloadID), entry.StandbyURL,
 			shortID(entry.LastCheckpointID), pushed, keep, entry.LastError)
 	}
@@ -825,17 +825,17 @@ func standbyList(ctx context.Context, client *agentclient.Client, settings optio
 		return writeJSON(settings.stdout, result)
 	}
 	if len(result.Duties) == 0 {
-		fmt.Fprintln(settings.stdout, "This machine stands warm standby for no workloads.")
+		_, _ = fmt.Fprintln(settings.stdout, "This machine stands warm standby for no workloads.")
 		return nil
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "WORKLOAD\tSTATE\tSOURCE\tCHECKPOINT\tHELD\tKEEP")
+	_, _ = fmt.Fprintln(writer, "WORKLOAD\tSTATE\tSOURCE\tCHECKPOINT\tHELD\tKEEP")
 	for _, duty := range result.Duties {
 		keep := "all"
 		if duty.KeepLast > 0 {
 			keep = strconv.Itoa(duty.KeepLast)
 		}
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			workloadLabel(duty.WorkloadName, duty.WorkloadID), duty.State,
 			shortID(duty.SourceMachineID), shortID(duty.LastCheckpointID),
 			duty.HeldAt.Local().Format(time.DateTime), keep)
@@ -845,18 +845,18 @@ func standbyList(ctx context.Context, client *agentclient.Client, settings optio
 	}
 	for _, duty := range result.Duties {
 		if duty.State == model.StandbyFailedOver {
-			fmt.Fprintf(settings.stdout, "%s failed over %s from checkpoint %s: %s\n",
+			_, _ = fmt.Fprintf(settings.stdout, "%s failed over %s from checkpoint %s: %s\n",
 				workloadLabel(duty.WorkloadName, duty.WorkloadID),
 				duty.FailoverAt.Local().Format(time.DateTime), shortID(duty.LastCheckpointID), duty.FailoverReason)
 		}
 		if duty.LastFailoverError != "" {
-			fmt.Fprintf(settings.stdout, "%s: last failover attempt failed: %s (next attempt %s)\n",
+			_, _ = fmt.Fprintf(settings.stdout, "%s: last failover attempt failed: %s (next attempt %s)\n",
 				workloadLabel(duty.WorkloadName, duty.WorkloadID), duty.LastFailoverError,
 				duty.NextAttemptAt.Local().Format(time.DateTime))
 		}
 	}
 	if !result.AutomaticFailover {
-		fmt.Fprintln(settings.stdout, "automatic failover: disabled — no control plane is configured, so this agent cannot confirm a source's death; only 'standby trigger' can act")
+		_, _ = fmt.Fprintln(settings.stdout, "automatic failover: disabled — no control plane is configured, so this agent cannot confirm a source's death; only 'standby trigger' can act")
 	}
 	return nil
 }
@@ -891,27 +891,27 @@ func standbyTrigger(ctx context.Context, settings options, arguments []string) e
 		return writeJSON(settings.stdout, result)
 	}
 	if result.Warning != "" {
-		fmt.Fprintln(settings.stderr, "warning: "+result.Warning)
+		_, _ = fmt.Fprintln(settings.stderr, "warning: "+result.Warning)
 	}
 	duty := result.Duty
-	fmt.Fprintf(settings.stdout, "Failover complete: workload %s restored from checkpoint %s (restore %s).\n",
+	_, _ = fmt.Fprintf(settings.stdout, "Failover complete: workload %s restored from checkpoint %s (restore %s).\n",
 		workloadLabel(duty.WorkloadName, duty.WorkloadID), shortID(duty.LastCheckpointID), shortID(duty.FailoverRestoreID))
 	if duty.FailoverReason != "" {
-		fmt.Fprintf(settings.stdout, "reason: %s\n", duty.FailoverReason)
+		_, _ = fmt.Fprintf(settings.stdout, "reason: %s\n", duty.FailoverReason)
 	}
 	return nil
 }
 
 func runStatus(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 1 {
-		migration, err := client.Migration(ctx, arguments[0])
+		record, err := client.Migration(ctx, arguments[0])
 		if err != nil {
 			return operationError(err)
 		}
 		if settings.jsonOutput {
-			return writeJSON(settings.stdout, migration)
+			return writeJSON(settings.stdout, record)
 		}
-		printMigration(settings.stdout, migration)
+		printMigration(settings.stdout, record)
 		return nil
 	}
 	values, err := client.Migrations(ctx)
@@ -922,13 +922,13 @@ func runStatus(ctx context.Context, client *agentclient.Client, settings options
 		return writeJSON(settings.stdout, values)
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "ID\tWORKLOAD\tSTAGE\tPROGRESS\tDESTINATION\tUPDATED")
+	_, _ = fmt.Fprintln(writer, "ID\tWORKLOAD\tSTAGE\tPROGRESS\tDESTINATION\tUPDATED")
 	for _, value := range values {
 		progress := 0.0
 		if len(value.Events) > 0 {
 			progress = value.Events[len(value.Events)-1].Progress * 100
 		}
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%.0f%%\t%s\t%s\n", shortID(value.ID), shortID(value.WorkloadID), value.Stage, progress, value.Destination.MachineID, value.UpdatedAt.Local().Format(time.DateTime))
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%.0f%%\t%s\t%s\n", shortID(value.ID), shortID(value.WorkloadID), value.Stage, progress, value.Destination.MachineID, value.UpdatedAt.Local().Format(time.DateTime))
 	}
 	return writer.Flush()
 }
@@ -941,44 +941,44 @@ func waitForMigration(ctx context.Context, client *agentclient.Client, settings 
 	lastSequence := uint64(0)
 	printer := newProgressPrinter(settings.stdout)
 	for {
-		migration, err := client.Migration(ctx, id)
+		record, err := client.Migration(ctx, id)
 		if err != nil {
 			return operationError(err)
 		}
 		if settings.jsonOutput {
-			if migration.Stage == model.MigrationCompleted || migration.Stage == model.MigrationRolledBack {
-				return writeJSON(settings.stdout, migration)
+			if record.Stage == model.MigrationCompleted || record.Stage == model.MigrationRolledBack {
+				return writeJSON(settings.stdout, record)
 			}
-		} else if len(migration.Events) > 0 {
-			event := migration.Events[len(migration.Events)-1]
+		} else if len(record.Events) > 0 {
+			event := record.Events[len(record.Events)-1]
 			if event.Sequence != lastSequence {
 				lastSequence = event.Sequence
-				printer.event(migration.Stage, event)
+				printer.event(record.Stage, event)
 			}
 		}
-		switch migration.Stage {
+		switch record.Stage {
 		case model.MigrationCompleted:
 			printer.end()
 			if !settings.jsonOutput {
-				fmt.Fprintf(settings.stdout, "Migration successful. Downtime: %s, transferred: %s, deduplicated: %s.\n", migration.Metrics.Downtime.Round(time.Millisecond), humanBytes(migration.Metrics.TransferredBytes), humanBytes(migration.Metrics.DeduplicatedBytes))
-				if migration.Network.Identity.IP != "" {
+				_, _ = fmt.Fprintf(settings.stdout, "Migration successful. Downtime: %s, transferred: %s, deduplicated: %s.\n", record.Metrics.Downtime.Round(time.Millisecond), humanBytes(record.Metrics.TransferredBytes), humanBytes(record.Metrics.DeduplicatedBytes))
+				if record.Network.Identity.IP != "" {
 					sockets := "listeners re-established; connections must reconnect"
-					if migration.Network.SocketsCarried {
+					if record.Network.SocketsCarried {
 						sockets = "TCP state carried with the checkpoint"
 					}
-					fmt.Fprintf(settings.stdout, "Network: virtual address %s, %s.\n", migration.Network.Identity.IP, sockets)
+					_, _ = fmt.Fprintf(settings.stdout, "Network: virtual address %s, %s.\n", record.Network.Identity.IP, sockets)
 				}
 			}
-			if migration.FailureCode != "" {
-				return exitError{code: 5, err: errors.New(migration.FailureReason)}
+			if record.FailureCode != "" {
+				return exitError{code: 5, err: errors.New(record.FailureReason)}
 			}
 			return nil
 		case model.MigrationRolledBack, model.MigrationFailed, model.MigrationCancelled:
 			printer.end()
 			if settings.jsonOutput {
-				_ = writeJSON(settings.stdout, migration)
+				_ = writeJSON(settings.stdout, record)
 			}
-			return exitError{code: 5, err: fmt.Errorf("migration %s: %s", migration.Stage, migration.FailureReason)}
+			return exitError{code: 5, err: fmt.Errorf("record %s: %s", record.Stage, record.FailureReason)}
 		}
 		select {
 		case <-ctx.Done():
@@ -1011,11 +1011,11 @@ func newProgressPrinter(writer io.Writer) *progressPrinter {
 // event draws one progress step.
 func (printer *progressPrinter) event(stage model.MigrationStage, event model.MigrationEvent) {
 	if !printer.terminal {
-		fmt.Fprintf(printer.writer, "[%s] %3.0f%% %s", stage, event.Progress*100, event.Message)
+		_, _ = fmt.Fprintf(printer.writer, "[%s] %3.0f%% %s", stage, event.Progress*100, event.Message)
 		if event.BytesTotal > 0 {
-			fmt.Fprintf(printer.writer, " (%s / %s)", humanBytes(event.BytesDone), humanBytes(event.BytesTotal))
+			_, _ = fmt.Fprintf(printer.writer, " (%s / %s)", humanBytes(event.BytesDone), humanBytes(event.BytesTotal))
 		}
-		fmt.Fprintln(printer.writer)
+		_, _ = fmt.Fprintln(printer.writer)
 		return
 	}
 	const width = 30
@@ -1026,16 +1026,16 @@ func (printer *progressPrinter) event(stage model.MigrationStage, event model.Mi
 	if filled > width {
 		filled = width
 	}
-	fmt.Fprintf(printer.writer, "\r[%s%s] %3.0f%% %s %s", strings.Repeat("=", filled), strings.Repeat(" ", width-filled), event.Progress*100, stage, event.Message)
+	_, _ = fmt.Fprintf(printer.writer, "\r[%s%s] %3.0f%% %s %s", strings.Repeat("=", filled), strings.Repeat(" ", width-filled), event.Progress*100, stage, event.Message)
 	if event.BytesTotal > 0 {
-		fmt.Fprintf(printer.writer, " (%s / %s)", humanBytes(event.BytesDone), humanBytes(event.BytesTotal))
+		_, _ = fmt.Fprintf(printer.writer, " (%s / %s)", humanBytes(event.BytesDone), humanBytes(event.BytesTotal))
 	}
 }
 
 // end closes an in-place bar so whatever follows starts on a fresh line.
 func (printer *progressPrinter) end() {
 	if printer.terminal {
-		fmt.Fprintln(printer.writer)
+		_, _ = fmt.Fprintln(printer.writer)
 	}
 }
 
@@ -1047,19 +1047,19 @@ func printWorkload(settings options, workload model.Workload) error {
 	if workload.Process != nil {
 		pid = strconv.Itoa(workload.Process.PID)
 	}
-	fmt.Fprintf(settings.stdout, "%s: %s (PID %s)\n", workload.Spec.Name, workload.Status, pid)
+	_, _ = fmt.Fprintf(settings.stdout, "%s: %s (PID %s)\n", workload.Spec.Name, workload.Status, pid)
 	return nil
 }
 
-func printMigration(writer io.Writer, migration model.Migration) {
+func printMigration(writer io.Writer, record model.Migration) {
 	progress := 0.0
 	message := ""
-	if len(migration.Events) > 0 {
-		event := migration.Events[len(migration.Events)-1]
+	if len(record.Events) > 0 {
+		event := record.Events[len(record.Events)-1]
 		progress = event.Progress * 100
 		message = event.Message
 	}
-	fmt.Fprintf(writer, "%s %s %.0f%% %s\n", migration.ID, migration.Stage, progress, message)
+	_, _ = fmt.Fprintf(writer, "%s %s %.0f%% %s\n", record.ID, record.Stage, progress, message)
 }
 
 func runFork(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
@@ -1076,9 +1076,9 @@ func runFork(ctx context.Context, client *agentclient.Client, settings options, 
 			return writeJSON(settings.stdout, records)
 		}
 		writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(writer, "FORK\tSTATE\tSOURCE\tWORKLOAD\tROOT\tGEN\tACTIVE")
+		_, _ = fmt.Fprintln(writer, "FORK\tSTATE\tSOURCE\tWORKLOAD\tROOT\tGEN\tACTIVE")
 		for _, record := range records {
-			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%d\t%t\n", record.ID, record.State,
+			_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%d\t%t\n", record.ID, record.State,
 				record.SourceWorkloadID, record.ForkWorkloadID, record.RootPath, record.Generation, record.Activated)
 		}
 		return writer.Flush()
@@ -1110,13 +1110,13 @@ func runFork(ctx context.Context, client *agentclient.Client, settings options, 
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, record)
 	}
-	fmt.Fprintf(settings.stdout, "Forked workload %s from checkpoint %s\n", record.ForkWorkloadID, record.SourceCheckpointID)
-	fmt.Fprintf(settings.stdout, "  fork id:     %s\n  root:        %s\n  checkpoint:  %s\n  generation:  %d\n",
+	_, _ = fmt.Fprintf(settings.stdout, "Forked workload %s from checkpoint %s\n", record.ForkWorkloadID, record.SourceCheckpointID)
+	_, _ = fmt.Fprintf(settings.stdout, "  fork id:     %s\n  root:        %s\n  checkpoint:  %s\n  generation:  %d\n",
 		record.ID, record.RootPath, record.ForkCheckpointID, record.Generation)
 	if record.Activated {
-		fmt.Fprintf(settings.stdout, "  process:     running as PID %d\n", record.PID)
+		_, _ = fmt.Fprintf(settings.stdout, "  process:     running as PID %d\n", record.PID)
 	} else {
-		fmt.Fprintln(settings.stdout, "  process:     not started; run shiftgate restore with the fork checkpoint or shiftgate fork --activate")
+		_, _ = fmt.Fprintln(settings.stdout, "  process:     not started; run shiftgate restore with the fork checkpoint or shiftgate fork --activate")
 	}
 	return nil
 }
@@ -1135,7 +1135,7 @@ func runClone(ctx context.Context, client *agentclient.Client, settings options,
 			return writeJSON(settings.stdout, records)
 		}
 		writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(writer, "CLONE\tSTATE\tCOUNT\tSOURCE WORKLOAD\tRUNNING\tDURATION\tCLONED FILES")
+		_, _ = fmt.Fprintln(writer, "CLONE\tSTATE\tCOUNT\tSOURCE WORKLOAD\tRUNNING\tDURATION\tCLONED FILES")
 		for _, record := range records {
 			running := 0
 			for _, member := range record.Members {
@@ -1143,7 +1143,7 @@ func runClone(ctx context.Context, client *agentclient.Client, settings options,
 					running++
 				}
 			}
-			fmt.Fprintf(writer, "%s\t%s\t%d\t%s\t%d/%d\t%dms\t%d\n", record.ID, record.State,
+			_, _ = fmt.Fprintf(writer, "%s\t%s\t%d\t%s\t%d/%d\t%dms\t%d\n", record.ID, record.State,
 				record.Count, record.SourceWorkloadID, running, record.Count, record.DurationMS, record.ClonedFiles)
 		}
 		return writer.Flush()
@@ -1167,7 +1167,7 @@ func runClone(ctx context.Context, client *agentclient.Client, settings options,
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, record)
 		}
-		fmt.Fprintf(settings.stdout, "Clone set %s rolled back: %d workload(s) removed\n", record.ID, record.Count)
+		_, _ = fmt.Fprintf(settings.stdout, "Clone set %s rolled back: %d workload(s) removed\n", record.ID, record.Count)
 		return nil
 	}
 	flags := flag.NewFlagSet("clone", flag.ContinueOnError)
@@ -1187,18 +1187,18 @@ func runClone(ctx context.Context, client *agentclient.Client, settings options,
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, record)
 	}
-	fmt.Fprintf(settings.stdout, "Cloned %d workload(s) from checkpoint %s\n", record.Count, record.CheckpointID)
-	fmt.Fprintf(settings.stdout, "  clone set:   %s\n  duration:    %dms\n  cloned files (copy-on-write): %d, copied: %d\n",
+	_, _ = fmt.Fprintf(settings.stdout, "Cloned %d workload(s) from checkpoint %s\n", record.Count, record.CheckpointID)
+	_, _ = fmt.Fprintf(settings.stdout, "  clone set:   %s\n  duration:    %dms\n  cloned files (copy-on-write): %d, copied: %d\n",
 		record.ID, record.DurationMS, record.ClonedFiles, record.CopiedFiles)
 	for _, member := range record.Members {
-		fmt.Fprintf(settings.stdout, "  %-28s pid %-6d root %s\n", member.Name, member.PID, member.RootPath)
+		_, _ = fmt.Fprintf(settings.stdout, "  %-28s pid %-6d root %s\n", member.Name, member.PID, member.RootPath)
 	}
-	fmt.Fprintln(settings.stdout, "  state is stored once for the whole set; each workload owns its root and every checkpoint it takes afterwards")
+	_, _ = fmt.Fprintln(settings.stdout, "  state is stored once for the whole set; each workload owns its root and every checkpoint it takes afterwards")
 	return nil
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, `Usage: shiftgate [--agent ENDPOINT] [--control-url URL] [--json] COMMAND
+	_, _ = fmt.Fprintln(writer, `Usage: shiftgate [--agent ENDPOINT] [--control-url URL] [--json] COMMAND
 
 Agent commands (local machine):
   doctor                         Check local migration prerequisites
@@ -1241,12 +1241,12 @@ func completion(writer io.Writer, arguments []string) error {
 	commands := "doctor machines workloads workload checkpoint restore fork clone migrate failover standby status update logs login logout whoami plans storage fleet marketplace version"
 	switch arguments[0] {
 	case "bash":
-		fmt.Fprintf(writer, "complete -W %q shiftgate\n", commands)
+		_, _ = fmt.Fprintf(writer, "complete -W %q shiftgate\n", commands)
 	case "zsh":
-		fmt.Fprintf(writer, "#compdef shiftgate\n_arguments '1:command:(%s)'\n", strings.ReplaceAll(commands, " ", " "))
+		_, _ = fmt.Fprintf(writer, "#compdef shiftgate\n_arguments '1:command:(%s)'\n", commands)
 	case "fish":
 		for _, command := range strings.Fields(commands) {
-			fmt.Fprintf(writer, "complete -c shiftgate -f -n '__fish_use_subcommand' -a %s\n", command)
+			_, _ = fmt.Fprintf(writer, "complete -c shiftgate -f -n '__fish_use_subcommand' -a %s\n", command)
 		}
 	default:
 		return usageError("unsupported shell " + arguments[0])

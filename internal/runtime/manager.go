@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -222,7 +223,10 @@ func (m *Manager) Start(idOrName string) (model.Workload, error) {
 		}
 		argv = append([]string{self, WorkloadExecCommand, "--"}, argv...)
 	}
-	command := exec.Command(argv[0], argv[1:]...)
+	// The workload is not tied to any request context: it runs until the
+	// operator or its own exit stops it, so its command carries a context
+	// that is never canceled.
+	command := exec.CommandContext(context.Background(), argv[0], argv[1:]...)
 	command.Dir = workload.Spec.WorkingDir
 	command.Env = mergedEnvironment(workload.Spec.Environment)
 	command.Stdout = logFile
@@ -505,7 +509,7 @@ func (m *Manager) PrepareRestore(spec model.WorkloadSpec) (model.Workload, bool,
 	return workload, false, nil
 }
 
-func (m *Manager) MarkRestoreFailed(id string, reason string) error {
+func (m *Manager) MarkRestoreFailed(id, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	workload, err := m.Get(id)

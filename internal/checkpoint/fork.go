@@ -173,7 +173,8 @@ func (f *Forker) Fork(parent context.Context, sourceWorkloadID string, options F
 	// The fork's declared ports are reserved when the fork is activated —
 	// a fork that is only materialized runs nothing and holds nothing. See
 	// activate().
-	if err = f.materialize(ctx, &record, manifest, filesystemAsset, forkSpec); err != nil {
+	err = f.materialize(ctx, &record, manifest, filesystemAsset, forkSpec)
+	if err != nil {
 		return record, err
 	}
 	if !options.Activate {
@@ -181,7 +182,8 @@ func (f *Forker) Fork(parent context.Context, sourceWorkloadID string, options F
 			"fork_workload_id", record.ForkWorkloadID, "fork_checkpoint_id", record.ForkCheckpointID, "root_path", record.RootPath)
 		return f.commit(&record)
 	}
-	if err = f.activate(ctx, &record, manifest, forkSpec); err != nil {
+	err = f.activate(ctx, &record, manifest, forkSpec)
+	if err != nil {
 		return record, err
 	}
 	f.logger.Info("workload forked and activated", "fork_id", record.ID, "source_workload_id", record.SourceWorkloadID,

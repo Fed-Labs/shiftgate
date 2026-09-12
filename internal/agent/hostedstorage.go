@@ -217,7 +217,7 @@ func (loop *hostedStorageLoop) fetchAndApply(ctx context.Context) {
 // endpoint. Only the fetch touches the network; apply is local.
 func (loop *hostedStorageLoop) fetch(ctx context.Context) (objectstore.STSCredentials, error) {
 	endpoint := fmt.Sprintf("%s/v1/organizations/%s/storage/credentials", strings.TrimRight(loop.configuration.controlURL, "/"), loop.configuration.organization)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
 		return objectstore.STSCredentials{}, err
 	}
@@ -226,7 +226,7 @@ func (loop *hostedStorageLoop) fetch(ctx context.Context) (objectstore.STSCreden
 	if err != nil {
 		return objectstore.STSCredentials{}, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
 		return objectstore.STSCredentials{}, err

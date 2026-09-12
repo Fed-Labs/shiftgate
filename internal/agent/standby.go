@@ -326,7 +326,7 @@ func (s *standbySupervisor) fetchPresence(ctx context.Context) (map[string]contr
 	requestCtx, cancel := context.WithTimeout(ctx, standbyFetchTimeout)
 	defer cancel()
 	endpoint := fmt.Sprintf("%s/v1/organizations/%s/machines", s.controlURL, s.organizationID)
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +335,7 @@ func (s *standbySupervisor) fetchPresence(ctx context.Context) (map[string]contr
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
 		return nil, fmt.Errorf("control plane answered %d: %s", response.StatusCode, strings.TrimSpace(string(body)))

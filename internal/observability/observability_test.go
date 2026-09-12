@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,7 +15,7 @@ func TestMetricsHandlerComposesDiagnostics(t *testing.T) {
 	diagnostics.MigrationFinished(OutcomeSuccess, time.Second, 0)
 	metrics.SetDiagnostics(diagnostics)
 	recorder := httptest.NewRecorder()
-	metrics.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	metrics.Handler().ServeHTTP(recorder, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil))
 	body := recorder.Body.String()
 	for _, expected := range []string{
 		"shift_uptime_seconds",
@@ -33,7 +34,7 @@ func TestMetricsHandlerComposesDiagnostics(t *testing.T) {
 func TestMetricsHandlerWithoutDiagnostics(t *testing.T) {
 	metrics := NewMetrics()
 	recorder := httptest.NewRecorder()
-	metrics.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	metrics.Handler().ServeHTTP(recorder, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil))
 	if body := recorder.Body.String(); strings.Contains(body, "migration") {
 		t.Fatalf("diagnostics series rendered without a recorder:\n%s", body)
 	}

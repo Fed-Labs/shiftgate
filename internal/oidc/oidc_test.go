@@ -94,8 +94,8 @@ func writeJSONTest(writer http.ResponseWriter, value any) {
 func rsaJWK(key *rsa.PrivateKey) map[string]string {
 	return map[string]string{
 		"kty": "RSA", "kid": "key-1", "use": "sig", "alg": "RS256",
-		"n": base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
-		"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.PublicKey.E)).Bytes()),
+		"n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
+		"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
 	}
 }
 

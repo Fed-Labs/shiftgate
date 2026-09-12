@@ -32,16 +32,15 @@ export function MigrateDialog({ workload, machines, onClose, onMigrated }: Migra
   // The plan decides whether live mode is offered at all: the free tier is
   // cold-only and the control plane enforces it (LIVE_MIGRATION_PLAN_REQUIRED).
   // The entitlement fetch is advisory — if it fails, the options stay open and
-  // the server's refusal is the gate that shows.
+  // the server's refusal is the gate that shows. The effective mode is derived
+  // rather than reset in an effect: a gated plan simply resolves to cold.
   const entitlementQuery = useQuery({
     queryKey: ["entitlement", orgId],
     queryFn: () => api.getEntitlement(orgId),
     staleTime: 60_000,
   });
   const liveGated = entitlementQuery.data?.plan === "free";
-  useEffect(() => {
-    if (liveGated) setMode("cold");
-  }, [liveGated]);
+  const effectiveMode = liveGated ? "cold" : mode;
 
   const migrate = useMutation({
     mutationFn: async () => {
@@ -50,7 +49,7 @@ export function MigrateDialog({ workload, machines, onClose, onMigrated }: Migra
         action: "migrate",
         workload_id: workload.id,
         destination_id: destinationId,
-        mode,
+        mode: effectiveMode,
         timeout_seconds: 600,
       });
       return result;
@@ -64,6 +63,7 @@ export function MigrateDialog({ workload, machines, onClose, onMigrated }: Migra
           ? `Migration started — stage ${stage}. Track it live on the Migrations page.`
           : "Migration started. Track it live on the Migrations page."
       );
+      onMigrated?.();
     },
     onError: (error: unknown) => setMessage(error instanceof Error ? error.message : "Migration failed"),
   });
@@ -163,13 +163,13 @@ export function MigrateDialog({ workload, machines, onClose, onMigrated }: Migra
             <p className="tlabel mb-2">mode</p>
             <div className="grid grid-cols-2 gap-2">
               <ModeOption
-                selected={mode === "cold"}
+                selected={effectiveMode === "cold"}
                 title="Cold"
                 description="Stops the workload for the whole capture-and-transfer window"
                 onClick={() => setMode("cold")}
               />
               <ModeOption
-                selected={mode === "live"}
+                selected={effectiveMode === "live"}
                 title="Live"
                 description="Pre-copy passes while it runs; a short freeze for the final delta"
                 onClick={() => setMode("live")}
@@ -219,7 +219,7 @@ export function MigrateDialog({ workload, machines, onClose, onMigrated }: Migra
             onClick={() => migrate.mutate()}
           >
             {migrate.isPending && <Loader2 size={13} className="mr-1.5 animate-spin" />}
-            {mode === "live" ? "MOVE (LIVE)" : "MOVE"}
+            {effectiveMode === "live" ? "MOVE (LIVE)" : "MOVE"}
           </Button>
         </div>
       </div>

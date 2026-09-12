@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -54,7 +53,6 @@ type Store struct {
 	root      string
 	chunkSize int
 	keys      *securestore.Manager
-	mu        sync.RWMutex
 }
 
 type PutResult struct {
@@ -185,7 +183,7 @@ func (s *Store) ExportChunk(ref model.ChunkRef, writer io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	hasher := sha256.New()
 	written, err := io.Copy(io.MultiWriter(writer, hasher), io.LimitReader(file, maxEncodedChunk+1))
 	if err != nil {
@@ -331,7 +329,7 @@ func (s *Store) putChunk(workloadID string, keyVersion uint32, dataKey []byte, s
 		return model.ChunkRef{}, false, err
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	defer func() { _ = os.Remove(temporaryPath) }()
 	if err := temporary.Chmod(0o600); err != nil {
 		_ = temporary.Close()
 		return model.ChunkRef{}, false, err
@@ -398,7 +396,7 @@ func (s *Store) readChunk(workloadID string, ref model.ChunkRef) ([]byte, error)
 // is reached through a ref the current write fabricated — it may predate the
 // zstd switch — so the codec is resolved from the bytes and the caller can
 // label the manifest truthfully.
-func (s *Store) verifyChunk(workloadID string, ref model.ChunkRef) ([]byte, string, error) {
+func (s *Store) verifyChunk(workloadID string, ref model.ChunkRef) (plaintext []byte, codec string, err error) {
 	path, err := s.chunkPath(ref)
 	if err != nil {
 		return nil, "", err
@@ -430,7 +428,7 @@ func (s *Store) verifyChunk(workloadID string, ref model.ChunkRef) ([]byte, stri
 	if err != nil {
 		return nil, "", err
 	}
-	plaintext, codec, err := decompress(compressed, plainSize)
+	plaintext, codec, err = decompress(compressed, plainSize)
 	if err != nil {
 		return nil, "", err
 	}
@@ -472,15 +470,13 @@ func encodeChunk(keyVersion uint32, plainSize int64, nonce, ciphertext []byte) (
 	return buffer.Bytes(), nil
 }
 
-func decodeChunk(encoded []byte) (uint32, int64, []byte, []byte, error) {
+func decodeChunk(encoded []byte) (keyVersion uint32, plainSize int64, nonce, ciphertext []byte, err error) {
 	reader := bytes.NewReader(encoded)
 	magicBytes := make([]byte, len(magic))
 	if _, err := io.ReadFull(reader, magicBytes); err != nil || string(magicBytes) != magic {
 		return 0, 0, nil, nil, errors.New("invalid chunk magic")
 	}
 	var format uint16
-	var keyVersion uint32
-	var plainSize int64
 	var nonceLength uint16
 	var ciphertextLength uint64
 	if err := binary.Read(reader, binary.BigEndian, &format); err != nil || format != fileFormatVersion {
@@ -501,8 +497,8 @@ func decodeChunk(encoded []byte) (uint32, int64, []byte, []byte, error) {
 	if nonceLength == 0 || ciphertextLength > maxEncodedChunk || uint64(reader.Len()) != uint64(nonceLength)+ciphertextLength {
 		return 0, 0, nil, nil, errors.New("invalid chunk lengths")
 	}
-	nonce := make([]byte, nonceLength)
-	ciphertext := make([]byte, ciphertextLength)
+	nonce = make([]byte, nonceLength)
+	ciphertext = make([]byte, ciphertextLength)
 	if _, err := io.ReadFull(reader, nonce); err != nil {
 		return 0, 0, nil, nil, err
 	}
@@ -536,7 +532,7 @@ var (
 // returning the codec it found. The size check runs after decompression so a
 // stream that expands to anything other than the recorded plaintext size is
 // rejected however it got there.
-func decompress(compressed []byte, expectedSize int64) ([]byte, string, error) {
+func decompress(compressed []byte, expectedSize int64) (plaintext []byte, codec string, err error) {
 	if bytes.HasPrefix(compressed, zstdFrameMagic) {
 		plaintext, err := zstdDecoder().DecodeAll(compressed, nil)
 		if err != nil {
@@ -552,7 +548,7 @@ func decompress(compressed []byte, expectedSize int64) ([]byte, string, error) {
 		if err != nil {
 			return nil, "", err
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 		limited := io.LimitReader(reader, expectedSize+1)
 		plaintext, err := io.ReadAll(limited)
 		if err != nil {
@@ -591,8 +587,4 @@ func copyContext(ctx context.Context, destination io.Writer, source io.Reader) (
 			return total, readErr
 		}
 	}
-}
-
-func hashWriter() hash.Hash {
-	return sha256.New()
 }

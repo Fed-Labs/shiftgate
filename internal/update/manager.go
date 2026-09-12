@@ -631,7 +631,7 @@ func (manager *Manager) Policy() Policy {
 }
 
 // Run checks periodically and, when the policy allows, applies what it finds. It
-// returns when the context is cancelled. Failures are logged and recorded rather
+// returns when the context is canceled. Failures are logged and recorded rather
 // than ending the loop, because a machine that cannot reach the feed today must
 // still try tomorrow.
 func (manager *Manager) Run(ctx context.Context) {

@@ -72,7 +72,10 @@ func NewDevelopmentClient(endpoint, certificateFile, privateKeyFile string) (*Cl
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{certificate},
 		// Development mode still encrypts traffic but intentionally skips peer trust validation.
-		InsecureSkipVerify: true, //nolint:gosec
+		// Insecure transport is the point here: the transfer client speaks to
+		// a peer agent whose identity is pinned by the migration session key,
+		// not by the web PKI.
+		InsecureSkipVerify: true, //nolint:gosec // peer identity is established by the session key, not TLS PKI
 	}}
 	return &Client{baseURL: strings.TrimRight(endpoint, "/"), http: &http.Client{Transport: transport}}, nil
 }
@@ -128,7 +131,7 @@ func (c *Client) UploadChunk(ctx context.Context, transferID string, ref model.C
 		<-exportDone
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	exportErr := <-exportDone
 	if exportErr != nil {
 		return exportErr
@@ -214,25 +217,22 @@ func (c *Client) doJSON(ctx context.Context, method, requestPath string, input, 
 			request.Header.Set("Content-Type", "application/json")
 		}
 		response, err := c.http.Do(request)
-		if err == nil {
-			defer response.Body.Close()
-			if response.StatusCode >= 200 && response.StatusCode < 300 {
-				if output == nil {
-					_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
-					return nil
-				}
-				return json.NewDecoder(io.LimitReader(response.Body, 16<<20)).Decode(output)
+		if err != nil {
+			lastErr = err
+		} else {
+			// Every attempt closes its own response body: one left open by
+			// a retried request would hold its connection until this
+			// function returns, and four attempts would hold four of them.
+			attemptErr := consumeResponse(response, output)
+			_ = response.Body.Close()
+			if attemptErr == nil || !retryableStatus(response.StatusCode) {
+				return attemptErr
 			}
 			// Only the transient classes are worth another attempt; a peer
 			// that refused the request outright — quota, storage, identity —
 			// answers the same way in 200ms, and every retry only delays the
 			// real error from reaching the migration record.
-			if !retryableStatus(response.StatusCode) {
-				return decodeRemoteError(response)
-			}
-			lastErr = decodeRemoteError(response)
-		} else {
-			lastErr = err
+			lastErr = attemptErr
 		}
 		select {
 		case <-ctx.Done():
@@ -257,6 +257,21 @@ func retryableStatus(status int) bool {
 		return true
 	}
 	return false
+}
+
+// consumeResponse reads a response's body to its outcome — decoding output on
+// success, a remote error otherwise — leaving the body ready for its caller to
+// close. A successful response with no output is drained, keeping its
+// connection reusable.
+func consumeResponse(response *http.Response, output any) error {
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		if output == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+			return nil
+		}
+		return json.NewDecoder(io.LimitReader(response.Body, 16<<20)).Decode(output)
+	}
+	return decodeRemoteError(response)
 }
 
 func decodeRemoteError(response *http.Response) error {

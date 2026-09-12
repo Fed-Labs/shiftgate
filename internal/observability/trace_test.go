@@ -102,7 +102,7 @@ func TestInjectTraceHeader(t *testing.T) {
 	if !ok || parsed.TraceID != trace.TraceID {
 		t.Fatalf("injected header = %q", traced.Header.Get(TraceParentHeader))
 	}
-	plain, err := http.NewRequest(http.MethodGet, "http://agent/v1/migrations", nil)
+	plain, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://agent/v1/migrations", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestTraceMiddlewarePropagatesAndEchoes(t *testing.T) {
 		served, _ = TraceFromContext(request.Context())
 	}))
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/v1/migrations", nil)
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/migrations", nil)
 	request.Header.Set(TraceParentHeader, incoming)
 	handler.ServeHTTP(recorder, request)
 	if served.TraceID != "4bf92f3577b34da6a3ce929d0e0e4736" {
@@ -134,7 +134,7 @@ func TestTraceMiddlewarePropagatesAndEchoes(t *testing.T) {
 func TestTraceMiddlewareMintsRootForUntracedRequests(t *testing.T) {
 	handler := TraceMiddleware(nil, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/workloads", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/workloads", nil))
 	if recorder.Header().Get(TraceParentHeader) == "" {
 		t.Fatal("untraced request got no root trace")
 	}
@@ -145,7 +145,7 @@ func TestTraceMiddlewareSkipsProbes(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	}))
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil))
 	if recorder.Header().Get(TraceParentHeader) != "" {
 		t.Fatal("metrics scrape was traced")
 	}

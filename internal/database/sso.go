@@ -63,7 +63,7 @@ func (store *Store) SetOrganizationSSO(ctx context.Context, organizationID, emai
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	command, err := tx.Exec(ctx, `UPDATE organizations SET sso_enforced=$2,sso_email_domain=$3,updated_at=now() WHERE id=$1`, organizationID, enforced, strings.ToLower(strings.TrimSpace(emailDomain)))
 	if err != nil {
 		return err
@@ -92,12 +92,13 @@ func (store *Store) FederateSSOLink(ctx context.Context, issuer, subject, email,
 	if err != nil {
 		return UserRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var user UserRecord
 	err = tx.QueryRow(ctx, `SELECT id,email,password_hash,display_name,disabled_at,created_at,external_id,sso_issuer,sso_subject FROM users WHERE sso_issuer=$1 AND sso_subject=$2`, issuer, subject).
 		Scan(&user.ID, &user.Email, &user.PasswordHash, &user.DisplayName, &user.DisabledAt, &user.CreatedAt, &user.ExternalID, &user.SSOIssuer, &user.SSOSubject)
-	if err == nil {
+	switch {
+	case err == nil:
 		// Returning identity: refresh the display name if the issuer's is
 		// newer, and fall through to membership enforcement below.
 		if displayName != "" && displayName != user.DisplayName {
@@ -106,12 +107,12 @@ func (store *Store) FederateSSOLink(ctx context.Context, issuer, subject, email,
 			}
 			user.DisplayName = displayName
 		}
-	} else if IsNotFound(err) {
+	case IsNotFound(err):
 		user, err = store.federateByEmail(ctx, tx, issuer, subject, email, displayName)
 		if err != nil {
 			return UserRecord{}, err
 		}
-	} else {
+	default:
 		return UserRecord{}, err
 	}
 	if user.DisabledAt != nil {

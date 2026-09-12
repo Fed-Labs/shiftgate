@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -207,7 +208,7 @@ func TestCloneTreeReproducesFilesLinksAndModes(t *testing.T) {
 
 func TestCloneTreeSkipsUnixSockets(t *testing.T) {
 	source := t.TempDir()
-	listener, err := net.Listen("unix", filepath.Join(source, "app.sock"))
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "unix", filepath.Join(source, "app.sock"))
 	if err != nil {
 		t.Skipf("cannot create a unix socket here: %v", err)
 	}

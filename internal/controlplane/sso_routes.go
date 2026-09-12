@@ -327,7 +327,7 @@ func validEmailDomain(domain string) bool {
 			return false
 		}
 		for _, character := range label {
-			if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '-') {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
 				return false
 			}
 		}

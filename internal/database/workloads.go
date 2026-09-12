@@ -25,7 +25,7 @@ func (store *Store) CreateWorkload(ctx context.Context, record WorkloadRecord, a
 	if err != nil {
 		return WorkloadRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	// An omitted status starts as empty JSON, the column's declared default —
 	// binding a nil RawMessage would send NULL and violate NOT NULL, the same
 	// default UpsertWorkload applies.
@@ -69,7 +69,7 @@ func (store *Store) UpdateWorkloadStatus(ctx context.Context, organizationID, wo
 	if err != nil {
 		return WorkloadRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var record WorkloadRecord
 	err = tx.QueryRow(ctx, `UPDATE workloads SET status=$3,updated_at=now() WHERE organization_id=$1 AND id=$2
 		RETURNING id,organization_id,COALESCE(machine_id,''),name,spec,status,created_at,updated_at`, organizationID, workloadID, status).
@@ -91,7 +91,7 @@ func (store *Store) UpsertWorkload(ctx context.Context, record WorkloadRecord, a
 	if err != nil {
 		return WorkloadRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var machineExists bool
 	if record.MachineID == "" {
 		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM machines WHERE organization_id=$1 AND machine_id='')`, record.OrganizationID).Scan(&machineExists)

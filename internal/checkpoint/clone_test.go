@@ -51,7 +51,7 @@ func (e *cloneEngine) Restore(_ context.Context, options RestoreOptions) (int, e
 			return 0, err
 		}
 	}
-	command := exec.Command("/bin/sh", "-c", "while true; do sleep 1; done")
+	command := exec.CommandContext(context.Background(), "/bin/sh", "-c", "while true; do sleep 1; done")
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
 		return 0, err

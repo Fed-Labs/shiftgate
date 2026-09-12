@@ -85,7 +85,7 @@ func Open(root string) (*Manager, error) {
 	return manager, nil
 }
 
-func (m *Manager) GetOrCreateWorkloadKey(workloadID string) (uint32, []byte, error) {
+func (m *Manager) GetOrCreateWorkloadKey(workloadID string) (version uint32, key []byte, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	records, err := m.loadWorkloadRecords(workloadID)
@@ -97,7 +97,7 @@ func (m *Manager) GetOrCreateWorkloadKey(workloadID string) (uint32, []byte, err
 		key, err := m.unwrap(record)
 		return record.KeyVersion, key, err
 	}
-	key := make([]byte, keySize)
+	key = make([]byte, keySize)
 	if _, err := rand.Read(key); err != nil {
 		return 0, nil, err
 	}
@@ -152,18 +152,18 @@ func (m *Manager) ImportWorkloadKey(workloadID string, version uint32, key []byt
 	return m.storeWorkloadKey(workloadID, version, key, records)
 }
 
-func (m *Manager) RotateWorkloadKey(workloadID string) (uint32, []byte, error) {
+func (m *Manager) RotateWorkloadKey(workloadID string) (version uint32, key []byte, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	records, err := m.loadWorkloadRecords(workloadID)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return 0, nil, err
 	}
-	var version uint32 = 1
+	version = 1
 	if len(records) > 0 {
 		version = records[len(records)-1].KeyVersion + 1
 	}
-	key := make([]byte, keySize)
+	key = make([]byte, keySize)
 	if _, err := rand.Read(key); err != nil {
 		return 0, nil, err
 	}

@@ -39,10 +39,10 @@ func (*activatingEngine) Dump(_ context.Context, options DumpOptions) error {
 }
 func (e *activatingEngine) Restore(_ context.Context, options RestoreOptions) (int, error) {
 	e.restores = append(e.restores, options)
-	command := exec.Command("/bin/sh", "-c", "while true; do sleep 1; done")
+	command := exec.CommandContext(context.Background(), "/bin/sh", "-c", "while true; do sleep 1; done")
 	// A CRIU-restored tree leads its own session and process group, exactly
 	// like a workload the manager starts; reproducing that here keeps the
-	// runtime manager's group-wide signalling scoped to the fake workload.
+	// runtime manager's group-wide signaling scoped to the fake workload.
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
 		return 0, err
@@ -291,7 +291,7 @@ func TestForkFromExplicitCheckpointRejectsForeignCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	if second.SourceCheckpointID != first.SourceCheckpointID {
-		t.Fatalf("explicit fork point was not honoured: %+v", second)
+		t.Fatalf("explicit fork point was not honored: %+v", second)
 	}
 	if second.RootPath == first.RootPath || second.ForkWorkloadID == first.ForkWorkloadID {
 		t.Fatalf("two forks of one checkpoint must be independent: %+v %+v", first, second)

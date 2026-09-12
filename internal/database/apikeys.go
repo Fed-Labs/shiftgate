@@ -15,7 +15,7 @@ func (store *Store) CreateAPIKey(ctx context.Context, record APIKeyRecord, secre
 	if err != nil {
 		return APIKeyRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	err = tx.QueryRow(ctx, `INSERT INTO api_keys(id,organization_id,user_id,name,prefix,secret_hash,scopes,expires_at)
 		VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING created_at`, record.ID, record.OrganizationID, record.UserID, record.Name, record.Prefix, secretHash, record.Scopes, record.ExpiresAt).Scan(&record.CreatedAt)
 	if err != nil {
@@ -47,7 +47,7 @@ func (store *Store) RevokeAPIKey(ctx context.Context, organizationID, keyID stri
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	command, err := tx.Exec(ctx, `UPDATE api_keys SET revoked_at=now() WHERE id=$1 AND organization_id=$2 AND revoked_at IS NULL`, keyID, organizationID)
 	if err != nil {
 		return err

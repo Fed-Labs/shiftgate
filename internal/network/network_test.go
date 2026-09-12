@@ -20,7 +20,7 @@ import (
 // port itself.
 func freePort(t *testing.T) int {
 	t.Helper()
-	listener, err := net.Listen(ProtocolTCP, "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), ProtocolTCP, "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("probe free port: %v", err)
 	}
@@ -33,7 +33,7 @@ func freePort(t *testing.T) int {
 // a forwarder dials, so the echo is reachable through the forwarder.
 func echoListener(t *testing.T, port int) (closer func()) {
 	t.Helper()
-	listener, err := net.Listen(ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	if err != nil {
 		t.Fatalf("start echo listener: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestForwarderCarriesTraffic(t *testing.T) {
 	forwarder, mapping := startForwarder(t, containerPort)
 	defer forwarder.Stop()
 
-	connection, err := net.DialTimeout(ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)), 2*time.Second)
+	connection, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)))
 	if err != nil {
 		t.Fatalf("dial forwarded port: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestForwarderDrainClosesRemainingConnections(t *testing.T) {
 	defer closeUpstream()
 	forwarder, mapping := startForwarder(t, containerPort)
 
-	connection, err := net.DialTimeout(ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)), 2*time.Second)
+	connection, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)))
 	if err != nil {
 		t.Fatalf("dial forwarded port: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestForwarderDrainClosesRemainingConnections(t *testing.T) {
 		t.Fatal("the connection must be closed after the grace period")
 	}
 	// After draining, the host port is free for the next user.
-	probe, err := net.Listen(ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)))
+	probe, err := (&net.ListenConfig{}).Listen(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)))
 	if err != nil {
 		t.Fatalf("the drained port must be releasable: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestCoordinatorLifecyclePublishesDrainsAndRecords(t *testing.T) {
 	}
 	// The forwarded mapping is reachable and carries traffic; the direct
 	// mapping needed no forwarder at all.
-	connection, err := net.DialTimeout(ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(forwarded.HostPort)), 2*time.Second)
+	connection, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(forwarded.HostPort)))
 	if err != nil {
 		t.Fatalf("dial forwarded port: %v", err)
 	}
@@ -440,7 +440,7 @@ func TestCoordinatorLifecyclePublishesDrainsAndRecords(t *testing.T) {
 	if ports := coordinator.ForwardedPorts("workload-live"); len(ports) != 0 {
 		t.Fatalf("forwarders must stop: %v", ports)
 	}
-	probe, err := net.Listen(ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(forwarded.HostPort)))
+	probe, err := (&net.ListenConfig{}).Listen(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(forwarded.HostPort)))
 	if err != nil {
 		t.Fatalf("the deactivated port must be free: %v", err)
 	}

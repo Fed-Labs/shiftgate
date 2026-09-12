@@ -14,7 +14,7 @@ func ReadJSON(path string, target any) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	decoder := json.NewDecoder(io.LimitReader(file, 64<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -85,7 +85,7 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return fmt.Errorf("open directory for sync: %w", err)
 	}
-	defer directory.Close()
+	defer func() { _ = directory.Close() }()
 	if err := directory.Sync(); err != nil && !errors.Is(err, os.ErrInvalid) {
 		return fmt.Errorf("sync directory: %w", err)
 	}

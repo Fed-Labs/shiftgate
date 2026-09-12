@@ -26,7 +26,9 @@ const (
 // at debug level); the previous gauge values stay in place, because a failed
 // read must not look like an idle or empty machine.
 func (s *Service) runSampler(ctx context.Context, diagnostics *observability.Diagnostics) {
-	s.sampleHost(diagnostics)
+	if err := s.sampleHost(diagnostics); err != nil {
+		s.logger.Debug("host sampling failed", "error", err)
+	}
 	go s.sampleGPULoop(ctx, diagnostics)
 	ticker := time.NewTicker(hostSampleInterval)
 	defer ticker.Stop()

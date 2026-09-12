@@ -279,7 +279,7 @@ func tailFile(path string, lines int) string {
 	if err != nil {
 		return ""
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	values := make([]string, 0, lines)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {

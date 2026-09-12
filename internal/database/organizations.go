@@ -37,7 +37,7 @@ func (store *Store) AddMember(ctx context.Context, organizationID, email, role s
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var userID string
 	if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE lower(email)=lower($1) AND disabled_at IS NULL`, email).Scan(&userID); err != nil {
 		return err

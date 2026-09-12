@@ -67,7 +67,7 @@ func (server *Server) handleWorkloadStatus(writer http.ResponseWriter, request *
 	if !decodeJSON(writer, request, &input) {
 		return
 	}
-	if input == nil || len(input) == 0 {
+	if len(input) == 0 {
 		writeError(writer, http.StatusBadRequest, "STATUS_INVALID", "status payload cannot be empty")
 		return
 	}

@@ -256,7 +256,7 @@ func TestPostgreSQLControlPlaneFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	subscriptionPayload := `{"id":"evt_` + subscriptionEventID + `","type":"customer.subscription.created","data":{"object":{"id":"sub_1","customer":"cus_integration_1","status":"active","current_period_end":1893456000,"metadata":{"organization_id":"` + registration.Organization.ID + `","plan":"pro","max_storage_bytes":"999999999999","max_machines":"9999"}}}}`
-	webhookRequest, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/webhooks/stripe", strings.NewReader(subscriptionPayload))
+	webhookRequest, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, httpServer.URL+"/v1/webhooks/stripe", strings.NewReader(subscriptionPayload))
 	webhookRequest.Header.Set("Content-Type", "application/json")
 	webhookRequest.Header.Set("Stripe-Signature", stripeSignature("whsec_integration", subscriptionPayload, time.Now().Unix()))
 	webhookResponse, err := client.Do(webhookRequest)
@@ -351,7 +351,7 @@ func TestPostgreSQLControlPlaneFlow(t *testing.T) {
 		t.Fatalf("expected audit events, got %d", len(audit))
 	}
 
-	request, _ := http.NewRequest(http.MethodGet, httpServer.URL+"/ready", nil)
+	request, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, httpServer.URL+"/ready", nil)
 	response, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -368,7 +368,7 @@ func postJSON(t *testing.T, client *http.Client, endpoint string, input any, exp
 	if err != nil {
 		t.Fatal(err)
 	}
-	request, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +392,7 @@ func postJSON(t *testing.T, client *http.Client, endpoint string, input any, exp
 
 func getJSON(t *testing.T, client *http.Client, endpoint string, expectedStatus int, output any, authorization string) {
 	t.Helper()
-	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +423,7 @@ func expectStatus(t *testing.T, client *http.Client, method, endpoint string, ex
 		}
 		body = bytes.NewReader(encoded)
 	}
-	request, err := http.NewRequest(method, endpoint, body)
+	request, err := http.NewRequestWithContext(context.Background(), method, endpoint, body)
 	if err != nil {
 		t.Fatal(err)
 	}

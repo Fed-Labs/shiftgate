@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,7 +21,7 @@ import (
 // is captured as several sibling bases because its image sets reference each
 // other through parent symlinks and must never be flattened into one
 // directory. Exclusions are matched against base-relative member paths.
-func captureDirectory(ctx context.Context, store *chunkstore.Store, workloadID, assetName, root string, bases []string, exclusions []string, restoreOrder int) (chunkstore.PutResult, error) {
+func captureDirectory(ctx context.Context, store *chunkstore.Store, workloadID, assetName, root string, bases, exclusions []string, restoreOrder int) (chunkstore.PutResult, error) {
 	if len(bases) == 0 {
 		return chunkstore.PutResult{}, errors.New("asset " + assetName + " has no archive bases")
 	}
@@ -178,9 +177,4 @@ func validateExtractedRoot(staging, expectedBase string) (string, error) {
 		return "", errors.New("restored workload root is not a directory")
 	}
 	return root, nil
-}
-
-func drainAndClose(reader io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, reader)
-	_ = reader.Close()
 }

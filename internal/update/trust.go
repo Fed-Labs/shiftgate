@@ -41,7 +41,7 @@ func TrustedKeyID(publicKeyPEM string) (string, error) {
 	return identity.PublicKeyID(publicKeyPEM)
 }
 
-// KeyRing is the set of keys whose signatures an installer honours, and how many
+// KeyRing is the set of keys whose signatures an installer honors, and how many
 // of them must agree. A threshold above one lets an operator require two
 // signers, so a single compromised signing key cannot ship a release on its own.
 type KeyRing struct {

@@ -220,7 +220,7 @@ func parseNvccVersion(output string) string {
 }
 
 // cudaToolkitDirectory looks for a standard toolkit install under /usr/local.
-func cudaToolkitDirectory() (string, string) {
+func cudaToolkitDirectory() (directory, version string) {
 	matches, _ := filepath.Glob("/usr/local/cuda*")
 	var best string
 	for _, candidate := range matches {
@@ -242,7 +242,7 @@ func cudaToolkitDirectory() (string, string) {
 	if best == "" {
 		return "", ""
 	}
-	version := strings.TrimPrefix(filepath.Base(best), "cuda-")
+	version = strings.TrimPrefix(filepath.Base(best), "cuda-")
 	if version == filepath.Base(best) {
 		version = ""
 	}

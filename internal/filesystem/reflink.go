@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -22,7 +23,7 @@ func CloneFile(source, destination string) (cloned bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	defer input.Close()
+	defer func() { _ = input.Close() }()
 	info, err := input.Stat()
 	if err != nil {
 		return false, err
@@ -34,7 +35,9 @@ func CloneFile(source, destination string) (cloned bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	defer output.Close()
+	// The explicit Sync below is what makes the copy durable; the close after
+	// it cannot reveal anything the sync has not already surfaced.
+	defer func() { _ = output.Close() }()
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, output.Fd(), ficlone, input.Fd())
 	switch errno {
 	case 0:
@@ -45,10 +48,10 @@ func CloneFile(source, destination string) (cloned bool, err error) {
 		if _, err = io.Copy(output, input); err != nil {
 			return false, err
 		}
-		if err = output.Chmod(info.Mode().Perm()); err != nil {
+		if err := output.Chmod(info.Mode().Perm()); err != nil {
 			return false, err
 		}
-		if err = output.Sync(); err != nil {
+		if err := output.Sync(); err != nil {
 			return false, err
 		}
 		return false, nil
@@ -120,8 +123,8 @@ func cloneWalk(source, target string, stats *CloneTreeStats, hardlinks map[devIn
 		return err
 	}
 	for _, entry := range entries {
-		sourcePath := source + string(os.PathSeparator) + entry.Name()
-		targetPath := target + string(os.PathSeparator) + entry.Name()
+		sourcePath := filepath.Join(source, entry.Name())
+		targetPath := filepath.Join(target, entry.Name())
 		info, err := entry.Info()
 		if err != nil {
 			return err
@@ -150,7 +153,7 @@ func cloneWalk(source, target string, stats *CloneTreeStats, hardlinks map[devIn
 			stats.Symlinks++
 		case mode.IsRegular():
 			if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-				key := devInode{device: uint64(stat.Dev), inode: stat.Ino}
+				key := devInode{device: stat.Dev, inode: stat.Ino}
 				if first, exists := hardlinks[key]; exists {
 					if err := os.Link(first, targetPath); err != nil {
 						return err

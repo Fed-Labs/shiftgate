@@ -164,7 +164,7 @@ func TestMigrationActiveFor(t *testing.T) {
 		{ID: "done", WorkloadID: "w1", Stage: model.MigrationCompleted},
 		{ID: "failed", WorkloadID: "w1", Stage: model.MigrationFailed},
 		{ID: "rolled-back", WorkloadID: "w1", Stage: model.MigrationRolledBack},
-		{ID: "cancelled", WorkloadID: "w1", Stage: model.MigrationCancelled},
+		{ID: "cancelled", WorkloadID: "w1", Stage: model.MigrationCancelled}, //nolint:misspell // mirrors the persisted stage vocabulary
 	}
 	if migrationActiveFor(migrations, "w1") {
 		t.Fatal("terminal migrations must not hold the policy loop back")

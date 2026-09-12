@@ -37,7 +37,7 @@ func (o *Orchestrator) SetSourceNetwork(sourceNetwork SourceNetwork) {
 // the grace period to complete before the process is frozen. Draining counts
 // toward migration downtime because the workload is unreachable from the
 // moment its forwarders stop.
-func (o *Orchestrator) drainSourceForwarders(id string, workloadID string, plan model.NetworkPlan) {
+func (o *Orchestrator) drainSourceForwarders(id, workloadID string, plan model.NetworkPlan) {
 	if o.sourceNetwork == nil || !plan.DrainBeforeCheckpoint || len(plan.Ports) == 0 {
 		return
 	}

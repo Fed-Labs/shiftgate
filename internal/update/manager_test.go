@@ -486,10 +486,7 @@ func TestManagerRunStopsWithItsContext(t *testing.T) {
 		close(finished)
 	}()
 	deadline := time.After(5 * time.Second)
-	for {
-		if fixture.manager.Status().LastCheckedAt != nil {
-			break
-		}
+	for fixture.manager.Status().LastCheckedAt == nil {
 		select {
 		case <-deadline:
 			t.Fatal("the update loop never performed its first check")
@@ -501,7 +498,7 @@ func TestManagerRunStopsWithItsContext(t *testing.T) {
 	select {
 	case <-finished:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the update loop did not stop when its context was cancelled")
+		t.Fatal("the update loop did not stop when its context was canceled")
 	}
 }
 

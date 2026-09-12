@@ -282,19 +282,22 @@ type CreateReservationInput struct {
 // Machines lists the organization's registered machines.
 func (session *Session) Machines(ctx context.Context, organizationID string) ([]Machine, error) {
 	var result []Machine
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/machines"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/machines"), nil, &result)
+	return result, err
 }
 
 // RegisterMachine adds a machine to the organization.
 func (session *Session) RegisterMachine(ctx context.Context, organizationID string, input CreateMachineInput) (Machine, error) {
 	var result Machine
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/machines"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/machines"), input, &result)
+	return result, err
 }
 
 // MachineHeartbeat refreshes a machine's presence and status.
 func (session *Session) MachineHeartbeat(ctx context.Context, organizationID, machineID string, input MachineHeartbeatInput) (Machine, error) {
 	var result Machine
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/machines/"+url.PathEscape(machineID)+"/heartbeat"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/machines/"+url.PathEscape(machineID)+"/heartbeat"), input, &result)
+	return result, err
 }
 
 // MachinesWithCapability asks the fleet query the capability projection backs:
@@ -307,45 +310,52 @@ func (session *Session) MachinesWithCapability(ctx context.Context, organization
 		requestPath += "&minimum=" + url.QueryEscape(strconv.FormatFloat(minimum, 'f', -1, 64))
 	}
 	var result []Machine
-	return result, session.call(ctx, "GET", requestPath, nil, &result)
+	err := session.call(ctx, "GET", requestPath, nil, &result)
+	return result, err
 }
 
 // Workloads lists the organization's workloads.
 func (session *Session) Workloads(ctx context.Context, organizationID string) ([]Workload, error) {
 	var result []Workload
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/workloads"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/workloads"), nil, &result)
+	return result, err
 }
 
 // RegisterWorkload adds a workload to the organization.
 func (session *Session) RegisterWorkload(ctx context.Context, organizationID string, input CreateWorkloadInput) (Workload, error) {
 	var result Workload
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/workloads"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/workloads"), input, &result)
+	return result, err
 }
 
 // Migrations lists the organization's migration jobs.
 func (session *Session) Migrations(ctx context.Context, organizationID string) ([]MigrationJob, error) {
 	var result []MigrationJob
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/migrations"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/migrations"), nil, &result)
+	return result, err
 }
 
 // CreateMigration asks the control plane to move a workload. The job is
 // accepted, not completed: poll Migrations or MigrationEvents for the outcome.
 func (session *Session) CreateMigration(ctx context.Context, organizationID string, input CreateMigrationInput) (MigrationJob, error) {
 	var result MigrationJob
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/migrations"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/migrations"), input, &result)
+	return result, err
 }
 
 // MigrationEvents streams one migration's progress events in order.
 func (session *Session) MigrationEvents(ctx context.Context, organizationID, migrationID string) ([]MigrationEvent, error) {
 	var result []MigrationEvent
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/migrations/"+url.PathEscape(migrationID)+"/events"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/migrations/"+url.PathEscape(migrationID)+"/events"), nil, &result)
+	return result, err
 }
 
 // CancelMigration stops an active migration. The returned job is the
 // control plane's final view of it.
 func (session *Session) CancelMigration(ctx context.Context, organizationID, migrationID string) (MigrationJob, error) {
 	var result MigrationJob
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/migrations/"+url.PathEscape(migrationID)+"/cancel"), nil, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/migrations/"+url.PathEscape(migrationID)+"/cancel"), nil, &result)
+	return result, err
 }
 
 // Checkpoints lists the organization's checkpoints, optionally filtered to one
@@ -356,25 +366,29 @@ func (session *Session) Checkpoints(ctx context.Context, organizationID, workloa
 		requestPath += "?workload_id=" + url.QueryEscape(workloadID)
 	}
 	var result []Checkpoint
-	return result, session.call(ctx, "GET", requestPath, nil, &result)
+	err := session.call(ctx, "GET", requestPath, nil, &result)
+	return result, err
 }
 
 // RegisterCheckpoint records a checkpoint the agent has already written.
 func (session *Session) RegisterCheckpoint(ctx context.Context, organizationID string, input CreateCheckpointInput) (Checkpoint, error) {
 	var result Checkpoint
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/checkpoints"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/checkpoints"), input, &result)
+	return result, err
 }
 
 // Entitlement is the organization's plan and its remaining allowance.
 func (session *Session) Entitlement(ctx context.Context, organizationID string) (Entitlement, error) {
 	var result Entitlement
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/entitlement"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/entitlement"), nil, &result)
+	return result, err
 }
 
 // Storage reads the organization's hosted checkpoint storage status.
 func (session *Session) Storage(ctx context.Context, organizationID string) (StorageStatus, error) {
 	var result StorageStatus
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/storage"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/storage"), nil, &result)
+	return result, err
 }
 
 // Usage summarizes metered usage over an inclusive date range. Both bounds
@@ -390,7 +404,8 @@ func (session *Session) Usage(ctx context.Context, organizationID string, from, 
 		requestPath += separator + "to=" + url.QueryEscape(to.Format("2006-01-02"))
 	}
 	var result []UsageSummary
-	return result, session.call(ctx, "GET", requestPath, nil, &result)
+	err := session.call(ctx, "GET", requestPath, nil, &result)
+	return result, err
 }
 
 // AuditEvents reads the organization's audit trail, most recent first. A
@@ -401,7 +416,8 @@ func (session *Session) AuditEvents(ctx context.Context, organizationID string, 
 		requestPath += "?limit=" + url.QueryEscape(strconv.Itoa(limit))
 	}
 	var result []AuditEvent
-	return result, session.call(ctx, "GET", requestPath, nil, &result)
+	err := session.call(ctx, "GET", requestPath, nil, &result)
+	return result, err
 }
 
 // RetentionPolicy mirrors the control plane's retention wire shape exactly —
@@ -427,13 +443,15 @@ type RetentionPolicyUpdate struct {
 // RetentionPolicy reads the organization's retention windows.
 func (session *Session) RetentionPolicy(ctx context.Context, organizationID string) (RetentionPolicy, error) {
 	var result RetentionPolicy
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/retention"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/retention"), nil, &result)
+	return result, err
 }
 
 // SetRetentionPolicy applies the named windows and returns the stored policy.
 func (session *Session) SetRetentionPolicy(ctx context.Context, organizationID string, update RetentionPolicyUpdate) (RetentionPolicy, error) {
 	var result RetentionPolicy
-	return result, session.call(ctx, "PUT", organizationPath(organizationID, "/retention"), update, &result)
+	err := session.call(ctx, "PUT", organizationPath(organizationID, "/retention"), update, &result)
+	return result, err
 }
 
 // OrganizationSSO is the organization's single sign-on enforcement state.
@@ -445,7 +463,8 @@ type OrganizationSSO struct {
 // OrganizationSSO reads the enforcement state.
 func (session *Session) OrganizationSSO(ctx context.Context, organizationID string) (OrganizationSSO, error) {
 	var result OrganizationSSO
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/sso"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/sso"), nil, &result)
+	return result, err
 }
 
 // SetOrganizationSSO enforces SSO for an email domain — or disables
@@ -453,20 +472,23 @@ func (session *Session) OrganizationSSO(ctx context.Context, organizationID stri
 // time; a claimed domain answers 409.
 func (session *Session) SetOrganizationSSO(ctx context.Context, organizationID string, enforced bool, emailDomain string) (OrganizationSSO, error) {
 	var result OrganizationSSO
-	return result, session.call(ctx, "PUT", organizationPath(organizationID, "/sso"), OrganizationSSO{Enforced: enforced, EmailDomain: emailDomain}, &result)
+	err := session.call(ctx, "PUT", organizationPath(organizationID, "/sso"), OrganizationSSO{Enforced: enforced, EmailDomain: emailDomain}, &result)
+	return result, err
 }
 
 // APIKeys lists the organization's keys, revoked ones included.
 func (session *Session) APIKeys(ctx context.Context, organizationID string) ([]APIKey, error) {
 	var result []APIKey
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/api-keys"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/api-keys"), nil, &result)
+	return result, err
 }
 
 // CreateAPIKey mints a key. The secret in the result is shown once and never
 // stored server-side — the caller must surface it immediately.
 func (session *Session) CreateAPIKey(ctx context.Context, organizationID string, input CreateAPIKeyInput) (APIKeyCreated, error) {
 	var result APIKeyCreated
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/api-keys"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/api-keys"), input, &result)
+	return result, err
 }
 
 // RevokeAPIKey permanently disables a key.
@@ -479,41 +501,47 @@ func (session *Session) RevokeAPIKey(ctx context.Context, organizationID, keyID 
 // configuration serves both.
 func (session *Session) Plans(ctx context.Context) ([]billing.Plan, error) {
 	var result []billing.Plan
-	return result, session.client.Plans(ctx, &result)
+	err := session.client.Plans(ctx, &result)
+	return result, err
 }
 
 // ComputeOffers lists the offers the organization has published, including
 // withdrawn ones.
 func (session *Session) ComputeOffers(ctx context.Context, organizationID string) ([]ComputeOffer, error) {
 	var result []ComputeOffer
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/compute/offers"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/compute/offers"), nil, &result)
+	return result, err
 }
 
 // PublishComputeOffer exposes a registered machine's resources.
 func (session *Session) PublishComputeOffer(ctx context.Context, organizationID string, input PublishOfferInput) (ComputeOffer, error) {
 	var result ComputeOffer
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/compute/offers"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/compute/offers"), input, &result)
+	return result, err
 }
 
 // WithdrawComputeOffer takes an offer off the market. Existing reservations
 // are unaffected; new placements stop seeing it.
 func (session *Session) WithdrawComputeOffer(ctx context.Context, organizationID, offerID string) (ComputeOffer, error) {
 	var result ComputeOffer
-	return result, session.call(ctx, "DELETE", organizationPath(organizationID, "/compute/offers/"+url.PathEscape(offerID)), nil, &result)
+	err := session.call(ctx, "DELETE", organizationPath(organizationID, "/compute/offers/"+url.PathEscape(offerID)), nil, &result)
+	return result, err
 }
 
 // ComputeInventory is everything the organization may schedule against right
 // now, across its own machines and any the marketplace exposes to it.
 func (session *Session) ComputeInventory(ctx context.Context, organizationID string) (ComputeInventory, error) {
 	var result ComputeInventory
-	return result, session.call(ctx, "GET", organizationPath(organizationID, "/compute/inventory"), nil, &result)
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/compute/inventory"), nil, &result)
+	return result, err
 }
 
 // PlaceCompute ranks the destinations a workload could move to. It commits
 // nothing; CreateComputeReservation is what holds capacity.
 func (session *Session) PlaceCompute(ctx context.Context, organizationID string, input PlacementInput) (scheduler.Placement, error) {
 	var result scheduler.Placement
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/compute/placements"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/compute/placements"), input, &result)
+	return result, err
 }
 
 // ComputeReservations lists live holds, optionally filtered to one offer.
@@ -523,14 +551,16 @@ func (session *Session) ComputeReservations(ctx context.Context, organizationID,
 		requestPath += "?offer_id=" + url.QueryEscape(offerID)
 	}
 	var result []scheduler.Reservation
-	return result, session.call(ctx, "GET", requestPath, nil, &result)
+	err := session.call(ctx, "GET", requestPath, nil, &result)
+	return result, err
 }
 
 // CreateComputeReservation holds capacity on an offer until it expires or is
 // transitioned.
 func (session *Session) CreateComputeReservation(ctx context.Context, organizationID string, input CreateReservationInput) (scheduler.Reservation, error) {
 	var result scheduler.Reservation
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/compute/reservations"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/compute/reservations"), input, &result)
+	return result, err
 }
 
 // SetComputeReservationState moves a reservation through its state machine —
@@ -541,5 +571,6 @@ func (session *Session) SetComputeReservationState(ctx context.Context, organiza
 		Error string                     `json:"error,omitempty"`
 	}{State: state, Error: failureReason}
 	var result scheduler.Reservation
-	return result, session.call(ctx, "POST", organizationPath(organizationID, "/compute/reservations/"+url.PathEscape(reservationID)+"/state"), input, &result)
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/compute/reservations/"+url.PathEscape(reservationID)+"/state"), input, &result)
+	return result, err
 }

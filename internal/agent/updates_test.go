@@ -143,7 +143,7 @@ func updateRequest(t *testing.T, service *Service, method, path string, body any
 		}
 		reader = bytes.NewReader(encoded)
 	}
-	request := httptest.NewRequest(method, path, reader)
+	request := httptest.NewRequestWithContext(context.Background(), method, path, reader)
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}

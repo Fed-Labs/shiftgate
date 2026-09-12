@@ -81,7 +81,7 @@ func (c *Client) do(ctx context.Context, method, requestPath, accessToken string
 	if err != nil {
 		return fmt.Errorf("connect to control plane: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return decodeError(response)
 	}

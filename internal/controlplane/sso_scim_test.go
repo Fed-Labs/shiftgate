@@ -35,7 +35,7 @@ import (
 // expected status, and decodes the body.
 func requestJSON(t *testing.T, client *http.Client, method, endpoint string, input any, expectedStatus int, output any, authorization string) {
 	t.Helper()
-	request, err := http.NewRequest(method, endpoint, bytes.NewReader(ssoMustJSON(t, input)))
+	request, err := http.NewRequestWithContext(context.Background(), method, endpoint, bytes.NewReader(ssoMustJSON(t, input)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +337,11 @@ func ssoLogin(t *testing.T, httpServer *httptest.Server, idp *fakeIdentityProvid
 	// The browser: hit the issuer without following the redirect, and take the
 	// code and state out of the Location.
 	browser := &http.Client{Transport: idp.server.Client().Transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	response, err := browser.Get(authorization.AuthorizationURL)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, authorization.AuthorizationURL, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := browser.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +417,11 @@ func TestSSOLoginFlow(t *testing.T) {
 		map[string]string{"email": idp.email, "redirect_uri": redirectURI, "code_challenge": verifierChallenge(t, verifier)},
 		http.StatusOK, &begin, "")
 	browser := &http.Client{Transport: idp.server.Client().Transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	response, err := browser.Get(begin.AuthorizationURL)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, begin.AuthorizationURL, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := browser.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}

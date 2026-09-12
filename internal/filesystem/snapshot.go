@@ -100,7 +100,9 @@ func (btrfsProvider) Create(ctx context.Context, source, id string) (Snapshot, e
 }
 
 func runBtrfs(arguments ...string) error {
-	output, err := exec.Command("btrfs", arguments...).CombinedOutput()
+	// Snapshot rollback and delete run from Close paths that have no context
+	// to inherit; btrfs subvolume operations are short kernel calls.
+	output, err := exec.CommandContext(context.Background(), "btrfs", arguments...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("btrfs %s: %w: %s", strings.Join(arguments, " "), err, firstLine(output))
 	}

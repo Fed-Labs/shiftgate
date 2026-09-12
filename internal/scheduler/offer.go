@@ -246,8 +246,8 @@ func (pricing Pricing) Cost(resources Resources, duration time.Duration, egressB
 	increment := time.Duration(pricing.BillingIncrementHours) * time.Hour
 	billable := duration
 	if increment > 0 {
-		units := (duration + increment - 1) / increment
-		billable = units * increment
+		units := (int64(duration) + int64(increment) - 1) / int64(increment)
+		billable = time.Duration(units * int64(increment))
 	}
 	hours := billable.Hours()
 	total := int64(0)

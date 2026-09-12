@@ -16,7 +16,7 @@ func (store *Store) CreateCheckpoint(ctx context.Context, record CheckpointRecor
 	if err != nil {
 		return CheckpointRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var workloadMachine string
 	if err := tx.QueryRow(ctx, `SELECT COALESCE(machine_id,'') FROM workloads WHERE id=$1 AND organization_id=$2 FOR UPDATE`, record.WorkloadID, record.OrganizationID).Scan(&workloadMachine); err != nil {
 		return CheckpointRecord{}, err

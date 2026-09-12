@@ -111,7 +111,7 @@ func WriteStatus(root string, document StatusDocument) (string, error) {
 		return "", fmt.Errorf("stage migration status: %w", err)
 	}
 	if err := os.Rename(staged, path); err != nil {
-		os.Remove(staged)
+		_ = os.Remove(staged)
 		return "", fmt.Errorf("publish migration status: %w", err)
 	}
 	return path, nil

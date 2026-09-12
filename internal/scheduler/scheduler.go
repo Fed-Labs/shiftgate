@@ -74,7 +74,7 @@ type Weights struct {
 	Freshness  float64 `json:"freshness"`
 }
 
-// DefaultWeights favour a destination that can actually hold the workload and
+// DefaultWeights favor a destination that can actually hold the workload and
 // is close to it, without letting price dominate a fleet where most offers are
 // free because the operator owns them.
 func DefaultWeights() Weights {
@@ -466,7 +466,7 @@ func (scheduler *Scheduler) evaluate(request Request, offer Offer, now time.Time
 	latency, latencyKnown := offer.LatencyTo(request.SourceMachineID, request.SourceGeography)
 	if request.Constraints.MaxLatencyMillis > 0 {
 		if !latencyKnown {
-			return Candidate{}, reject(RejectLatencyUnknown, "no measured round-trip time exists for this path, so a latency limit cannot be honoured")
+			return Candidate{}, reject(RejectLatencyUnknown, "no measured round-trip time exists for this path, so a latency limit cannot be honored")
 		}
 		if latency > request.Constraints.MaxLatencyMillis {
 			return Candidate{}, reject(RejectLatency, fmt.Sprintf("%.1f ms exceeds the %.1f ms limit", latency, request.Constraints.MaxLatencyMillis))

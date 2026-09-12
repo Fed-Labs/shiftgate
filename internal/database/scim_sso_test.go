@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"shift.dev/shift/internal/model"
@@ -94,7 +95,7 @@ func TestSCIMUserStore(t *testing.T) {
 	}
 
 	// A duplicate email or external id is a conflict.
-	if _, err := store.SCIMCreateUser(ctx, organizationID, SCIMUser{Email: first.Email, DisplayName: "Other"}, testAudit(organizationID, "scim.user.create", "dup")); err != ErrSCIMConflict {
+	if _, err := store.SCIMCreateUser(ctx, organizationID, SCIMUser{Email: first.Email, DisplayName: "Other"}, testAudit(organizationID, "scim.user.create", "dup")); !errors.Is(err, ErrSCIMConflict) {
 		t.Fatalf("duplicate email returned %v, want ErrSCIMConflict", err)
 	}
 
@@ -237,7 +238,7 @@ func TestFederateSSOLink(t *testing.T) {
 	}
 
 	// A different subject claiming the same email is refused.
-	if _, err := store.FederateSSOLink(ctx, issuer, "subject-"+run+"-2", newcomer, "Impostor", testAudit(organizationID, "user.sso_login", "x")); err != ErrSSOAccountLinked {
+	if _, err := store.FederateSSOLink(ctx, issuer, "subject-"+run+"-2", newcomer, "Impostor", testAudit(organizationID, "user.sso_login", "x")); !errors.Is(err, ErrSSOAccountLinked) {
 		t.Fatalf("impostor login returned %v, want ErrSSOAccountLinked", err)
 	}
 
@@ -265,7 +266,7 @@ func TestFederateSSOLink(t *testing.T) {
 	if _, err := store.SCIMSetActive(ctx, organizationID, first.ID, false, testAudit(organizationID, "scim.user.delete", first.ID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.FederateSSOLink(ctx, issuer, "subject-"+run+"-1", newcomer, "New Comer", testAudit(organizationID, "user.sso_login", "x")); err != ErrUserDisabled {
+	if _, err := store.FederateSSOLink(ctx, issuer, "subject-"+run+"-1", newcomer, "New Comer", testAudit(organizationID, "user.sso_login", "x")); !errors.Is(err, ErrUserDisabled) {
 		t.Fatalf("disabled login returned %v, want ErrUserDisabled", err)
 	}
 }

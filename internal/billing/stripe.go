@@ -151,7 +151,7 @@ func (c *StripeClient) post(ctx context.Context, path string, form url.Values, o
 	if err != nil {
 		return fmt.Errorf("stripe %s: %w", path, err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
 		return fmt.Errorf("stripe %s: read response: %w", path, err)

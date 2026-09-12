@@ -18,7 +18,7 @@ func (store *Store) CreateMigration(ctx context.Context, record MigrationRecord,
 	if err != nil {
 		return MigrationRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var workloadMachine string
 	if err := tx.QueryRow(ctx, `SELECT COALESCE(machine_id,'') FROM workloads WHERE id=$1 AND organization_id=$2 FOR UPDATE`, record.WorkloadID, record.OrganizationID).Scan(&workloadMachine); err != nil {
 		return MigrationRecord{}, err
@@ -76,7 +76,7 @@ func (store *Store) CreateMigrationForAgent(ctx context.Context, record Migratio
 
 func (store *Store) UpdateMigrationStatus(ctx context.Context, organizationID, migrationID, status string, progress json.RawMessage, errorMessage string, audit AuditInput) (MigrationRecord, error) {
 	switch status {
-	case "queued", "running", "completed", "failed", "cancelled":
+	case "queued", "running", "completed", "failed", "cancelled": //nolint:misspell // persisted status vocabulary
 	default:
 		return MigrationRecord{}, fmt.Errorf("unsupported migration status %q", status)
 	}
@@ -87,7 +87,7 @@ func (store *Store) UpdateMigrationStatus(ctx context.Context, organizationID, m
 	if err != nil {
 		return MigrationRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var record MigrationRecord
 	err = tx.QueryRow(ctx, `UPDATE migration_jobs SET status=$3,progress=$4,error_message=$5,
 			completed_at=CASE WHEN $3 IN ('completed','failed','cancelled') THEN now() ELSE completed_at END,updated_at=now()

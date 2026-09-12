@@ -250,22 +250,18 @@ func (store *Store) Migrate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		failed := false
 		for _, statement := range splitSQL(string(content)) {
 			if _, err := tx.Exec(ctx, statement); err != nil {
 				_ = tx.Rollback(ctx)
-				failed = true
 				return fmt.Errorf("apply migration %s: %w", entry.Name(), err)
 			}
 		}
-		if !failed {
-			if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(name) VALUES($1)`, entry.Name()); err != nil {
-				_ = tx.Rollback(ctx)
-				return err
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return err
-			}
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(name) VALUES($1)`, entry.Name()); err != nil {
+			_ = tx.Rollback(ctx)
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
 		}
 	}
 	return nil

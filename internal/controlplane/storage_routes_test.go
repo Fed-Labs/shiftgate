@@ -119,7 +119,7 @@ func (backend *fakeStorageBackend) recordedPolicies() []string {
 func storageCall(t *testing.T, configuration config.ControlPlane, method, path string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 	server := New(configuration, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	request := httptest.NewRequest(method, path, nil)
+	request := httptest.NewRequestWithContext(context.Background(), method, path, nil)
 	request = request.WithContext(context.WithValue(request.Context(), principalContextKey, Principal{UserID: "user_1", Role: RoleAdmin}))
 	request.SetPathValue("organizationID", "org_1")
 	recorder := httptest.NewRecorder()
@@ -340,7 +340,7 @@ func TestHostedStorageFlowWithDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	var quotaError map[string]any
-	request, err := http.NewRequest(http.MethodGet, organizationPath+"/storage/credentials", nil)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, organizationPath+"/storage/credentials", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

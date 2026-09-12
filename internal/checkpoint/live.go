@@ -304,7 +304,7 @@ func (l *LiveSession) Finalize(parent context.Context) (manifest model.Checkpoin
 	if len(l.passImages) > 0 {
 		parentImages = l.passImages[len(l.passImages)-1]
 	}
-	if err = l.service.criu.Dump(ctx, DumpOptions{
+	err = l.service.criu.Dump(ctx, DumpOptions{
 		PID: l.workload.Process.PID, ImagesDirectory: l.imagesDirectory, ParentImages: parentImages,
 		TCPState: l.options.TCPState, ShellJob: true, FileLocks: true, ExternalUNIX: true,
 		LeaveStopped: true, ManageCgroups: "soft",
@@ -312,7 +312,8 @@ func (l *LiveSession) Finalize(parent context.Context) (manifest model.Checkpoin
 		// of a later incremental checkpoint, so its dump must arm the memory
 		// tracker — CRIU refuses to diff against an untracked parent.
 		TrackMemory: l.options.LeaveRunning,
-	}); err != nil {
+	})
+	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
 	// The final image set references unchanged pages in its parent through the
@@ -384,7 +385,8 @@ func (l *LiveSession) Finalize(parent context.Context) (manifest model.Checkpoin
 	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
-	if err = l.requireKeyVersion(imageResult.Asset); err != nil {
+	err = l.requireKeyVersion(imageResult.Asset)
+	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
 	filesystemResult, err := captureDirectory(ctx, l.service.chunks, l.workload.Spec.ID,
@@ -392,7 +394,8 @@ func (l *LiveSession) Finalize(parent context.Context) (manifest model.Checkpoin
 	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
-	if err = l.requireKeyVersion(filesystemResult.Asset); err != nil {
+	err = l.requireKeyVersion(filesystemResult.Asset)
+	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
 	// Dependency discovery reports the files outside the process image that
@@ -442,18 +445,22 @@ func (l *LiveSession) Finalize(parent context.Context) (manifest model.Checkpoin
 		CompatibilityID: compatibilityID(machine, l.workload.Spec),
 	}
 	manifest.Security.KeyVersion = l.keyVersion
-	if err = SignManifest(&manifest, l.service.identity); err != nil {
+	err = SignManifest(&manifest, l.service.identity)
+	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
-	if err = l.service.repository.Save(manifest); err != nil {
+	err = l.service.repository.Save(manifest)
+	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
 	// The checkpoint exists now, so this instant's file index becomes the
 	// baseline the next checkpoint's changed-file accounting diffs against.
-	if err = os.MkdirAll(filepath.Join(l.service.stateDir, "indices"), 0o700); err != nil {
+	err = os.MkdirAll(filepath.Join(l.service.stateDir, "indices"), 0o700)
+	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
-	if err = filesystem.SaveIndex(indexPath, currentIndex); err != nil {
+	err = filesystem.SaveIndex(indexPath, currentIndex)
+	if err != nil {
 		return model.CheckpointManifest{}, fmt.Errorf("persist changed-file index: %w", err)
 	}
 	if l.service.mirror != nil {

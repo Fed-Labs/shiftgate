@@ -138,7 +138,7 @@ func (reporter *Reporter) report(ctx context.Context) {
 		reporter.logger.Warn("control-plane heartbeat failed", "error", err)
 		return
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
 	reporter.observeProtocol(response.Header.Get(model.ProtocolVersionHeader))
 	switch {

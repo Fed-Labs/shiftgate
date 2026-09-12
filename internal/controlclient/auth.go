@@ -78,7 +78,8 @@ func (c *Client) Organizations(ctx context.Context, accessToken string) ([]Organ
 // first is the one fleet commands operate on unless the caller says otherwise.
 func (session *Session) Organizations(ctx context.Context) ([]Organization, error) {
 	var result []Organization
-	return result, session.call(ctx, "GET", "/v1/organizations", nil, &result)
+	err := session.call(ctx, "GET", "/v1/organizations", nil, &result)
+	return result, err
 }
 
 // Health probes the control plane without credentials.

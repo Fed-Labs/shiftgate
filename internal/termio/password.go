@@ -34,7 +34,7 @@ func ReadPassword(file *os.File) (string, error) {
 	// Restore the terminal whatever the read did; a broken prompt on exit is
 	// worse than a lost error here.
 	_ = ioctlTermios(file.Fd(), syscall.TCSETS, &saved)
-	fmt.Fprintln(file)
+	_, _ = fmt.Fprintln(file)
 	return line, readErr
 }
 
@@ -46,7 +46,7 @@ func readLine(file *os.File) (string, error) {
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
-func ioctlTermios(fd uintptr, request uintptr, termios *syscall.Termios) error {
+func ioctlTermios(fd, request uintptr, termios *syscall.Termios) error {
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, request, uintptr(unsafe.Pointer(termios)))
 	if errno != 0 {
 		return errno

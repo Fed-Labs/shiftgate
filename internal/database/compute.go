@@ -132,7 +132,7 @@ func (store *Store) UpsertComputeOffer(ctx context.Context, record ComputeOfferR
 	if err != nil {
 		return ComputeOfferRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var (
 		name         string
 		agentURL     string
@@ -213,7 +213,7 @@ func (store *Store) WithdrawComputeOffer(ctx context.Context, organizationID, of
 	if err != nil {
 		return ComputeOfferRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	stored, err := scanComputeOffer(tx.QueryRow(ctx, `UPDATE compute_offers
 		SET status='withdrawn',withdrawn_at=now(),updated_at=now()
 		WHERE id=$1 AND organization_id=$2 RETURNING `+computeOfferColumns, offerID, organizationID))
@@ -282,7 +282,7 @@ func (store *Store) CreateComputeReservation(ctx context.Context, record Compute
 	if err != nil {
 		return ComputeReservationRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	offer, err := scanComputeOffer(tx.QueryRow(ctx, `SELECT `+computeOfferColumns+` FROM compute_offers
 		WHERE id=$1 AND withdrawn_at IS NULL FOR UPDATE`, record.OfferID))
 	if err != nil {
@@ -335,7 +335,7 @@ func (store *Store) UpdateComputeReservationState(ctx context.Context, organizat
 	if err != nil {
 		return ComputeReservationRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var current string
 	if err := tx.QueryRow(ctx, `SELECT state FROM compute_reservations
 		WHERE id=$1 AND organization_id=$2 FOR UPDATE`, reservationID, organizationID).Scan(&current); err != nil {

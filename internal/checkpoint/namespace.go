@@ -9,7 +9,7 @@ import (
 	"syscall"
 )
 
-// MountNamespaceCommand is the argv[1] the agent binary recognises as the
+// MountNamespaceCommand is the argv[1] the agent binary recognizes as the
 // private-mount-namespace shim. The agent re-executes itself with this verb so
 // that bind mounts required by a restore are visible only to the restored
 // process tree; nothing is mounted in the host namespace.
@@ -80,8 +80,7 @@ func RunMountNamespace(arguments []string) error {
 	return syscall.Exec(resolved, append([]string{resolved}, programArgs...), os.Environ())
 }
 
-func parseMountNamespaceArgs(arguments []string) ([]BindMount, string, []string, error) {
-	var mounts []BindMount
+func parseMountNamespaceArgs(arguments []string) (mounts []BindMount, program string, programArgs []string, err error) {
 	index := 0
 	for index < len(arguments) {
 		switch arguments[index] {

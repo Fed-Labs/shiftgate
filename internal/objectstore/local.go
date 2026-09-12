@@ -62,7 +62,7 @@ func (s *Local) Put(ctx context.Context, key string, reader io.Reader, size int6
 		return ObjectInfo{}, err
 	}
 	temporaryName := temporary.Name()
-	defer os.Remove(temporaryName)
+	defer func() { _ = os.Remove(temporaryName) }()
 	info, err := copyHashed(ctx, temporary, reader, size, expectedSHA256)
 	closeErr := temporary.Close()
 	if err != nil {
@@ -111,7 +111,7 @@ func (s *Local) Get(ctx context.Context, key string, writer io.Writer) (ObjectIn
 		}
 		return ObjectInfo{}, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	hasher := sha256.New()
 	written, copyErr := copyWithContext(ctx, io.MultiWriter(writer, hasher), file)
 	if copyErr != nil {
@@ -190,7 +190,7 @@ func (s *Local) UploadPart(ctx context.Context, uploadID string, number int, rea
 		return PartInfo{}, err
 	}
 	temporaryName := temporary.Name()
-	defer os.Remove(temporaryName)
+	defer func() { _ = os.Remove(temporaryName) }()
 	object, err := copyHashed(ctx, temporary, reader, size, expectedSHA256)
 	closeErr := temporary.Close()
 	if err != nil {
@@ -270,7 +270,7 @@ func (s *Local) CompleteMultipart(ctx context.Context, uploadID string, parts []
 		return ObjectInfo{}, err
 	}
 	temporaryName := temporary.Name()
-	defer os.Remove(temporaryName)
+	defer func() { _ = os.Remove(temporaryName) }()
 	hasher := sha256.New()
 	var total int64
 	for _, part := range parts {
@@ -398,7 +398,7 @@ func (s *Local) metaPath(objectPath string) string { return objectPath + localMe
 func (s *Local) headLocked(key, objectPath string) (ObjectInfo, error) {
 	metadata, err := os.Open(s.metaPath(objectPath))
 	if err == nil {
-		defer metadata.Close()
+		defer func() { _ = metadata.Close() }()
 		var info ObjectInfo
 		if decodeErr := json.NewDecoder(metadata).Decode(&info); decodeErr != nil {
 			return ObjectInfo{}, ErrIntegrity
@@ -435,7 +435,7 @@ func (s *Local) loadUpload(uploadID string) (localUploadMeta, string, error) {
 	if err != nil {
 		return localUploadMeta{}, "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	var meta localUploadMeta
 	if err := json.NewDecoder(file).Decode(&meta); err != nil || meta.UploadID != uploadID || meta.Key == "" {
 		return localUploadMeta{}, "", ErrInvalidUpload
@@ -500,7 +500,7 @@ func writeJSONAtomic(path string, value any) error {
 		return err
 	}
 	name := file.Name()
-	defer os.Remove(name)
+	defer func() { _ = os.Remove(name) }()
 	encoderErr := json.NewEncoder(file).Encode(value)
 	closeErr := file.Close()
 	if encoderErr != nil {
@@ -517,7 +517,7 @@ func readPartMeta(path string) (PartInfo, error) {
 	if err != nil {
 		return PartInfo{}, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	var part PartInfo
 	if err := json.NewDecoder(bufio.NewReader(file)).Decode(&part); err != nil {
 		return PartInfo{}, ErrInvalidPart

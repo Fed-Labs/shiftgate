@@ -111,7 +111,7 @@ func TestUpdatesLoadTrustedKeysFromAFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(keys) != 2 || keys[0].PublicKeyPEM != "inline" || keys[1].PublicKeyPEM != "from the file" {
-		t.Fatalf("inline and file keys must both be honoured: %+v", keys)
+		t.Fatalf("inline and file keys must both be honored: %+v", keys)
 	}
 }
 

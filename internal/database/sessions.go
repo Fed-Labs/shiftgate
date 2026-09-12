@@ -34,7 +34,7 @@ func (store *Store) RotateSession(ctx context.Context, refreshHash, nextAccessHa
 	if err != nil {
 		return SessionRecord{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var record SessionRecord
 	err = tx.QueryRow(ctx, `SELECT s.id,u.id,u.email,u.display_name,s.access_expires_at,s.refresh_expires_at
 		FROM sessions s JOIN users u ON u.id=s.user_id

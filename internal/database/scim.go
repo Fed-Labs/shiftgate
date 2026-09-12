@@ -38,7 +38,7 @@ func (store *Store) SCIMCreateUser(ctx context.Context, organizationID string, u
 	if err != nil {
 		return SCIMUser{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	userID, err := model.NewID()
 	if err != nil {
 		return SCIMUser{}, err
@@ -211,8 +211,8 @@ func scimTokens(filter string) ([]string, error) {
 		}
 	}
 	for _, character := range filter {
-		switch {
-		case character == '"':
+		switch character {
+		case '"':
 			if inQuotes {
 				tokens = append(tokens, current.String())
 				current.Reset()
@@ -221,7 +221,7 @@ func scimTokens(filter string) ([]string, error) {
 				flush()
 				inQuotes = true
 			}
-		case character == ' ' || character == '\t':
+		case ' ', '\t':
 			if inQuotes {
 				current.WriteRune(character)
 			} else {
@@ -254,7 +254,7 @@ func scimValue(token string) (string, error) {
 // none, as with "pr"); the third reports whether the clause is filterable at
 // all. Attribute and operator names come from whitelists — request text never
 // reaches the SQL string.
-func renderSCIMClause(clause SCIMClause, placeholder int) (string, any, bool) {
+func renderSCIMClause(clause SCIMClause, placeholder int) (predicate string, argument any, filterable bool) {
 	column := map[string]string{
 		"email":        "lower(u.email)",
 		"display_name": "lower(u.display_name)",
@@ -291,7 +291,7 @@ func (store *Store) SCIMReplaceUser(ctx context.Context, organizationID, userID 
 	if err != nil {
 		return SCIMUser{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	command, err := tx.Exec(ctx, `UPDATE users SET email=$3,display_name=$4,external_id=$5,disabled_at=CASE WHEN $6::boolean THEN NULL ELSE now() END,updated_at=now()
 		WHERE id=$2 AND EXISTS(SELECT 1 FROM organization_members m WHERE m.organization_id=$1 AND m.user_id=users.id)`,
 		organizationID, userID, strings.ToLower(strings.TrimSpace(user.Email)), user.DisplayName, strings.TrimSpace(user.ExternalID), user.Active)
@@ -321,7 +321,7 @@ func (store *Store) SCIMSetActive(ctx context.Context, organizationID, userID st
 	if err != nil {
 		return SCIMUser{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	command, err := tx.Exec(ctx, `UPDATE users SET disabled_at=CASE WHEN $3::boolean THEN NULL ELSE now() END,updated_at=now()
 		WHERE id=$2 AND EXISTS(SELECT 1 FROM organization_members m WHERE m.organization_id=$1 AND m.user_id=users.id)`,
 		organizationID, userID, active)

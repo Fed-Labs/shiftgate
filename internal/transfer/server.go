@@ -317,7 +317,7 @@ func (s *Server) importChunk(writer http.ResponseWriter, request *http.Request) 
 		return
 	}
 	version, err := strconv.ParseUint(request.PathValue("version"), 10, 32)
-	if err != nil || uint32(version) != session.KeyVersion {
+	if err != nil || version != uint64(session.KeyVersion) {
 		writeError(writer, http.StatusBadRequest, "KEY_VERSION_INVALID", "chunk key version does not match the transfer")
 		return
 	}
@@ -328,7 +328,7 @@ func (s *Server) importChunk(writer http.ResponseWriter, request *http.Request) 
 		return
 	}
 	var ref model.ChunkRef
-	if err := json.Unmarshal(encoded, &ref); err != nil || ref.Address != request.PathValue("address") || ref.KeyVersion != uint32(version) {
+	if err := json.Unmarshal(encoded, &ref); err != nil || ref.Address != request.PathValue("address") || uint64(ref.KeyVersion) != version {
 		writeError(writer, http.StatusBadRequest, "CHUNK_REF_INVALID", "chunk reference does not match request path")
 		return
 	}
@@ -660,12 +660,4 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 
 func writeError(writer http.ResponseWriter, status int, code, message string) {
 	writeJSON(writer, status, model.ErrorResponse{Code: code, Message: message})
-}
-
-func parseInt64Header(request *http.Request, name string) (int64, error) {
-	value := strings.TrimSpace(request.Header.Get(name))
-	if value == "" {
-		return 0, nil
-	}
-	return strconv.ParseInt(value, 10, 64)
 }

@@ -125,7 +125,7 @@ func (fake *fakeFleetControl) registerMachine(t *testing.T, machineID, name, age
 	if err != nil {
 		t.Fatal(err)
 	}
-	request, err := http.NewRequest(http.MethodPost, fake.url()+"/v1/organizations/"+fake.orgID+"/machines", bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, fake.url()+"/v1/organizations/"+fake.orgID+"/machines", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +302,7 @@ func waitReplicated(t testing.TB, source, standby *agentProcess, workloadID stri
 // the source machine.
 func killSourceWorkload(t testing.TB, scriptPath, logPath string) int {
 	t.Helper()
-	if err := exec.Command("pkill", "-9", "-f", scriptPath).Run(); err != nil {
+	if err := exec.CommandContext(context.Background(), "pkill", "-9", "-f", scriptPath).Run(); err != nil {
 		t.Logf("pkill -9 %s: %v (proceeding; the quiet-counter check below is the real gate)", scriptPath, err)
 	}
 	var final int

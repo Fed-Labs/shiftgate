@@ -74,9 +74,9 @@ func AssumeRole(ctx context.Context, endpoint, region, accessKeyID, secretAccess
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return STSCredentials{}, fmt.Errorf("%w: %v", ErrRemote, err)
+		return STSCredentials{}, fmt.Errorf("%w: %w", ErrRemote, err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		// The error body carries the service's own code and message (for
 		// example "Unsupported action AssumeRole"), which is the difference
@@ -105,12 +105,7 @@ func AssumeRole(ctx context.Context, endpoint, region, accessKeyID, secretAccess
 	if credentials.Expiration.IsZero() {
 		return STSCredentials{}, fmt.Errorf("%w: AssumeRole response is missing the expiration", ErrRemote)
 	}
-	return STSCredentials{
-		AccessKeyID:     credentials.AccessKeyID,
-		SecretAccessKey: credentials.SecretAccessKey,
-		SessionToken:    credentials.SessionToken,
-		Expiration:      credentials.Expiration,
-	}, nil
+	return STSCredentials(credentials), nil
 }
 
 type assumeRoleResult struct {
