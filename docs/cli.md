@@ -31,10 +31,10 @@ shiftgate standby trigger WORKLOAD_ID --lazy
 shiftgate status
 shiftgate update status
 shiftgate update check
-shiftgate update apply --version 1.4.2
+shiftgate update apply --version 0.1.4
 shiftgate update rollback
-shiftgate update block 1.4.3 --reason "restarted the workload under load"
-shiftgate update unblock 1.4.3
+shiftgate update block 0.1.5 --reason "restarted the workload under load"
+shiftgate update unblock 0.1.5
 ```
 
 Use `--agent unix:///path/to/agent.sock`, `--json`, and `--timeout` to override defaults.
@@ -58,8 +58,11 @@ Migrations can also be started from the web dashboard: the Workloads page (or a
 workload's detail page) has a MOVE button that opens a destination-and-mode picker and
 dispatches the same `migrate` agent command through the control plane — it needs the
 source machine's `agent_url` registered and is refused for machines without a reachable
-peer listener, so it never queues a move the agent can't execute. Progress lands on the
-dashboard's Migrations page, which shows the same stage events the CLI does.
+peer listener, so it never queues a move the agent can't execute. Because it dispatches
+through the control plane, the dashboard's live mode is plan-gated like any other
+platform-mediated migration: on the free tier the Live option is disabled in the picker
+and a live dispatch would be refused with `LIVE_MIGRATION_PLAN_REQUIRED`. Progress lands
+on the dashboard's Migrations page, which shows the same stage events the CLI does.
 
 A clone set derives many independent running workloads from one checkpoint:
 `shiftgate clone CHECKPOINT_ID --count N --prefix worker` restores the

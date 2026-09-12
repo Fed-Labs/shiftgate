@@ -76,16 +76,30 @@ What it covers:
 | Scenario | Test |
 |---|---|
 | shell start → checkpoint → restore, counter resumes | `TestE2EShellCheckpointRestore` |
+| incremental checkpoint against a parent restores the chain | `TestE2EIncrementalCheckpointRestores` |
+| periodic policy snapshots without stopping the workload | `TestE2EPeriodicCheckpointPolicy` |
 | Python process checkpoint/restore, variable state intact | `TestE2EPythonProcess` |
 | Node.js application checkpoint/restore | `TestE2ENodeApplication` |
 | web server with a declared port, in-memory hit counter resumes | `TestE2EWebServer` |
 | multi-process tree checkpoint/restore | `TestE2EMultiProcessWorkload` |
 | PID-namespaced (container-style) workload checkpoint/restore, namespace recreated | `TestE2EContainerizedWorkload` |
+| lazy restore: process starts before memory is loaded, pages stream in | `TestE2ELazyRestore` |
+| one checkpoint → clone set of independent running workloads | `TestE2ECheckpointClone` |
 | two-agent migration completes, source cleaned up | `TestE2EMigrationCompletes` |
+| migration preflight (`--dry-run`) checks without moving anything | `TestE2EMigrationDryRun` |
 | unreachable destination → rollback, source resumes | `TestE2EMigrationUnreachableDestination` |
 | destination dies mid-transfer → failure, source resumes | `TestE2EMigrationDestinationDiesMidTransfer` |
+| live migration: iterative pre-copy passes, short final freeze | `TestE2ELiveMigrationIterativePreCopy` |
+| destination dies during pre-copy → zero downtime, source keeps running | `TestE2ELiveMigrationDestinationDiesDuringPreCopy` |
 | checkpoint → corrupt chunk bytes → restore refuses | `TestE2ECheckpointCorruptionDetected` |
 | agent restart over the same state → checkpoint still restores | `TestE2EAgentRestartResume` |
+| warm-standby replication → trigger restores on the standby | `TestE2EWarmStandbyFailover` |
+| automatic failover when the source is provably dead | `TestE2EAutomaticFailover` |
+| hosted storage: checkpoint mirrors through brokered credentials | `TestE2EHostedStorageCheckpoint` |
+
+`TestE2EAutomaticFailover` carries its own gate — `SHIFT_TEST_FAILOVER=1` — because
+it waits out the real 90-second presence staleness bound; `TestE2EHostedStorageCheckpoint`
+needs the hosted-storage environment (`requireHosted`).
 
 ### Stress suite
 

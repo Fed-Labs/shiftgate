@@ -44,11 +44,20 @@ shiftgate restore CHECKPOINT_ID                              # bring it back
 The agent answers on `/run/shift/agent.sock`; CLI commands find it there by
 default. A second machine with its own install is a migration target:
 `shiftgate migrate demo --to https://host:8443` (see below for the peer TLS that
-a remote listener requires). That second machine can also hold a warm standby:
+a remote listener requires). `--mode live` runs CRIU pre-dump passes while the
+workload keeps running and freezes it only for the final delta. That second
+machine can also hold a warm standby:
 `shiftgate workload failover demo --to https://standby:8443` replicates every
 scheduled checkpoint to it, and it restores automatically when the source is
 provably dead — unreachable and silent on the control plane — or on
-`shiftgate standby trigger`. See [the CLI reference](docs/cli.md).
+`shiftgate standby trigger`.
+
+A checkpoint is more than a migration step. `shiftgate restore CHECKPOINT_ID --lazy`
+starts the process before its memory is fully loaded and streams pages in on demand,
+and `shiftgate clone CHECKPOINT_ID --count 50 --prefix worker` turns one warm
+checkpoint into fifty independent running workloads on the same machine — each with
+its own root and identity, reflink-copied where the filesystem allows. See
+[the CLI reference](docs/cli.md).
 
 ### From a repository checkout
 
@@ -118,8 +127,11 @@ export SHIFT_CONTROL_API_KEY="shift_ak_..."
 ```
 
 The agent sends machine presence and inventory only. It does not upload workload keys,
-checkpoint data, or grant the dashboard command execution. The dashboard still cannot
-create or dispatch CLI workload operations.
+checkpoint data, or grant the dashboard command execution. The dashboard dispatches a
+bounded set of agent commands through the control plane — workload start/pause/resume/
+stop/delete, checkpoint, and one-click migrations from the Workloads page or a workload's
+detail page — using the machine's registered `agent_url`; it cannot create workloads or
+run arbitrary commands.
 
 ```bash
 mkdir -p ./data

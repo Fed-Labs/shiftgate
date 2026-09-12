@@ -19,8 +19,8 @@ sequence order. Usage queries accept inclusive `from` and exclusive `to` ISO-860
 
 The local agent contract is intentionally separate because it uses Unix peer credentials
 and machine-to-machine TLS. Its endpoints are rooted at `/v1/health`, `/v1/machine`,
-`/v1/workloads`, `/v1/checkpoints`, `/v1/restores`, `/v1/forks`, `/v1/migrations`, and
-`/v1/updates`.
+`/v1/workloads`, `/v1/checkpoints`, `/v1/restores`, `/v1/forks`, `/v1/clones`,
+`/v1/migrations`, `/v1/standby`, `/v1/failover`, and `/v1/updates`.
 
 `POST /v1/workloads/{id}/fork` and `POST /v1/checkpoints/{id}/fork` derive an independent
 workload from a workload's live state or from one explicit checkpoint. Both accept `name`,
@@ -29,6 +29,37 @@ transaction record, including the fork's new workload id, its own full checkpoin
 its root path. Forking a running workload checkpoints it with `leave_running`, so the
 source is never interrupted. `GET /v1/forks` and `GET /v1/forks/{id}` return fork records,
 filtered by the caller's ownership of the source workload.
+
+`POST /v1/checkpoints/{id}/clone` derives a set of independent running workloads from one
+checkpoint on the same machine. The request takes `count` (1–128), `name_prefix`,
+`parallel` (concurrent restores, default 4, capped at 16), and `timeout_seconds`, and
+returns the clone-set record: per-member workload id, root path, pid, and outcome, plus
+the set's all-or-nothing state. Members read the checkpoint's stored chunks once and
+take reflink copies of the extracted image set, so a set costs N restores, not N full
+copies. A workload that declares TCP ports clones one member only — every member would
+rebind the same host port — and larger sets are refused up front with
+`422 CLONE_FAILED`. `GET /v1/clones` and `GET /v1/clones/{id}` return clone-set records
+(filtered by the caller's ownership of the source workload), and
+`POST /v1/clones/{id}/rollback` reverts a set that was interrupted before commit; a
+committed set is a fleet of ordinary workloads and its rollback is refused — teardown
+goes through the workload API.
+
+`POST /v1/checkpoints/{id}/restore` accepts a `lazy` flag: the restored process starts
+executing before its memory image is fully loaded, and a `criu lazy-pages` daemon serves
+page faults on demand while streaming the remainder in the background. It requires
+kernel and CRIU userfaultfd support and is refused with the reason when either is
+missing — never silently downgraded to an eager restore. Every restore record reports
+`time_to_first_execution_ms` so eager and lazy compare honestly. `GET /v1/restores` and
+`GET /v1/restores/{id}` return restore records.
+
+`POST /v1/workloads/{id}/failover` installs, replaces, or clears the workload's warm
+standby designation: `agent_url` names the standby's peer listener, `machine_id` pins
+its identity, and `keep_last` bounds what the standby retains. `off: true` withdraws
+the designation; already-replicated checkpoints stay on the standby. `GET /v1/failover` returns the source-side replication ledger, and on
+the standby machine `GET /v1/standby` returns the duties it holds with their armed
+checkpoints and failover history, while `POST /v1/standby/{workload}/trigger` restores
+a held duty here — with the same optional `lazy` trade-off — after probing the source
+and warning when it still answers.
 
 `POST /v1/checkpoints/{id}/mirror` retries publication of a checkpoint already committed
 to the agent's encrypted local repository. The operation is idempotent and does not alter
@@ -84,8 +115,13 @@ soft-deleted are purged after their grace window.
 
 `GET /v1/plans` is public and returns the plan catalog: each tier's name, price in cents
 (`0` free, `-1` custom), seat model, description, advertised features, and the machine and
-storage limits the control plane enforces. The catalog is the single source of plan truth —
-the pricing page renders it and entitlement checks use it.
+storage limits the control plane enforces. Each plan also carries `live_migration` —
+false on the free tier — which the control plane enforces on platform-mediated
+migrations: a live-mode `POST /v1/organizations/{id}/migrations` or `migrate` agent
+command dispatch for a cold-only plan is refused with
+`402 LIVE_MIGRATION_PLAN_REQUIRED`. Peer-to-peer migrations between your own agents
+never touch the control plane and are not tier-gated. The catalog is the single source
+of plan truth — the pricing page renders it and entitlement checks use it.
 
 `POST /v1/organizations/{id}/billing/checkout` (admin) opens a Stripe-hosted checkout
 session for a catalog plan and returns `{url, session_id, plan}`. The request supplies the
