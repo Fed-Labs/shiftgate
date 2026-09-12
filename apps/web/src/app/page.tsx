@@ -1,13 +1,13 @@
 import { SiteHeader, SiteFooter } from "@/components/site-header";
 import { Hero } from "@/components/home/hero";
 import { Narrative } from "@/components/home/narrative";
-import { WhatMoves, Boundaries, FinalCTA } from "@/components/home/sections";
+import { WhatMoves, MoreThanMoving, Boundaries, FinalCTA } from "@/components/home/sections";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
   title: "SHIFTGATE — Move computation between machines",
   description:
-    "SHIFT moves supported running computation between Linux machines with encrypted checkpoints, validated restore, and explicit compatibility boundaries.",
+    "SHIFT captures running Linux computation as encrypted checkpoints — then moves it between machines, clones it into fleets, parks and resumes it, and fails it over to a warm standby.",
 };
 
 export default function HomePage() {
@@ -18,6 +18,7 @@ export default function HomePage() {
         <Hero />
         <Narrative />
         <WhatMoves />
+        <MoreThanMoving />
         <Boundaries />
         <FinalCTA />
       </main>

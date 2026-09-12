@@ -89,6 +89,12 @@ const COMMAND_GROUPS: CommandGroup[] = [
         description: "Show a workload spec, runtime state, process identity, and latest checkpoint reference.",
       },
       {
+        name: "workload failover",
+        syntax: "shiftgate workload failover NAME (--to URL [--machine-id ID] [--keep N] | --off)",
+        description: "Install a warm-standby failover policy: every checkpoint replicates to the standby agent at --to, which watches the source and restores the newest copy when the source is gone. --off withdraws the duty.",
+        flags: ["--to <peer-url>", "--machine-id <id>", "--keep <n>", "--off"],
+      },
+      {
         name: "workload stop",
         syntax: "shiftgate workload stop ID [--timeout SECONDS]",
         description: "Stop a running process group and release its runtime record after the grace period.",
@@ -113,8 +119,15 @@ const COMMAND_GROUPS: CommandGroup[] = [
       },
       {
         name: "restore",
-        syntax: "shiftgate restore CHECKPOINT_ID [--timeout SECONDS]",
-        description: "Restore locally through the selected agent, validate health, and commit only after validation succeeds.",
+        syntax: "shiftgate restore CHECKPOINT_ID [--lazy] [--timeout SECONDS]",
+        description: "Restore locally through the selected agent, validate health, and commit only after validation succeeds. --lazy starts the process before its memory is fully loaded; pages stream in on demand via userfaultfd.",
+        flags: ["--lazy", "--timeout <seconds>"],
+      },
+      {
+        name: "fork",
+        syntax: "shiftgate fork WORKLOAD [--name NAME] [--root PATH] [--checkpoint ID] [--activate]",
+        description: "Derive one independent workload from a checkpoint, with its own re-encrypted full checkpoint and key namespace. The fork lineage is recorded; the source is untouched.",
+        flags: ["--name <name>", "--root <dir>", "--checkpoint <id>", "--activate", "list", "inspect FORK_ID"],
       },
       {
         name: "clone",
@@ -143,6 +156,17 @@ const COMMAND_GROUPS: CommandGroup[] = [
           "--timeout <seconds>",
           "--wait",
         ],
+      },
+      {
+        name: "failover",
+        syntax: "shiftgate failover [status]",
+        description: "Show every active failover policy: its standby, the last checkpoint pushed, retention, and any replication error.",
+      },
+      {
+        name: "standby",
+        syntax: "shiftgate standby trigger WORKLOAD [--checkpoint ID] [--lazy]",
+        description: "The standby-side view: list the duties this machine holds and whether the death watch is armed, or explicitly trigger a failover restore here.",
+        flags: ["list", "trigger WORKLOAD_ID", "--checkpoint <id>", "--lazy", "--timeout <duration>"],
       },
     ],
   },

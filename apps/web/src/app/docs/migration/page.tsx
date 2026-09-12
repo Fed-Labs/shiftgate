@@ -202,6 +202,63 @@ export default function MigrationPage() {
           </div>
         </div>
 
+        {/* Warm-standby failover */}
+        <div className="mb-12">
+          <h2 className="text-xl font-semibold mb-4">Warm-standby failover</h2>
+          <p className="text-sm text-text-secondary leading-relaxed mb-4">
+            A workload can carry a failover policy: every checkpoint it takes is
+            replicated to a standby agent, which holds the newest copies and
+            watches the source. When the source&apos;s peer listener is
+            unreachable and the control plane&apos;s record for it is stale or
+            offline, the standby restores the newest checkpoint there — or an
+            operator triggers the same restore by hand.
+          </p>
+          <div className="rounded-lg border border-border bg-bg-elevated p-5 mb-4">
+            <pre className="text-sm">
+              <code className="text-accent">{`shiftgate workload failover api --to https://standby:8443 --keep 3
+shiftgate failover            # source-side: policy status
+shiftgate standby list        # standby-side: duties held, watch armed
+shiftgate standby trigger api # explicit failover restore`}</code>
+            </pre>
+          </div>
+          <div className="rounded-lg border border-status-warning/20 bg-status-warning/5 p-5">
+            <p className="text-sm text-status-warning font-medium mb-3">
+              There is no fencing
+            </p>
+            <p className="text-sm text-text-secondary leading-relaxed">
+              A source that is partitioned rather than dead can come back to a
+              second live copy. Automatic failover requires a configured
+              control plane so the standby can confirm absence; without one,
+              only an explicit <code className="font-mono text-xs">standby trigger</code> can act.
+            </p>
+          </div>
+        </div>
+
+        {/* Lazy restore */}
+        <div className="mb-12">
+          <h2 className="text-xl font-semibold mb-4">Lazy restore</h2>
+          <p className="text-sm text-text-secondary leading-relaxed mb-4">
+            Restores are eager by default: the full memory image is loaded
+            before the process exists. Lazy restore inverts that — the process
+            starts immediately and its memory pages stream in on demand through
+            a userfaultfd-backed pages daemon. Time-to-running stops depending
+            on the size of the address space.
+          </p>
+          <div className="rounded-lg border border-border bg-bg-elevated p-5">
+            <pre className="text-sm">
+              <code className="text-accent">shiftgate restore ckpt_a1b2c3d4 --lazy</code>
+            </pre>
+            <div className="my-3 h-px bg-border-subtle" />
+            <p className="text-sm text-text-secondary leading-relaxed">
+              The trade is explicit: a half-served workload depends on its
+              pages daemon for every missing page. The daemon runs for the
+              process&apos;s lifetime and its death is reported honestly —
+              SHIFTGATE never claims a lazy restore succeeded while pages are
+              still unserved. Kernel userfaultfd support is required.
+            </p>
+          </div>
+        </div>
+
         {/* Device compatibility */}
         <div>
           <h2 className="text-xl font-semibold mb-4">Device compatibility</h2>

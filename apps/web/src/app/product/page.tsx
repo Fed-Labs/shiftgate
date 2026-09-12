@@ -113,6 +113,18 @@ const useCases = [
       "Checkpoint a warmed-up process once and clone it into a fleet of independent running workloads on the same machine — each with its own root and identity, all continuing the captured state. Filesystem copies are reflink clone-on-write where the filesystem allows, so scaling out costs restores, not copies.",
     workflow: ["shiftgate checkpoint create worker-warm", "shiftgate clone CHECKPOINT_ID --count 50 --prefix worker"],
   },
+  {
+    title: "Park now, resume later",
+    description:
+      "Freeze a long-running job into an encrypted checkpoint and release the machine. Restore it — here or elsewhere — when it matters again, without redoing hours of work. Lazy restore starts the process immediately and streams memory pages in on demand.",
+    workflow: ["shiftgate checkpoint create render-job --leave-running=false", "shiftgate restore CHECKPOINT_ID --lazy"],
+  },
+  {
+    title: "Warm-standby failover",
+    description:
+      "Give a workload a failover policy and every checkpoint replicates to a standby agent that watches the source. When the source is confirmed gone — unreachable and stale at the control plane — the standby restores the newest checkpoint there automatically.",
+    workflow: ["shiftgate workload failover api --to https://standby:8443 --keep 3", "shiftgate standby list"],
+  },
 ];
 
 export default function ProductPage() {

@@ -16,7 +16,53 @@ interface ChangelogEntry {
   fixed?: string[];
 }
 
-const entries: ChangelogEntry[] = [];
+const entries: ChangelogEntry[] = [
+  {
+    version: "Unreleased",
+    date: "2026-09-12",
+    latest: true,
+    added: [
+      "Hosted checkpoint storage: per-organization encrypted mirroring with reconciled, quota-enforced usage; agents fetch short-lived scoped credentials from the control plane.",
+      "Live migration: CRIU pre-copy runs before the authoritative final checkpoint (--mode live).",
+      "Lazy restore: the process starts before its memory is fully loaded and pages stream in on demand through a userfaultfd-backed daemon (shiftgate restore --lazy).",
+      "Warm-standby failover: failover policies replicate checkpoints to a standby agent that restores the newest copy when the source is confirmed gone (shiftgate workload failover, shiftgate standby).",
+      "Clone sets: derive up to 128 independent running workloads from one checkpoint on the same machine, with reflink-copied filesystems and an all-or-nothing transaction (shiftgate clone).",
+      "One-click migration from the dashboard: dispatch a migration from the workloads fleet or a workload's detail page.",
+      "shiftgate.dev is the default control plane endpoint; --control-plane is optional.",
+    ],
+  },
+  {
+    version: "0.1.4",
+    date: "2026-09-04",
+    fixed: [
+      "The shipped systemd unit refused CRIU's netlink socket and made workload roots read-only; the sandbox now allows AF_NETLINK and keeps only OS directories read-only.",
+      "The CLI names the three real Unix-socket dial failures (agent not running, stale socket, group membership) instead of a bare errno.",
+    ],
+  },
+  {
+    version: "0.1.2",
+    date: "2026-09-04",
+    fixed: [
+      "doctor shows why the CRIU check failed — criu's own reason, not just the version.",
+      "CLI error prefix is 'shiftgate:'; the dist checksum sidecar works next to the download.",
+    ],
+  },
+  {
+    version: "0.1.1",
+    date: "2026-09-04",
+    changed: [
+      "The CLI is 'shiftgate' everywhere — 'shift' is a POSIX shell builtin that shadowed the binary in every shell.",
+      "The agent hands its Unix socket to the configured group so the CLI works unprivileged; installers create the group and enroll the user.",
+    ],
+  },
+  {
+    version: "0.1.0",
+    date: "2026-09-03",
+    added: [
+      "Initial release: CRIU-based checkpoints with encrypted, deduplicated chunk storage; cold migration between machines; workload management; control plane with organizations, plans, and audit; web dashboard; mTLS peer transport.",
+    ],
+  },
+];
 
 function ChangelogGroup({
   label,

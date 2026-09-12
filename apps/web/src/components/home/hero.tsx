@@ -50,7 +50,7 @@ export function Hero() {
       {/* bottom edge */}
       <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-5 md:px-10 py-3 border-t border-border-subtle">
         <span className="tlabel">scroll to observe a migration</span>
-        <span className="font-mono text-[10px] text-text-faint">v1.4.2</span>
+        <span className="font-mono text-[10px] text-text-faint">v0.1.4</span>
       </div>
     </section>
   );

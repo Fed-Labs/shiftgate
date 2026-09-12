@@ -54,7 +54,7 @@ const CATEGORIES = [
     title: "Migration",
     slug: "migration",
     icon: ArrowLeftRight,
-    description: "Cold and live migration, the migration pipeline, compatibility, and failure handling.",
+    description: "Cold and live migration, the pipeline, compatibility, failure handling, warm-standby failover, and lazy restore.",
   },
   {
     title: "API Reference",

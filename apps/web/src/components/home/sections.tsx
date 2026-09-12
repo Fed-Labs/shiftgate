@@ -52,12 +52,88 @@ export function WhatMoves() {
   );
 }
 
+/* Beyond moving — the checkpoint is a primitive, not just a transfer step */
+const USES = [
+  {
+    k: "CLONE",
+    title: "One warm checkpoint, fifty running workers",
+    body: "Derive any number of independent workloads from a single checkpoint on the same machine — each with its own root, its own process, its own identity. Filesystem copies are reflink clone-on-write, so scaling out costs restores, not copies.",
+    cmd: "shiftgate clone CKPT --count 50 --prefix worker",
+  },
+  {
+    k: "PARK",
+    title: "Park a workload. Resume it later.",
+    body: "Freeze a long-running job into an encrypted checkpoint and restore it — on this machine or another — without redoing hours of work. Lazy restore starts the process before its memory is fully loaded; pages stream in on demand.",
+    cmd: "shiftgate restore CKPT --lazy",
+  },
+  {
+    k: "FAILOVER",
+    title: "A warm standby that acts when the source dies",
+    body: "Every checkpoint replicates to a standby agent that watches the source and restores the newest copy there — automatically when the source is confirmed gone, or on your command.",
+    cmd: "shiftgate workload failover NAME --to https://standby:8443",
+  },
+  {
+    k: "STORE",
+    title: "Encrypted checkpoint storage, metered",
+    body: "Checkpoints mirror to platform-hosted, per-organization encrypted storage with real quota accounting — or to your own S3-compatible bucket. Keys never leave the agent; only ciphertext travels.",
+    cmd: "shiftgate storage",
+  },
+];
+
+export function MoreThanMoving() {
+  return (
+    <section className="border-b border-border-subtle">
+      <div className="max-w-6xl mx-auto px-5 md:px-10 py-24">
+        <div className="grid md:grid-cols-[1fr_1.4fr] gap-12">
+          <div>
+            <span className="tlabel block mb-4">beyond moving</span>
+            <h2 className="font-display text-3xl md:text-4xl font-medium text-text leading-tight">
+              Moving is only
+              <br />
+              the first verb.
+            </h2>
+            <p className="text-text-secondary text-sm leading-relaxed mt-6 max-w-xs">
+              A checkpoint is a portable object. Once state can be captured,
+              it can be multiplied, shelved, replicated, and stored.
+            </p>
+          </div>
+
+          <div className="divide-y divide-border-subtle border-y border-border-subtle">
+            {USES.map((u, i) => (
+              <motion.div
+                key={u.k}
+                initial={{ opacity: 0, y: 12 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true }}
+                transition={{ delay: i * 0.05 }}
+                className="py-5"
+              >
+                <div className="grid grid-cols-[110px_1fr] gap-4">
+                  <span className="font-mono text-[11px] text-accent tracking-[0.14em]">{u.k}</span>
+                  <div>
+                    <h3 className="text-sm font-medium text-text mb-1.5">{u.title}</h3>
+                    <p className="text-text-secondary text-sm leading-relaxed mb-3">{u.body}</p>
+                    <code className="font-mono text-[11px] text-text-muted bg-bg-surface border border-border-subtle rounded px-2 py-1 inline-block">
+                      {u.cmd}
+                    </code>
+                  </div>
+                </div>
+              </motion.div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 /* Honest boundaries */
 const LIMITS = [
   "Linux x86_64 is the supported platform.",
-  "Live migration is not yet enabled — cold migration is the production path.",
+  "Live migration is CRIU pre-copy assisted; the final checkpoint still pauses the workload briefly.",
   "GPU migration requires a matching, checkpoint-capable device.",
   "Transparent socket migration only where CRIU TCP repair is permitted.",
+  "Automatic failover has no fencing — a partitioned source can return to a second live copy.",
 ];
 
 export function Boundaries() {
