@@ -16,7 +16,7 @@ const STEPS = [
     command:
       "curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh | bash",
     output: `==> Installing binaries to /usr/local/bin
-==> Installed SHIFT 0.1.4
+==> Installed SHIFT 0.2.0
 ==> Installing CRIU (the kernel's checkpoint/restore engine)
 ==> Agent service enabled and started
 

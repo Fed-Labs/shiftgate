@@ -18,7 +18,7 @@ interface ChangelogEntry {
 
 const entries: ChangelogEntry[] = [
   {
-    version: "Unreleased",
+    version: "0.2.0",
     date: "2026-09-12",
     latest: true,
     added: [
