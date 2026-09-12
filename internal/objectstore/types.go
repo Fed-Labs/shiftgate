@@ -20,6 +20,11 @@ var (
 	ErrInvalidPart   = errors.New("invalid multipart part")
 	ErrRemote        = errors.New("remote object storage error")
 	ErrUnsupported   = errors.New("object storage operation is unsupported")
+	// ErrNoStateDirectory is returned by multipart upload-state methods on a
+	// client built without a state directory. Such clients (the control
+	// plane's read-only listing broker) can read, list, and delete objects
+	// but cannot start or resume multipart uploads.
+	ErrNoStateDirectory = errors.New("S3 client has no state directory; multipart upload state is unavailable")
 )
 
 type ObjectInfo struct {

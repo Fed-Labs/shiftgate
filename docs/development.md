@@ -22,6 +22,7 @@ internal/controlplane  HTTP API, sessions, machines, billing
 internal/database   PostgreSQL store and migrations
 internal/observability logging, metrics, tracing, diagnostics
 apps/desktop        Tauri v2 + React desktop client
+apps/web            Next.js dashboard for the control plane
 tests/integration   the real-workload e2e and stress suites
 ```
 
@@ -107,6 +108,32 @@ python3 scripts/make-icon.py   # regenerate src-tauri/icons/icon.png if needed
 ```
 
 The icon script needs no third-party packages — it is a stdlib PNG writer.
+
+### Web dashboard
+
+The dashboard in `apps/web/` (Next.js 16, React 19) talks to `shift-control`
+directly from the browser:
+
+```bash
+cd apps/web
+npm install
+# A local dashboard must point at a locally started control plane (the
+# default is the platform endpoint at https://shiftgate.dev):
+cp .env.example .env       # NEXT_PUBLIC_API_URL=http://127.0.0.1:8090
+npm run dev                # http://localhost:3000
+```
+
+The control plane must list the dashboard's origin in `SHIFT_ALLOWED_ORIGINS`,
+or the browser blocks every call — login fails with "Failed to fetch" while
+the CLI keeps working (it sends no Origin header):
+
+```bash
+SHIFT_ALLOWED_ORIGINS=http://localhost:3000 ./bin/shift-control --listen 127.0.0.1:8090
+```
+
+`npm run build` produces the production bundle. The `AGENTS.md` in that
+directory notes this Next.js version differs from what most tooling assumes —
+read its bundled docs before changing framework-level code.
 
 ## Debugging tips
 

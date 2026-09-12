@@ -64,14 +64,19 @@ func OpenS3(configuration S3Config) (*S3, error) {
 	if err != nil || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.Host == "" || endpoint.RawQuery != "" || endpoint.User != nil {
 		return nil, errors.New("S3 endpoint must be an http(s) URL without credentials or query parameters")
 	}
-	if err := validateBucket(configuration.Bucket); err != nil {
+	if err := ValidateBucket(configuration.Bucket); err != nil {
 		return nil, err
 	}
-	if configuration.StateDir == "" || !filepath.IsAbs(configuration.StateDir) {
-		return nil, errors.New("S3 state directory must be an absolute path")
-	}
-	if err := os.MkdirAll(filepath.Join(configuration.StateDir, "multipart"), 0o700); err != nil {
-		return nil, fmt.Errorf("create S3 state directory: %w", err)
+	// A state directory is optional: a read-only client (the control plane's
+	// listing broker) needs no multipart bookkeeping, and its upload-state
+	// methods fail with ErrNoStateDirectory instead of touching the disk.
+	if configuration.StateDir != "" {
+		if !filepath.IsAbs(configuration.StateDir) {
+			return nil, errors.New("S3 state directory must be an absolute path")
+		}
+		if err := os.MkdirAll(filepath.Join(configuration.StateDir, "multipart"), 0o700); err != nil {
+			return nil, fmt.Errorf("create S3 state directory: %w", err)
+		}
 	}
 	client := configuration.HTTPClient
 	if client == nil {
@@ -428,6 +433,51 @@ func (s *S3) CleanupMultipart(ctx context.Context, prefix string, before time.Ti
 	return removed, nil
 }
 
+// ListPrefix walks every stored object under prefix, reporting each with the
+// store's own prefix stripped from the key, and stops early when visit
+// returns an error. It is the metering primitive — the control plane counts
+// actual stored bytes with it instead of trusting agent-reported totals —
+// so it is deliberately not part of the Store interface the agent's mirror
+// uses.
+func (s *S3) ListPrefix(ctx context.Context, prefix string, visit func(ObjectInfo) error) error {
+	fullPrefix := s.prefix
+	if prefix != "" {
+		if fullPrefix != "" {
+			fullPrefix += "/"
+		}
+		fullPrefix += strings.Trim(prefix, "/")
+	}
+	token := ""
+	for {
+		query := url.Values{"list-type": {"2"}}
+		if fullPrefix != "" {
+			query.Set("prefix", fullPrefix)
+		}
+		if token != "" {
+			query.Set("continuation-token", token)
+		}
+		response, err := s.doBucket(ctx, http.MethodGet, query, nil, nil, 0)
+		if err != nil {
+			return err
+		}
+		var page listObjectsResult
+		decodeErr := xml.NewDecoder(response.Body).Decode(&page)
+		_ = response.Body.Close()
+		if decodeErr != nil {
+			return fmt.Errorf("%w: invalid object-list response", ErrRemote)
+		}
+		for _, object := range page.Contents {
+			if err := visit(ObjectInfo{Key: s.externalKey(object.Key), Size: object.Size, LastModified: object.LastModified}); err != nil {
+				return err
+			}
+		}
+		if !page.IsTruncated || page.NextContinuationToken == "" {
+			return nil
+		}
+		token = page.NextContinuationToken
+	}
+}
+
 func (s *S3) doKey(ctx context.Context, method, key string, query url.Values, headers http.Header, body io.Reader, size int64) (*http.Response, error) {
 	return s.doURL(ctx, method, s.objectURL(key, query), headers, body, size)
 }
@@ -478,24 +528,53 @@ func (s *S3) doURL(ctx context.Context, method string, target *url.URL, headers 
 }
 
 func (s *S3) sign(request *http.Request) {
-	request.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
-	if s.accessKeyID == "" || s.secretKey == "" {
+	s.signService(request, "s3", "")
+}
+
+// signService signs a request for an AWS service ("s3" or "sts"); both use
+// the same SigV4 derivation with the service name in the scope. It snapshots
+// the credentials under the mutex so a concurrent SetCredentials rotation
+// cannot produce a signature mixed from two credential generations.
+// payloadHash is the hex SHA-256 the server should verify the body against;
+// the empty string means UNSIGNED-PAYLOAD, which S3 accepts but STS does not.
+func (s *S3) signService(request *http.Request, service string, payloadHash string) {
+	if payloadHash == "" {
+		payloadHash = "UNSIGNED-PAYLOAD"
+	}
+	request.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	s.mu.Lock()
+	accessKeyID, secretKey, sessionToken := s.accessKeyID, s.secretKey, s.sessionToken
+	region := s.region
+	s.mu.Unlock()
+	if accessKeyID == "" || secretKey == "" {
 		return
 	}
 	now := s.clock().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	date := now.Format("20060102")
 	request.Header.Set("X-Amz-Date", amzDate)
-	if s.sessionToken != "" {
-		request.Header.Set("X-Amz-Security-Token", s.sessionToken)
+	if sessionToken != "" {
+		request.Header.Set("X-Amz-Security-Token", sessionToken)
 	}
 	canonicalHeaders, signedHeaders := canonicalHeaders(request)
-	canonicalRequest := strings.Join([]string{request.Method, canonicalURI(request.URL), canonicalQuery(request.URL.Query()), canonicalHeaders, signedHeaders, "UNSIGNED-PAYLOAD"}, "\n")
-	scope := date + "/" + s.region + "/s3/aws4_request"
+	canonicalRequest := strings.Join([]string{request.Method, canonicalURI(request.URL), canonicalQuery(request.URL.Query()), canonicalHeaders, signedHeaders, payloadHash}, "\n")
+	scope := date + "/" + region + "/" + service + "/aws4_request"
 	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hashString(canonicalRequest)
-	signingKey := hmacSHA256(hmacSHA256(hmacSHA256(hmacSHA256([]byte("AWS4"+s.secretKey), []byte(date)), []byte(s.region)), []byte("s3")), []byte("aws4_request"))
+	signingKey := hmacSHA256(hmacSHA256(hmacSHA256(hmacSHA256([]byte("AWS4"+secretKey), []byte(date)), []byte(region)), []byte(service)), []byte("aws4_request"))
 	signature := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
-	request.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+s.accessKeyID+"/"+scope+", SignedHeaders="+signedHeaders+", Signature="+signature)
+	request.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+accessKeyID+"/"+scope+", SignedHeaders="+signedHeaders+", Signature="+signature)
+}
+
+// SetCredentials rotates the SigV4 credentials on an open store without
+// rebuilding it, so multipart upload state and the state directory survive a
+// refresh. The control plane's issued credentials expire; hosted-mode agents
+// call this with each refresh.
+func (s *S3) SetCredentials(accessKeyID, secretAccessKey, sessionToken string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.accessKeyID = accessKeyID
+	s.secretKey = secretAccessKey
+	s.sessionToken = sessionToken
 }
 
 func canonicalHeaders(request *http.Request) (string, string) {
@@ -588,10 +667,16 @@ func (s *S3) statePath(uploadID string) string {
 }
 
 func (s *S3) saveUploadState(state s3UploadState) error {
+	if s.stateDir == "" {
+		return ErrNoStateDirectory
+	}
 	return writeJSONAtomic(s.statePath(state.Upload.UploadID), state)
 }
 
 func (s *S3) loadUploadState(uploadID string) (s3UploadState, error) {
+	if s.stateDir == "" {
+		return s3UploadState{}, ErrNoStateDirectory
+	}
 	if validateUploadID(uploadID) != nil {
 		return s3UploadState{}, ErrInvalidUpload
 	}
@@ -632,6 +717,9 @@ func (s *S3) recordPartState(uploadID string, part PartInfo) error {
 }
 
 func (s *S3) removeUploadState(uploadID string) error {
+	if s.stateDir == "" {
+		return ErrNoStateDirectory
+	}
 	if err := os.Remove(s.statePath(uploadID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -657,6 +745,18 @@ type listUploadsResult struct {
 	IsTruncated        bool       `xml:"IsTruncated"`
 	NextKeyMarker      string     `xml:"NextKeyMarker"`
 	NextUploadIDMarker string     `xml:"NextUploadIdMarker"`
+}
+
+type listObjectsResult struct {
+	Contents              []s3Object `xml:"Contents"`
+	IsTruncated           bool       `xml:"IsTruncated"`
+	NextContinuationToken string     `xml:"NextContinuationToken"`
+}
+
+type s3Object struct {
+	Key          string    `xml:"Key"`
+	Size         int64     `xml:"Size"`
+	LastModified time.Time `xml:"LastModified"`
 }
 
 type s3Upload struct {
@@ -686,8 +786,10 @@ func parseS3Error(response *http.Response) error {
 	return fmt.Errorf("%w: %s: %s", ErrRemote, result.Code, result.Message)
 }
 
-func validateBucket(bucket string) error {
-	if len(bucket) < 3 || len(bucket) > 63 || strings.HasPrefix(bucket, ".") || strings.HasSuffix(bucket, ".") || strings.Contains(bucket, "/") {
+// ValidateBucket reports whether name is a usable S3 bucket name: 3–63
+// characters, no leading or trailing dot, no path separators.
+func ValidateBucket(name string) error {
+	if len(name) < 3 || len(name) > 63 || strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") || strings.Contains(name, "/") {
 		return errors.New("invalid S3 bucket name")
 	}
 	return nil

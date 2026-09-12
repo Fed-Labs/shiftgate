@@ -4,50 +4,53 @@ import { ArrowRight } from "lucide-react";
 
 export const metadata: Metadata = {
   title: "Quickstart",
-  description: "Build SHIFTGATE locally and run a real checkpoint/restore workflow on Linux.",
+  description: "Install SHIFTGATE with one command and run a real checkpoint/restore workflow on Linux.",
 };
 
 const STEPS = [
   {
     number: "01",
-    title: "Prepare Linux",
-    description: "Use an x86_64 Linux host with CRIU, GNU tar, Go 1.24+, and the kernel capabilities CRIU reports through `shiftgate doctor`.",
-    command: "criu --version && tar --version | head -1 && go version",
-    output: `CRIU version 4.0
-tar (GNU tar) 1.35
-go version go1.24.0 linux/amd64`,
+    title: "Install",
+    description:
+      "One command on an x86_64 Linux host: it downloads the release, verifies its SHA-256, installs CRIU through your package manager when it is missing, and enables the agent as a systemd service. Building from a repository checkout works too (`make build`, then `sudo ./install.sh`).",
+    command:
+      "curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh | bash",
+    output: `==> Installing binaries to /usr/local/bin
+==> Installed SHIFT 0.1.4
+==> Installing CRIU (the kernel's checkpoint/restore engine)
+==> Agent service enabled and started
+
+If you were added to the 'shift' group, log out and back in once
+(or run 'newgrp shift') so 'shiftgate' can reach the agent.`,
   },
   {
     number: "02",
-    title: "Build and check the agent",
-    description: "Build the CLI and agent from this repository, start a development agent on writable local paths, then verify checkpoint support before creating workloads.",
-    command: `make build
-mkdir -p ./data/run
-./bin/shift-agent --state-dir ./data --listen unix://$PWD/data/agent.sock
-# In another terminal:
-./bin/shiftgate --agent unix://$PWD/data/agent.sock doctor`,
-    output: `Healthy: true
-  ✓ CRIU installed and kernel check passed
-  ✓ GNU tar available
-
-If doctor reports a kernel capability error, resolve that prerequisite first; SHIFT does not substitute a fake checkpoint.`,
+    title: "Check the machine",
+    description:
+      "Verify the machine can actually checkpoint: CRIU health, kernel features, tar, and privileges. Doctor reports real gaps instead of substituting a fake checkpoint.",
+    command: "shiftgate doctor",
+    output: `OK    platform linux/amd64
+OK    privileges agent effective uid 0
+OK    criu 4.2
+OK    cgroup_v2 mounted, delegation available
+OK    archive GNU tar available`,
   },
   {
     number: "03",
     title: "Create and start a scoped workload",
     description: "Attach one explicit directory as the workload root. Commands run under the agent, and only that approved root is captured.",
-    command: `./bin/shiftgate --agent unix://$PWD/data/agent.sock workload create demo \\
-  --path "$PWD/demo" --start -- /usr/bin/python3 -m http.server 8080`,
+    command: `shiftgate workload create demo \\
+  --path "$HOME/demo" --start -- python3 -m http.server 8080`,
     output: `Workload wl_example created.
 Status: running
-Root:   /absolute/path/to/demo`,
+Root:   /home/you/demo`,
   },
   {
     number: "04",
     title: "Checkpoint and restore locally",
     description: "Create an encrypted, content-addressed checkpoint while leaving the source running, then restore it to validate that process and filesystem state round-trip on this host.",
-    command: `./bin/shiftgate --agent unix://$PWD/data/agent.sock checkpoint create demo --leave-running
-./bin/shiftgate --agent unix://$PWD/data/agent.sock restore CHECKPOINT_ID`,
+    command: `shiftgate checkpoint create demo --leave-running
+shiftgate restore CHECKPOINT_ID`,
     output: `Checkpoint ckpt_example created.
 Plain:  ... Stored: ...
 Checkpoint restored and committed. Process PID: 12345`,
@@ -56,7 +59,7 @@ Checkpoint restored and committed. Process PID: 12345`,
     number: "05",
     title: "Move between two agents",
     description: "After both hosts pass `doctor`, migrate over mutually authenticated HTTPS. Use cold mode for the simplest path or live mode to invoke CRIU pre-copy before its authoritative final dump.",
-    command: `./bin/shiftgate migrate demo \\
+    command: `shiftgate migrate demo \\
   --to https://destination.example:8443 \\
   --machine-id DESTINATION_MACHINE_ID \\
   --mode cold`,
@@ -79,7 +82,8 @@ export default function QuickstartPage() {
           </h1>
           <p className="text-text-secondary max-w-2xl text-lg leading-relaxed">
             Run a real checkpoint-backed workflow in five steps. The examples use
-            a local development socket; production agents require mutual TLS.
+            the installed agent's default socket; production agents require
+            mutual TLS.
           </p>
         </div>
 

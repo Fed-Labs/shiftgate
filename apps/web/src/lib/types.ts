@@ -253,6 +253,19 @@ export interface Entitlement {
   stripe_customer_id?: string;
 }
 
+// Control-plane-hosted checkpoint storage status. When enabled is false the
+// control plane does not host storage and location fields are absent.
+export interface StorageStatus {
+  enabled: boolean;
+  endpoint?: string;
+  bucket?: string;
+  prefix?: string;
+  used_storage_bytes: number;
+  max_storage_bytes: number;
+  over_quota: boolean;
+  last_reconciled_at?: string;
+}
+
 export interface AuditEvent {
   id: string;
   organization_id?: string;
@@ -300,4 +313,69 @@ export interface ApiError {
   code: string;
   message: string;
   request_id?: string;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Compute marketplace                                                */
+/* ------------------------------------------------------------------ */
+
+export interface ComputeResources {
+  cpu_count?: number;
+  memory_bytes?: number;
+  storage_bytes?: number;
+  network_mbps?: number;
+  gpus?: GPUDevice[];
+}
+
+export interface ComputePricing {
+  currency?: string;
+  cpu_hour_micros?: number;
+  memory_gib_hour_micros?: number;
+  storage_gib_hour_micros?: number;
+  gpu_hour_micros?: number;
+  egress_gib_micros?: number;
+  minimum_charge_micros?: number;
+}
+
+export interface ComputeOffer {
+  id: string;
+  organization_id: string;
+  machine_id: string;
+  machine_name?: string;
+  agent_url?: string;
+  exposed: ComputeResources;
+  committed: ComputeResources;
+  available: ComputeResources;
+  pricing: ComputePricing;
+  geography?: { region?: string; country?: string; zone?: string };
+  policy: { visibility: string; [key: string]: unknown };
+  availability: { status: string; last_seen_at?: string };
+  trust: string;
+  identity_verified: boolean;
+  created_at: string;
+  updated_at: string;
+  withdrawn_at?: string;
+}
+
+export interface ComputeInventory {
+  trading_enabled: boolean;
+  offers: ComputeOffer[];
+}
+
+export interface ComputeReservation {
+  id: string;
+  offer_id: string;
+  organization_id: string;
+  machine_id: string;
+  workload_id?: string;
+  migration_id?: string;
+  requested: ComputeResources;
+  state: "PENDING" | "ACTIVE" | "RELEASED" | "EXPIRED" | "FAILED";
+  hourly_micros: number;
+  currency?: string;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+  released_at?: string;
+  error?: string;
 }

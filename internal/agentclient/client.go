@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"shift.dev/shift/internal/checkpoint"
+	"shift.dev/shift/internal/migration"
 	"shift.dev/shift/internal/model"
 	"shift.dev/shift/internal/observability"
 	"shift.dev/shift/internal/update"
@@ -43,11 +44,42 @@ type ForkRequest struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
+type CloneRequest struct {
+	Count          int    `json:"count,omitempty"`
+	NamePrefix     string `json:"name_prefix,omitempty"`
+	Parallel       int    `json:"parallel,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+}
+
 type MigrationCreateRequest struct {
 	WorkloadID     string              `json:"workload_id"`
 	Destination    model.Destination   `json:"destination"`
 	Mode           model.MigrationMode `json:"mode,omitempty"`
+	PreCopyPasses  int                 `json:"pre_copy_passes,omitempty"`
 	TimeoutSeconds int                 `json:"timeout_seconds,omitempty"`
+}
+
+// failoverRequest installs or clears a workload's warm-standby policy. An
+// empty AgentURL with Off set clears it.
+type failoverRequest struct {
+	Off       bool   `json:"off,omitempty"`
+	AgentURL  string `json:"agent_url,omitempty"`
+	MachineID string `json:"machine_id,omitempty"`
+	KeepLast  int    `json:"keep_last,omitempty"`
+}
+
+type standbyTriggerRequest struct {
+	CheckpointID string `json:"checkpoint_id,omitempty"`
+	Lazy         bool   `json:"lazy,omitempty"`
+}
+
+// StandbyTriggerResponse is the answer to an explicit failover: the duty as
+// it now stands, what the pre-trigger probe observed, and — when the source
+// still answered — the warning that two live copies exist.
+type StandbyTriggerResponse struct {
+	Duty            model.StandbyDuty `json:"duty"`
+	SourceReachable string            `json:"source_reachable"`
+	Warning         string            `json:"warning,omitempty"`
 }
 
 type DoctorResponse struct {
@@ -149,6 +181,18 @@ func (c *Client) DeleteWorkload(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, path.Join("/v1/workloads", id), nil, nil)
 }
 
+// SetCheckpointPolicy installs, replaces, or clears a workload's periodic
+// checkpoint schedule. A non-positive interval clears it.
+func (c *Client) SetCheckpointPolicy(ctx context.Context, workloadID string, intervalSeconds, keepLast int) (model.Workload, error) {
+	input := struct {
+		IntervalSeconds int `json:"interval_seconds"`
+		KeepLast        int `json:"keep_last,omitempty"`
+	}{IntervalSeconds: intervalSeconds, KeepLast: keepLast}
+	var result model.Workload
+	err := c.do(ctx, http.MethodPost, path.Join("/v1/workloads", workloadID, "policy"), input, &result)
+	return result, err
+}
+
 func (c *Client) Logs(ctx context.Context, id string, tail int) (string, error) {
 	requestPath := path.Join("/v1/workloads", id, "logs")
 	if tail > 0 {
@@ -198,9 +242,14 @@ func (c *Client) MirrorCheckpoint(ctx context.Context, id string) (checkpoint.Mi
 	return result, err
 }
 
-func (c *Client) Restore(ctx context.Context, checkpointID string, timeoutSeconds int) (checkpoint.RestoreRecord, error) {
+// RestoreRequest is what a restore caller asks for beyond the checkpoint.
+type RestoreRequest struct {
+	TimeoutSeconds int  `json:"timeout_seconds,omitempty"`
+	Lazy           bool `json:"lazy,omitempty"`
+}
+
+func (c *Client) Restore(ctx context.Context, checkpointID string, input RestoreRequest) (checkpoint.RestoreRecord, error) {
 	var result checkpoint.RestoreRecord
-	input := map[string]int{"timeout_seconds": timeoutSeconds}
 	err := c.do(ctx, http.MethodPost, path.Join("/v1/checkpoints", checkpointID, "restore"), input, &result)
 	return result, err
 }
@@ -229,6 +278,29 @@ func (c *Client) Fork(ctx context.Context, id string) (checkpoint.ForkRecord, er
 	return result, err
 }
 
+func (c *Client) CloneCheckpoint(ctx context.Context, checkpointID string, input CloneRequest) (checkpoint.CloneRecord, error) {
+	var result checkpoint.CloneRecord
+	err := c.do(ctx, http.MethodPost, path.Join("/v1/checkpoints", checkpointID, "clone"), input, &result)
+	return result, err
+}
+
+func (c *Client) Clones(ctx context.Context) ([]checkpoint.CloneRecord, error) {
+	var result []checkpoint.CloneRecord
+	err := c.do(ctx, http.MethodGet, "/v1/clones", nil, &result)
+	return result, err
+}
+
+func (c *Client) Clone(ctx context.Context, id string) (checkpoint.CloneRecord, error) {
+	var result checkpoint.CloneRecord
+	err := c.do(ctx, http.MethodGet, path.Join("/v1/clones", id), nil, &result)
+	return result, err
+}
+
+func (c *Client) CloneRollback(ctx context.Context, id string) (checkpoint.CloneRecord, error) {
+	var result checkpoint.CloneRecord
+	err := c.do(ctx, http.MethodPost, path.Join("/v1/clones", id, "rollback"), nil, &result)
+	return result, err
+}
 func (c *Client) Migrations(ctx context.Context) ([]model.Migration, error) {
 	var result []model.Migration
 	err := c.do(ctx, http.MethodGet, "/v1/migrations", nil, &result)
@@ -255,6 +327,64 @@ func (c *Client) CreateMigration(ctx context.Context, input MigrationCreateReque
 
 func (c *Client) CancelMigration(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodPost, path.Join("/v1/migrations", id, "cancel"), struct{}{}, &map[string]string{})
+}
+
+// PreflightMigration runs a migration's checks without creating one: the
+// agent reaches the destination over the peer channel, runs the same
+// compatibility check the migration's validate stage would, and returns the
+// report. It is the client half of `migrate --dry-run`.
+func (c *Client) PreflightMigration(ctx context.Context, input MigrationCreateRequest) (migration.PreflightResult, error) {
+	var result migration.PreflightResult
+	err := c.do(ctx, http.MethodPost, "/v1/migrations/preflight", input, &result)
+	return result, err
+}
+
+// SetFailoverPolicy installs, replaces, or clears a workload's warm-standby
+// policy. An empty agentURL clears it; installing one requires the workload
+// to already carry a checkpoint policy — the agent enforces the pair.
+func (c *Client) SetFailoverPolicy(ctx context.Context, workloadID, agentURL, machineID string, keepLast int) (model.Workload, error) {
+	input := failoverRequest{AgentURL: agentURL, MachineID: machineID, KeepLast: keepLast}
+	if agentURL == "" {
+		input.Off = true
+	}
+	var result model.Workload
+	err := c.do(ctx, http.MethodPost, path.Join("/v1/workloads", workloadID, "failover"), input, &result)
+	return result, err
+}
+
+// StandbyStatus is the standby agent's own view: the duties it holds and
+// whether it can confirm a source's death on its own (a control plane is
+// configured). When it cannot, armed duties never fail over automatically.
+type StandbyStatus struct {
+	Duties            []model.StandbyDuty `json:"duties"`
+	AutomaticFailover bool                `json:"automatic_failover"`
+}
+
+// StandbyStatus lists the standby duties this agent holds: the workloads
+// whose replicated state it protects and watches.
+func (c *Client) StandbyStatus(ctx context.Context) (StandbyStatus, error) {
+	var result StandbyStatus
+	err := c.do(ctx, http.MethodGet, "/v1/standby", nil, &result)
+	return result, err
+}
+
+// TriggerStandbyFailover commands an explicit failover of one standby duty.
+// An empty checkpointID restores the duty's newest replicated checkpoint. The
+// call runs the restore synchronously and can take minutes.
+func (c *Client) TriggerStandbyFailover(ctx context.Context, workloadID, checkpointID string, lazy bool) (StandbyTriggerResponse, error) {
+	var result StandbyTriggerResponse
+	input := standbyTriggerRequest{CheckpointID: checkpointID, Lazy: lazy}
+	err := c.do(ctx, http.MethodPost, path.Join("/v1/standby", workloadID, "trigger"), input, &result)
+	return result, err
+}
+
+// ReplicationEntries lists this agent's replication ledger: for every
+// workload with a failover policy, what was pushed to which standby and how
+// the last attempt went.
+func (c *Client) ReplicationEntries(ctx context.Context) ([]model.ReplicationEntry, error) {
+	var result []model.ReplicationEntry
+	err := c.do(ctx, http.MethodGet, "/v1/failover", nil, &result)
+	return result, err
 }
 
 // UpdateStatus reports the machine's update state: what is installed, what is

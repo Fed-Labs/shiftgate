@@ -54,7 +54,30 @@ func testOrganization(t *testing.T, store *Store, label string) string {
 }
 
 func testAudit(organizationID, action, resourceID string) AuditInput {
-	return AuditInput{ID: "audit-" + resourceID, OrganizationID: organizationID, Action: action, ResourceType: "machine", ResourceID: resourceID, Metadata: map[string]any{}}
+	// The audit id must be unique per call: these tests share one database
+	// (isolation comes from fresh organization and user ids), so a fixed id
+	// collides across tests and across runs on the audit_events primary key.
+	id, err := model.NewID()
+	if err != nil {
+		panic("testAudit: " + err.Error())
+	}
+	return AuditInput{ID: id, OrganizationID: organizationID, Action: action, ResourceType: "machine", ResourceID: resourceID, Metadata: map[string]any{}}
+}
+
+// testUpgradePlan raises an organization's entitlements through the production
+// Stripe webhook path, for tests that need more than the free plan's machine
+// limit.
+func testUpgradePlan(t *testing.T, store *Store, organizationID string, maxMachines int) {
+	t.Helper()
+	eventID, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := store.ApplyStripeSubscription(context.Background(), "evt-"+eventID, "customer.subscription.created",
+		[]byte(`{"id":"evt-`+eventID+`"}`), organizationID, "pro", "active", "", "", 10737418240, maxMachines)
+	if err != nil || !applied {
+		t.Fatalf("raise entitlement for %s: applied=%v err=%v", organizationID, applied, err)
+	}
 }
 
 // TestMachineCapabilityProjection proves registration and heartbeat keep the
@@ -65,6 +88,9 @@ func TestMachineCapabilityProjection(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	organizationID := testOrganization(t, store, "capabilities")
+	// Three machines is past the free plan's limit of two; the projection is
+	// the point of this test, so the organization is upgraded first.
+	testUpgradePlan(t, store, organizationID, 10)
 
 	register := func(machineID string, capabilities map[string]any) MachineRecord {
 		t.Helper()
@@ -132,7 +158,13 @@ func TestMachineCapabilityProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(updated.Capabilities) != `{"gpu_count":2.0}` {
+	// The document is stored as JSONB, so it comes back in PostgreSQL's
+	// normalized formatting — compare the parsed value, not the bytes.
+	var heartbeatDocument map[string]any
+	if err := json.Unmarshal(updated.Capabilities, &heartbeatDocument); err != nil {
+		t.Fatalf("heartbeat stored invalid JSON: %v (%s)", err, updated.Capabilities)
+	}
+	if heartbeatDocument["gpu_count"] != 2.0 || len(heartbeatDocument) != 1 {
 		t.Fatalf("heartbeat did not replace the document: %s", updated.Capabilities)
 	}
 	flagged, err = store.MachinesWithCapability(ctx, organizationID, "cuda_version", "text", nil)
@@ -262,9 +294,20 @@ func TestEnforceRetentionSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Windows of zero days: everything this test created is already past them.
-	if err := store.SetRetentionPolicy(ctx, RetentionPolicy{OrganizationID: organizationID, AuditRetentionDays: 0, CheckpointRetentionDays: 0, DeletedStorageRetentionDays: 0}, testAudit(organizationID, "retention.update", organizationID)); err != nil {
+	// One-day windows with everything backdated past them. Zero would mean
+	// "keep forever" — the API allows 0..36500 days and 0 disables the sweep —
+	// so the rows are aged instead.
+	if err := store.SetRetentionPolicy(ctx, RetentionPolicy{OrganizationID: organizationID, AuditRetentionDays: 1, CheckpointRetentionDays: 1, DeletedStorageRetentionDays: 1}, testAudit(organizationID, "retention.update", organizationID)); err != nil {
 		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`UPDATE audit_events SET created_at=now()-interval '2 days' WHERE organization_id=$1`,
+		`UPDATE checkpoints SET created_at=now()-interval '2 days' WHERE organization_id=$1`,
+		`UPDATE storage_objects SET deleted_at=now()-interval '2 days' WHERE organization_id=$1`,
+	} {
+		if _, err := store.pool.Exec(ctx, statement, organizationID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	sweep, err := store.EnforceRetention(ctx)
 	if err != nil {

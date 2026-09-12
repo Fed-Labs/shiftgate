@@ -146,6 +146,23 @@ func (c *Client) Verify(ctx context.Context, transferID string) (Session, error)
 	return result, err
 }
 
+// Hold parks a verified replication session on the standby and hands it the
+// duty facts. The session returned is the standby's record of what it now
+// protects; a retry after a lost response gets the same HELD session back.
+func (c *Client) Hold(ctx context.Context, transferID string, keepLast int, sourceAgentURL string) (Session, error) {
+	var result Session
+	err := c.doJSON(ctx, http.MethodPost, path.Join("/v1/peer/transfers", transferID, "hold"), HoldRequest{
+		KeepLast: keepLast, SourceAgentURL: sourceAgentURL,
+	}, &result)
+	return result, err
+}
+
+// Withdraw releases this machine's standby duty for a workload — the source's
+// way of telling a standby it no longer holds state for it.
+func (c *Client) Withdraw(ctx context.Context, workloadID string) error {
+	return c.doJSON(ctx, http.MethodPost, "/v1/peer/standby/withdraw", WithdrawRequest{WorkloadID: workloadID}, nil)
+}
+
 func (c *Client) Restore(ctx context.Context, transferID string, timeout time.Duration) (checkpoint.RestoreRecord, error) {
 	var result checkpoint.RestoreRecord
 	input := RestoreRequest{TimeoutSeconds: int(timeout.Seconds())}
@@ -172,26 +189,29 @@ func (c *Client) Get(ctx context.Context, transferID string) (Session, error) {
 }
 
 func (c *Client) doJSON(ctx context.Context, method, requestPath string, input, output any) error {
-	var body io.Reader
+	var encoded []byte
 	if input != nil {
-		encoded, err := json.Marshal(input)
-		if err != nil {
+		var err error
+		if encoded, err = json.Marshal(input); err != nil {
 			return err
 		}
-		body = bytes.NewReader(encoded)
 	}
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
+		// A fresh reader per attempt: reusing one would hand NewRequest a
+		// drained buffer, and the request would carry Content-Length 0 — the
+		// peer would answer INVALID_JSON for a body that was never empty.
+		var body io.Reader
+		if encoded != nil {
+			body = bytes.NewReader(encoded)
+		}
 		request, err := http.NewRequestWithContext(ctx, method, c.baseURL+requestPath, body)
 		if err != nil {
 			return err
 		}
 		observability.InjectTraceHeader(request)
-		if input != nil {
+		if body != nil {
 			request.Header.Set("Content-Type", "application/json")
-			if seeker, ok := body.(io.Seeker); ok {
-				_, _ = seeker.Seek(0, io.SeekStart)
-			}
 		}
 		response, err := c.http.Do(request)
 		if err == nil {
@@ -203,7 +223,11 @@ func (c *Client) doJSON(ctx context.Context, method, requestPath string, input, 
 				}
 				return json.NewDecoder(io.LimitReader(response.Body, 16<<20)).Decode(output)
 			}
-			if response.StatusCode < 500 && response.StatusCode != http.StatusTooManyRequests {
+			// Only the transient classes are worth another attempt; a peer
+			// that refused the request outright — quota, storage, identity —
+			// answers the same way in 200ms, and every retry only delays the
+			// real error from reaching the migration record.
+			if !retryableStatus(response.StatusCode) {
 				return decodeRemoteError(response)
 			}
 			lastErr = decodeRemoteError(response)
@@ -217,6 +241,22 @@ func (c *Client) doJSON(ctx context.Context, method, requestPath string, input, 
 		}
 	}
 	return lastErr
+}
+
+// retryableStatus reports whether a peer response describes a transient
+// condition worth retrying: the classic gateway/proxy failures and explicit
+// rate limiting. Everything else — including 507 STORAGE_INSUFFICIENT, a
+// definitive capacity refusal — is terminal for this request.
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+		http.StatusTooManyRequests:
+		return true
+	}
+	return false
 }
 
 func decodeRemoteError(response *http.Response) error {

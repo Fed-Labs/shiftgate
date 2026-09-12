@@ -107,6 +107,12 @@ const useCases = [
       "Prepare data and validate non-GPU pipeline logic first. GPU context movement requires an explicit vendor checkpoint adapter and matching hardware; otherwise restart that stage safely from a checkpoint.",
     workflow: ["shiftgate checkpoint create training-run-7", "shiftgate migrate training-run-7 --to https://gpu-node:8443"],
   },
+  {
+    title: "Fifty workers from one warm state",
+    description:
+      "Checkpoint a warmed-up process once and clone it into a fleet of independent running workloads on the same machine — each with its own root and identity, all continuing the captured state. Filesystem copies are reflink clone-on-write where the filesystem allows, so scaling out costs restores, not copies.",
+    workflow: ["shiftgate checkpoint create worker-warm", "shiftgate clone CHECKPOINT_ID --count 50 --prefix worker"],
+  },
 ];
 
 export default function ProductPage() {

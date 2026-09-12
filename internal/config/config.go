@@ -55,9 +55,25 @@ type Agent struct {
 	Updates                 Updates            `json:"updates"`
 	Tracing                 Tracing            `json:"tracing"`
 
+	// CgroupRoot is the directory the agent places workload cgroups under.
+	// Empty means /sys/fs/cgroup/shift. Two agents on one machine must use
+	// distinct roots — a workload's cgroup path is derived from its id, so a
+	// shared root puts both agents' trees for the same workload in one
+	// directory, and the migration the second agent restores lands in the
+	// cgroup the first is about to tear down.
+	CgroupRoot string `json:"cgroup_root,omitempty"`
+
 	objectStoreLocalRootExplicit bool
 	objectStoreStateDirExplicit  bool
 }
+
+// DefaultControlPlaneURL is the control plane every SHIFT client talks to
+// unless told otherwise: the platform hosts the control plane, so its address
+// is part of the product, not per-deployment configuration — the same way a
+// hosted service's SDK ships its endpoint. A private deployment overrides it
+// with --control-url / SHIFT_CONTROL_URL (CLI, agents) or NEXT_PUBLIC_API_URL
+// (dashboard).
+const DefaultControlPlaneURL = "https://shiftgate.dev"
 
 type ControlReporter struct {
 	URL            string        `json:"url,omitempty"`
@@ -122,6 +138,14 @@ func (c *Agent) Validate() error {
 	}
 	if c.StateDir == "" || !filepath.IsAbs(c.StateDir) {
 		return errors.New("state_dir must be an absolute path")
+	}
+	if c.CgroupRoot != "" {
+		if !filepath.IsAbs(c.CgroupRoot) {
+			return errors.New("cgroup_root must be an absolute path")
+		}
+		if cleaned := filepath.Clean(c.CgroupRoot); cleaned != c.CgroupRoot || cleaned == "/" || strings.Contains(cleaned, "..") {
+			return errors.New("cgroup_root must be a cleaned path under a cgroup mount, not / or a relative traversal")
+		}
 	}
 	if c.ChunkSizeBytes < 64<<10 || c.ChunkSizeBytes > 64<<20 {
 		return errors.New("chunk_size_bytes must be between 64 KiB and 64 MiB")
@@ -257,6 +281,9 @@ func applyAgentEnvironment(configuration *Agent) {
 	if value := os.Getenv("SHIFT_LOG_LEVEL"); value != "" {
 		configuration.LogLevel = strings.ToLower(value)
 	}
+	if value := os.Getenv("SHIFT_CGROUP_ROOT"); value != "" {
+		configuration.CgroupRoot = value
+	}
 	if os.Getenv("SHIFT_OBJECTSTORE_LOCAL_ROOT") != "" {
 		configuration.objectStoreLocalRootExplicit = true
 	}
@@ -271,6 +298,47 @@ func applyAgentEnvironment(configuration *Agent) {
 	}
 	if value := os.Getenv("SHIFT_TRACING_SERVICE_NAME"); value != "" {
 		configuration.Tracing.ServiceName = value
+	}
+}
+
+// applyStorageEnvironment maps SHIFT_STORAGE_* variables onto the hosted
+// storage block. Durations accept Go duration strings ("90m"); an unparseable
+// duration is ignored here so Validate reports it with its own message — the
+// variable was clearly set, so silently keeping the default would hide that.
+func applyStorageEnvironment(configuration *StorageConfig) {
+	if value := os.Getenv("SHIFT_STORAGE_ENABLED"); value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err == nil {
+			configuration.Enabled = enabled
+		}
+	}
+	if value := os.Getenv("SHIFT_STORAGE_ENDPOINT"); value != "" {
+		configuration.Endpoint = value
+	}
+	if value := os.Getenv("SHIFT_STORAGE_PUBLIC_ENDPOINT"); value != "" {
+		configuration.PublicEndpoint = value
+	}
+	if value := os.Getenv("SHIFT_STORAGE_REGION"); value != "" {
+		configuration.Region = value
+	}
+	if value := os.Getenv("SHIFT_STORAGE_BUCKET"); value != "" {
+		configuration.Bucket = value
+	}
+	if value := os.Getenv("SHIFT_STORAGE_ACCESS_KEY_ID"); value != "" {
+		configuration.AccessKeyID = value
+	}
+	if value := os.Getenv("SHIFT_STORAGE_SECRET_ACCESS_KEY"); value != "" {
+		configuration.SecretAccessKey = value
+	}
+	if value := os.Getenv("SHIFT_STORAGE_CREDENTIAL_TTL"); value != "" {
+		if parsed, err := time.ParseDuration(value); err == nil {
+			configuration.CredentialTTL = parsed
+		}
+	}
+	if value := os.Getenv("SHIFT_STORAGE_RECONCILE_INTERVAL"); value != "" {
+		if parsed, err := time.ParseDuration(value); err == nil {
+			configuration.ReconcileInterval = parsed
+		}
 	}
 }
 
@@ -297,6 +365,14 @@ func applyControlPlaneEnvironment(configuration *ControlReporter) {
 		if parsed, err := time.ParseDuration(value); err == nil {
 			configuration.Interval = parsed
 		}
+	}
+	// The control plane's address is part of the platform: when the reporter
+	// is being configured at all, an omitted URL means "the platform's", not
+	// a validation error. A reporter configured with nothing at all stays
+	// disabled, so the default never leaks into unconfigured agents.
+	if strings.TrimSpace(configuration.URL) == "" &&
+		(strings.TrimSpace(configuration.OrganizationID) != "" || strings.TrimSpace(configuration.MachineID) != "" || strings.TrimSpace(configuration.APIKey) != "") {
+		configuration.URL = DefaultControlPlaneURL
 	}
 }
 
@@ -355,6 +431,17 @@ type ControlPlane struct {
 	// authenticate through the issuer and local passwords stop working for
 	// them. All three values must be present together or none.
 	OIDC OIDC `json:"oidc"`
+
+	// AllowedOrigins lists the exact browser origins that may call the API, for
+	// the web dashboard ("http://localhost:3000"). A request carrying any other
+	// Origin is served without CORS headers, so a browser blocks it; the CLI and
+	// agents send no Origin and are unaffected. Empty allows no browser origin.
+	AllowedOrigins []string `json:"allowed_origins,omitempty"`
+
+	// Storage is the platform-hosted checkpoint store. When its Enabled flag is
+	// off (the default) the control plane serves metadata only, exactly as
+	// before, and agents that want a cloud mirror bring their own S3 bucket.
+	Storage StorageConfig `json:"storage"`
 }
 
 // OIDC names the identity provider the control plane federates to.
@@ -362,6 +449,39 @@ type OIDC struct {
 	Issuer       string `json:"issuer"`
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
+}
+
+// StorageConfig configures the control plane's hosted checkpoint storage. When
+// Enabled, the control plane brokers short-lived, org-scoped credentials for
+// the platform's S3-compatible store (MinIO in compose) instead of each user
+// supplying their own bucket. Disabled — the default — leaves every existing
+// deployment untouched.
+type StorageConfig struct {
+	Enabled bool `json:"enabled"`
+	// Endpoint is the S3 address the control plane signs against (typically
+	// the internal MinIO service). PublicEndpoint is what agents receive; it
+	// defaults to Endpoint when empty, and differs when the store is reachable
+	// from agents under another host or port.
+	Endpoint       string `json:"endpoint"`
+	PublicEndpoint string `json:"public_endpoint,omitempty"`
+	Region         string `json:"region"`
+	Bucket         string `json:"bucket"`
+	// AccessKeyID and SecretAccessKey are the parent credential the control
+	// plane assumes org roles from; it never leaves the control plane.
+	AccessKeyID     string        `json:"access_key_id"`
+	SecretAccessKey string        `json:"secret_access_key"`
+	CredentialTTL   time.Duration `json:"credential_ttl"`
+	// ReconcileInterval is how often usage is recounted from the bucket.
+	ReconcileInterval time.Duration `json:"reconcile_interval"`
+}
+
+// AgentEndpoint is the S3 address handed to agents: PublicEndpoint when set,
+// otherwise Endpoint.
+func (s StorageConfig) AgentEndpoint() string {
+	if strings.TrimSpace(s.PublicEndpoint) != "" {
+		return s.PublicEndpoint
+	}
+	return s.Endpoint
 }
 
 func DefaultControlPlane() ControlPlane {
@@ -405,6 +525,62 @@ func (o OIDC) Configured() bool {
 	return strings.TrimSpace(o.Issuer) != "" && strings.TrimSpace(o.ClientID) != "" && strings.TrimSpace(o.ClientSecret) != ""
 }
 
+// Validate applies hosted-storage rules when the block is enabled; a disabled
+// block is always valid so partially-filled leftovers never break startup.
+// Defaults for the two intervals are applied in place (matching the reporter's
+// style) rather than rejected, because both have safe values.
+func (s *StorageConfig) Validate() error {
+	if !s.Enabled {
+		return nil
+	}
+	endpoint := strings.TrimRight(strings.TrimSpace(s.Endpoint), "/")
+	if endpoint == "" {
+		return errors.New("storage endpoint is required when hosted storage is enabled")
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return fmt.Errorf("storage endpoint must be an http(s) URL: %q", s.Endpoint)
+	}
+	if parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		return fmt.Errorf("storage endpoint must carry no path, query, fragment, or credentials: %q", s.Endpoint)
+	}
+	if strings.TrimSpace(s.PublicEndpoint) != "" {
+		public, err := url.Parse(strings.TrimSpace(s.PublicEndpoint))
+		if err != nil || (public.Scheme != "https" && public.Scheme != "http") || public.Host == "" {
+			return fmt.Errorf("storage public endpoint must be an http(s) URL: %q", s.PublicEndpoint)
+		}
+	}
+	if strings.TrimSpace(s.Region) == "" {
+		return errors.New("storage region is required when hosted storage is enabled")
+	}
+	if err := objectstore.ValidateBucket(strings.TrimSpace(s.Bucket)); err != nil {
+		return fmt.Errorf("storage bucket: %w", err)
+	}
+	if s.AccessKeyID == "" || s.SecretAccessKey == "" {
+		return errors.New("storage access key id and secret access key are required when hosted storage is enabled")
+	}
+	if s.CredentialTTL <= 0 {
+		s.CredentialTTL = DefaultStorageCredentialTTL
+	}
+	if s.CredentialTTL < 15*time.Minute || s.CredentialTTL > 7*24*time.Hour {
+		return fmt.Errorf("storage credential TTL must be between 15 minutes and 7 days, got %s", s.CredentialTTL)
+	}
+	if s.ReconcileInterval <= 0 {
+		s.ReconcileInterval = DefaultStorageReconcileInterval
+	}
+	if s.ReconcileInterval < 30*time.Second {
+		return fmt.Errorf("storage reconcile interval must be at least 30 seconds, got %s", s.ReconcileInterval)
+	}
+	return nil
+}
+
+// Default intervals applied by StorageConfig.Validate when the block is
+// enabled but leaves them unset.
+const (
+	DefaultStorageCredentialTTL     = time.Hour
+	DefaultStorageReconcileInterval = 5 * time.Minute
+)
+
 func (c *ControlPlane) Validate() error {
 	if c.Version != 1 {
 		return fmt.Errorf("unsupported control-plane config version %d", c.Version)
@@ -433,6 +609,13 @@ func (c *ControlPlane) Validate() error {
 	if c.RateLimitPerMin < 10 || c.RateLimitPerMin > 10000 {
 		return errors.New("rate limit must be between 10 and 10000 requests per minute")
 	}
+	for _, origin := range c.AllowedOrigins {
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
+			(parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("allowed origin %q must be an http:// or https:// origin with a host and no path, query, or fragment", origin)
+		}
+	}
 	if c.ComputeReservationTTL < time.Minute || c.ComputeReservationTTL > 24*time.Hour {
 		return errors.New("compute reservation TTL must be between one minute and 24 hours")
 	}
@@ -440,6 +623,9 @@ func (c *ControlPlane) Validate() error {
 		return errors.New("retention sweep interval must be zero (disabled) or at most seven days")
 	}
 	if err := c.OIDC.Validate(); err != nil {
+		return err
+	}
+	if err := c.Storage.Validate(); err != nil {
 		return err
 	}
 	for plan, priceID := range c.StripePrices {
@@ -485,6 +671,16 @@ func LoadControlPlaneUnvalidated(path string) (ControlPlane, error) {
 	if value := os.Getenv("SHIFT_CONTROL_LISTEN"); value != "" {
 		configuration.Listen = value
 	}
+	// SHIFT_ALLOWED_ORIGINS is a comma-separated list that replaces the file's
+	// allowed_origins, e.g. SHIFT_ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com.
+	if value := os.Getenv("SHIFT_ALLOWED_ORIGINS"); value != "" {
+		configuration.AllowedOrigins = nil
+		for _, origin := range strings.Split(value, ",") {
+			if trimmed := strings.TrimSpace(origin); trimmed != "" {
+				configuration.AllowedOrigins = append(configuration.AllowedOrigins, trimmed)
+			}
+		}
+	}
 	if value := os.Getenv("SHIFT_COMPUTE_TRADING_ENABLED"); value != "" {
 		enabled, err := strconv.ParseBool(value)
 		if err != nil {
@@ -512,6 +708,7 @@ func LoadControlPlaneUnvalidated(path string) (ControlPlane, error) {
 			configuration.StripePrices[plan] = value
 		}
 	}
+	applyStorageEnvironment(&configuration.Storage)
 	if configuration.ComputeReservationTTL <= 0 {
 		configuration.ComputeReservationTTL = DefaultControlPlane().ComputeReservationTTL
 	}

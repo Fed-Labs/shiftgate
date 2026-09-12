@@ -28,6 +28,10 @@ type Server struct {
 	limiter   *RateLimiter
 	stripe    *billing.StripeClient
 	startedAt time.Time
+	// storage brokers per-org credentials for the hosted checkpoint store and
+	// reconciles usage from the bucket. It is nil when hosting is off, which
+	// every storage route treats as STORAGE_NOT_CONFIGURED.
+	storage *storageService
 	// oidcHTTPClient overrides the outbound client used for OIDC discovery,
 	// token exchange, and key fetches. It exists for tests, which point it at
 	// a locally issued TLS certificate; production leaves it nil and gets the
@@ -50,21 +54,35 @@ func Open(ctx context.Context, configuration config.ControlPlane, logger *slog.L
 		store.Close()
 		return nil, err
 	}
-	return New(configuration, store, logger), nil
+	server := New(configuration, store, logger)
+	if configuration.Storage.Enabled && server.storage == nil {
+		store.Close()
+		return nil, errors.New("hosted storage was requested but the broker could not be constructed")
+	}
+	return server, nil
 }
 
 func New(configuration config.ControlPlane, store *database.Store, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{config: configuration, database: store, logger: logger, metrics: observability.NewMetrics(), limiter: NewRateLimiter(configuration.RateLimitPerMin), stripe: billing.NewStripeClient(configuration.StripeSecretKey), startedAt: time.Now().UTC()}
+	server := &Server{config: configuration, database: store, logger: logger, metrics: observability.NewMetrics(), limiter: NewRateLimiter(configuration.RateLimitPerMin), stripe: billing.NewStripeClient(configuration.StripeSecretKey), startedAt: time.Now().UTC()}
+	storage, err := newStorageService(configuration.Storage)
+	if err != nil {
+		// New cannot fail, so a broker that could not be built leaves hosting
+		// off for this in-process server with an error logged; Open — the
+		// production constructor — refuses to start instead.
+		logger.Error("hosted storage broker construction failed; hosting is off", "error", err)
+	}
+	server.storage = storage
+	return server
 }
 
 // Handler returns the fully instrumented HTTP handler. It is useful for
 // embedding the control plane behind an existing listener and for integration
 // tests; Run remains the default production listener lifecycle.
 func (server *Server) Handler() http.Handler {
-	return server.metrics.Middleware(server.logger, server.handler())
+	return server.metrics.Middleware(server.logger, server.cors(server.handler()))
 }
 
 func (server *Server) Close() {
@@ -76,7 +94,7 @@ func (server *Server) Close() {
 func (server *Server) Run(ctx context.Context) error {
 	httpServer := &http.Server{
 		Addr:              server.config.Listen,
-		Handler:           server.metrics.Middleware(server.logger, server.handler()),
+		Handler:           server.metrics.Middleware(server.logger, server.cors(server.handler())),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       server.config.RequestTimeout,
 		WriteTimeout:      server.config.RequestTimeout,
@@ -91,6 +109,10 @@ func (server *Server) Run(ctx context.Context) error {
 	// an operator could trigger would let expired records outlive their window
 	// for as long as nobody remembered to sweep.
 	server.startRetentionSweeper(ctx)
+	// Hosted-storage usage is recounted on the same principle: the quota the
+	// credential broker enforces must track the bucket without an operator
+	// remembering to ask.
+	server.startStorageReconciler(ctx)
 	go func() { errorsChannel <- httpServer.Serve(listener) }()
 	select {
 	case <-ctx.Done():
@@ -156,6 +178,9 @@ func (server *Server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/organizations/{organizationID}/machines/{machineID}/commands", server.requireOrganization(RoleOperator, "workloads", server.handleAgentCommand))
 	mux.HandleFunc("POST /v1/organizations/{organizationID}/reconcile", server.requireOrganization(RoleOperator, "workloads", server.handleReconcile))
 	mux.HandleFunc("GET /v1/organizations/{organizationID}/usage", server.requireOrganization(RoleViewer, "billing", server.handleUsage))
+	mux.HandleFunc("GET /v1/organizations/{organizationID}/storage", server.requireOrganization(RoleViewer, "billing", server.handleStorageStatus))
+	mux.HandleFunc("GET /v1/organizations/{organizationID}/storage/credentials", server.requireOrganization(RoleOperator, "machines", server.handleStorageCredentials))
+	mux.HandleFunc("POST /v1/organizations/{organizationID}/storage/reconcile", server.requireOrganization(RoleAdmin, "billing", server.handleStorageReconcile))
 	mux.HandleFunc("GET /v1/plans", server.handlePlans)
 	mux.HandleFunc("POST /v1/organizations/{organizationID}/billing/checkout", server.requireOrganization(RoleAdmin, "billing", server.handleBillingCheckout))
 	mux.HandleFunc("POST /v1/organizations/{organizationID}/billing/portal", server.requireOrganization(RoleAdmin, "billing", server.handleBillingPortal))

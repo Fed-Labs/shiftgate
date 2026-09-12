@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,21 @@ import (
 
 type Authenticator func(*http.Request) (string, error)
 
+// ReplicationWatcher is the agent-side counterpart of a held replication
+// session. The peer server calls it after the session is durably persisted,
+// so the agent's standby supervisor can keep its duty records current; a
+// watcher is notified on the server's handler goroutine and must not block.
+type ReplicationWatcher interface {
+	// ReplicationHeld reports a session that just entered (or already sat in)
+	// the HELD state: its checkpoint is imported, verified, and restorable.
+	ReplicationHeld(session Session)
+	// ReplicationWithdrawn reports that the authenticated source machine
+	// withdrew its standby duty for the workload. The watcher matches the
+	// duty by source and workload; a withdrawal naming a duty that never
+	// existed is a no-op.
+	ReplicationWithdrawn(sourceMachineID, workloadID string)
+}
+
 type Server struct {
 	sessions     *Sessions
 	keys         *securestore.Manager
@@ -36,6 +52,7 @@ type Server struct {
 	authenticate Authenticator
 	logger       *slog.Logger
 	maxBodyBytes int64
+	replication  ReplicationWatcher
 }
 
 type ReserveRequest struct {
@@ -44,6 +61,8 @@ type ReserveRequest struct {
 	WorkloadID      string    `json:"workload_id"`
 	EstimatedBytes  int64     `json:"estimated_bytes"`
 	ExpiresAt       time.Time `json:"expires_at,omitempty"`
+	// Purpose marks a replication reserve. Empty means a migration.
+	Purpose string `json:"purpose,omitempty"`
 }
 
 type KeyRequest struct {
@@ -59,6 +78,19 @@ type MissingResponse struct {
 
 type RestoreRequest struct {
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+}
+
+// HoldRequest carries the standby-duty facts with a replication hold: the
+// retention the source asks the standby to keep, and the source's advertised
+// peer listener the standby should probe before ever failing over on its own.
+type HoldRequest struct {
+	KeepLast       int    `json:"keep_last"`
+	SourceAgentURL string `json:"source_agent_url,omitempty"`
+}
+
+// WithdrawRequest names the workload whose standby duty the source withdraws.
+type WithdrawRequest struct {
+	WorkloadID string `json:"workload_id"`
 }
 
 func NewServer(sessions *Sessions, keys *securestore.Manager, chunks *chunkstore.Store, checkpoints *checkpoint.Repository, restorer *checkpoint.Restorer, inventory *linuxplatform.Inventory, authenticate Authenticator, logger *slog.Logger) *Server {
@@ -79,6 +111,14 @@ func (s *Server) SetDiagnostics(diagnostics *observability.Diagnostics) {
 	s.diagnostics = diagnostics
 }
 
+// SetReplicationWatcher attaches the standby supervisor's duty recorder.
+// Without one, hold and withdraw answer 503: those endpoints exist to reach
+// the agent's duty store, and silently accepting a duty no one records
+// would tell the source its state is protected when it is not.
+func (s *Server) SetReplicationWatcher(watcher ReplicationWatcher) {
+	s.replication = watcher
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/peer/machine", s.machine)
@@ -90,6 +130,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/peer/transfers/{id}/restore", s.restore)
 	mux.HandleFunc("POST /v1/peer/transfers/{id}/commit", s.commit)
 	mux.HandleFunc("POST /v1/peer/transfers/{id}/rollback", s.rollback)
+	mux.HandleFunc("POST /v1/peer/transfers/{id}/hold", s.hold)
+	mux.HandleFunc("POST /v1/peer/standby/withdraw", s.withdraw)
 	mux.HandleFunc("GET /v1/peer/transfers/{id}", s.get)
 	return s.withAuth(mux)
 }
@@ -124,6 +166,10 @@ func (s *Server) reserve(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusForbidden, "SOURCE_IDENTITY_MISMATCH", "request source does not match the authenticated machine")
 		return
 	}
+	if !validPurpose(input.Purpose) {
+		writeError(writer, http.StatusBadRequest, "PURPOSE_INVALID", "transfer purpose must be empty (migration) or \"replication\"")
+		return
+	}
 	if input.EstimatedBytes < 0 {
 		writeError(writer, http.StatusBadRequest, "ESTIMATE_INVALID", "estimated bytes cannot be negative")
 		return
@@ -146,6 +192,7 @@ func (s *Server) reserve(writer http.ResponseWriter, request *http.Request) {
 	session, err := s.sessions.Reserve(Session{
 		ID: input.ID, SourceMachineID: source, WorkloadID: input.WorkloadID,
 		EstimatedBytes: input.EstimatedBytes, ExpiresAt: input.ExpiresAt,
+		Purpose: input.Purpose,
 	})
 	if err != nil {
 		writeError(writer, http.StatusConflict, "RESERVATION_REJECTED", err.Error())
@@ -256,7 +303,16 @@ func (s *Server) importChunk(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, http.StatusNotFound, "TRANSFER_NOT_FOUND", err.Error())
 		return
 	}
-	if err := requireState(&session, SessionManifestReady); err != nil {
+	// A live migration uploads its pre-copy passes' chunks in KEY_READY,
+	// before the final checkpoint exists: interleaving each pass's transfer
+	// with the pass loop is what keeps the later freeze down to the final
+	// delta. Before a manifest is imported the session itself is the
+	// authorization — the request carries the peer's verified machine
+	// identity, the chunk is AEAD ciphertext under the workload key ImportKey
+	// already bound to this session, the content address is verified when the
+	// chunk is stored, and the reservation bounds the bytes. Once a manifest
+	// is imported the stricter rule applies: only chunks it references.
+	if err := requireState(&session, SessionKeyReady, SessionManifestReady); err != nil {
 		writeError(writer, http.StatusConflict, "TRANSFER_STATE_INVALID", err.Error())
 		return
 	}
@@ -276,14 +332,16 @@ func (s *Server) importChunk(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, http.StatusBadRequest, "CHUNK_REF_INVALID", "chunk reference does not match request path")
 		return
 	}
-	manifest, err := s.checkpoints.Load(session.CheckpointID)
-	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "MANIFEST_LOAD_FAILED", err.Error())
-		return
-	}
-	if !manifestContainsChunk(manifest, ref) {
-		writeError(writer, http.StatusForbidden, "CHUNK_NOT_AUTHORIZED", "chunk is not referenced by this transfer manifest")
-		return
+	if session.CheckpointID != "" {
+		manifest, err := s.checkpoints.Load(session.CheckpointID)
+		if err != nil {
+			writeError(writer, http.StatusInternalServerError, "MANIFEST_LOAD_FAILED", err.Error())
+			return
+		}
+		if !manifestContainsChunk(manifest, ref) {
+			writeError(writer, http.StatusForbidden, "CHUNK_NOT_AUTHORIZED", "chunk is not referenced by this transfer manifest")
+			return
+		}
 	}
 	if session.EstimatedBytes > 0 && session.ReceivedBytes+ref.StoredSize > session.EstimatedBytes+(session.EstimatedBytes/20) {
 		writeError(writer, http.StatusInsufficientStorage, "TRANSFER_QUOTA_EXCEEDED", "incoming transfer exceeded its reserved size")
@@ -367,7 +425,11 @@ func (s *Server) restore(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	timeout := time.Duration(input.TimeoutSeconds) * time.Second
-	record, err := s.restorer.Prepare(request.Context(), session.CheckpointID, timeout)
+	// A migration restore is always eager: the source is frozen waiting for
+	// the destination's answer, and the migration's downtime metric must mean
+	// the process is fully there — a lazy start would report a resume the
+	// memory had not caught up with.
+	record, err := s.restorer.Prepare(request.Context(), session.CheckpointID, checkpoint.PrepareOptions{Timeout: timeout})
 	if err != nil {
 		_, _ = s.sessions.Update(session.ID, source, func(value *Session) error {
 			value.State = SessionFailed
@@ -446,6 +508,85 @@ func (s *Server) rollback(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	writeJSON(writer, http.StatusOK, session)
+}
+
+// hold parks a verified replication session as the standby's restorable copy
+// and records the duty facts the source sends with it. Only a replication
+// session can be held — a migration's session ends in restore and commit —
+// and only after Verify proved every referenced chunk present and intact.
+// Holding is idempotent: a session already HELD is returned unchanged so a
+// source retrying after a lost response cannot corrupt the standby's record.
+func (s *Server) hold(writer http.ResponseWriter, request *http.Request) {
+	if s.replication == nil {
+		writeError(writer, http.StatusServiceUnavailable, "STANDBY_NOT_AVAILABLE", "this agent does not run a standby supervisor")
+		return
+	}
+	var input HoldRequest
+	if !decodeJSON(writer, request, s.maxBodyBytes, &input) {
+		return
+	}
+	if input.KeepLast < 0 {
+		writeError(writer, http.StatusBadRequest, "HOLD_INVALID", "keep_last cannot be negative")
+		return
+	}
+	if input.SourceAgentURL != "" {
+		parsed, err := url.Parse(input.SourceAgentURL)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			writeError(writer, http.StatusBadRequest, "HOLD_INVALID", "source agent URL must be a plain https URL")
+			return
+		}
+	}
+	source := peerMachine(request.Context())
+	session, err := s.sessions.Get(request.PathValue("id"), source)
+	if err != nil {
+		writeError(writer, http.StatusNotFound, "TRANSFER_NOT_FOUND", err.Error())
+		return
+	}
+	if session.State != SessionHeld {
+		if session.Purpose != PurposeReplication {
+			writeError(writer, http.StatusConflict, "TRANSFER_STATE_INVALID", "only a replication transfer can be held")
+			return
+		}
+		if err := requireState(&session, SessionVerified); err != nil {
+			writeError(writer, http.StatusConflict, "TRANSFER_STATE_INVALID", err.Error())
+			return
+		}
+		session, err = s.sessions.Update(session.ID, source, func(value *Session) error {
+			value.State = SessionHeld
+			value.KeepLast = input.KeepLast
+			value.SourceAgentURL = input.SourceAgentURL
+			return nil
+		})
+		if err != nil {
+			writeError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err.Error())
+			return
+		}
+	}
+	s.replication.ReplicationHeld(session)
+	writeJSON(writer, http.StatusOK, session)
+}
+
+// withdraw releases the source's standby duty for a workload. The duty this
+// reaches belongs to the authenticated source machine only; a peer cannot
+// withdraw another machine's duty. Withdrawal removes the duty — the
+// replicated checkpoints already on the standby stay: deleting state on
+// another machine's say-so is not a withdrawal's job, and the standby's
+// operator can prune what a withdrawn duty left behind.
+func (s *Server) withdraw(writer http.ResponseWriter, request *http.Request) {
+	if s.replication == nil {
+		writeError(writer, http.StatusServiceUnavailable, "STANDBY_NOT_AVAILABLE", "this agent does not run a standby supervisor")
+		return
+	}
+	var input WithdrawRequest
+	if !decodeJSON(writer, request, s.maxBodyBytes, &input) {
+		return
+	}
+	if strings.TrimSpace(input.WorkloadID) == "" {
+		writeError(writer, http.StatusBadRequest, "WITHDRAW_INVALID", "workload_id is required")
+		return
+	}
+	s.replication.ReplicationWithdrawn(peerMachine(request.Context()), input.WorkloadID)
+	writeJSON(writer, http.StatusOK, map[string]string{"status": "withdrawn"})
 }
 
 func (s *Server) get(writer http.ResponseWriter, request *http.Request) {

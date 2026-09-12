@@ -174,6 +174,42 @@ The CLI reports this workload's actual bytes and duration.`}</code>
           </div>
         </div>
 
+        {/* Cloning */}
+        <div className="mb-12">
+          <h2 className="text-xl font-semibold mb-4">Cloning from checkpoints</h2>
+          <p className="text-sm text-text-secondary leading-relaxed mb-4">
+            A clone set derives many independent running workloads from one
+            checkpoint on the same machine. Every member keeps its own workload
+            identity, its own root directory, and its own process — each a live
+            continuation of the checkpointed state. The checkpoint&apos;s chunks
+            are read from the store once, and every filesystem copy is a
+            reflink clone where the filesystem supports it, so scaling out
+            costs N restores, not N full copies.
+          </p>
+          <div className="rounded-lg border border-border bg-bg-elevated p-5">
+            <pre className="text-sm">
+              <code className="text-accent">shiftgate clone ckpt_a1b2c3d4 --count 50 --prefix worker</code>
+            </pre>
+            <div className="my-3 h-px bg-border-subtle" />
+            <pre className="text-sm text-text-secondary whitespace-pre-wrap">
+              <code>{`  Cloned 50 workload(s) from checkpoint ckpt_a1b2c3d4
+    clone set:   set_9f3e...
+    duration:    18231ms
+  worker-1   pid 4231  root /srv/app-clone-9f3e-1
+  worker-2   pid 4232  root /srv/app-clone-9f3e-2
+  ...
+  All-or-nothing: any member failure rolls back every member.`}</code>
+            </pre>
+          </div>
+          <p className="text-sm text-text-muted leading-relaxed mt-4">
+            Members restore in parallel (default 4, capped at 16 concurrent
+            CRIU restores). A workload that declares TCP ports can only be
+            cloned one member at a time, because every member would rebind the
+            same host port. A committed set is a fleet of ordinary workloads —
+            teardown goes through the workload API.
+          </p>
+        </div>
+
         {/* Storage and deduplication */}
         <div className="mb-12">
           <h2 className="text-xl font-semibold mb-4">Storage and deduplication</h2>

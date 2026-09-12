@@ -13,11 +13,34 @@ in encrypted local collections, and process identity includes `/proc` start tick
 signalling a reused PID.
 
 Checkpoint creation combines CRIU process images with explicitly configured filesystem
-roots. The chunk store compresses and encrypts each bounded-size chunk, addresses it with a
+roots. The chunk store compresses and encrypts each bounded-size chunk (zstd at its default
+level; chunks written by earlier versions in gzip remain readable — the codec is identified
+by the decompressed frame's magic, not trusted from the manifest), addresses it with a
 keyed digest, and verifies both ciphertext and plaintext before restore. Manifests are
 signed by the source machine identity and encrypted with the workload data key. Optional
 object-store mirroring uploads that encrypted envelope and the encrypted chunks; a
 destination decrypts and authenticates the envelope before importing any chunk or metadata.
+
+A restore is a two-phase transaction — prepare stages the filesystem and the
+process image set, switches the root, restores and validates the tree, then
+commit reaps the superseded source and drops the staging state — and an
+opt-in lazy variant (`restore --lazy`) starts the tree before its memory is
+materialized: the agent runs `criu lazy-pages` as a foreground child over the
+image set, CRIU's restore hands page serving to it through userfaultfd, and
+the daemon exits once it has served every image page (or the process is
+gone), at which point a watch removes the now-derived image set. The restore
+record carries an honest `time_to_first_execution_ms` for both variants, and
+the lazily restored process's own checkpoints remain correct — reading its
+memory faults the remaining pages in through the daemon.
+
+A clone set is the same restore transaction applied N times to one checkpoint
+on one machine (`clone CHECKPOINT_ID --count N`): the chunk store's contents
+are extracted once, every member's filesystem copy is a reflink clone where
+the filesystem allows it, and each member restores through a private mount
+namespace bind mounting its own root over the path the checkpointed images
+record — the mechanism a fork uses, applied per member. Members restore in a
+bounded parallel pool (default 4, cap 16); the set is all-or-nothing with a
+persisted record that recovery can reverse after an agent restart mid-set.
 
 ## Filesystem
 
@@ -104,6 +127,50 @@ That reporter updates registration metadata such as status, inventory, and adver
 address. It is one-way presence reporting; it does not expose workload keys, checkpoint
 chunks, or dashboard command dispatch.
 
+## Periodic checkpoint policies
+
+A workload's spec can carry a checkpoint policy (interval, optional retention count). A
+scheduler goroutine in the agent reconsiders policies every 5 seconds: a running workload
+whose interval has elapsed — measured from its newest checkpoint, or its creation when
+none exists — gets a full `leave_running` checkpoint, after which retention deletes the
+oldest snapshots beyond the count, never an ancestor a kept checkpoint still needs. The
+schedule is derived from persisted facts only, so it survives agent restarts; workloads
+that are not running or have a migration in flight are skipped. Policies are per-agent
+and per-workload — there is no cross-node coordination, because each agent is the
+authority for the workloads it owns.
+
+## Warm-standby failover
+
+A workload's spec can additionally carry a failover policy (a standby's peer URL, its
+expected machine id, a retention count), which is only valid paired with a checkpoint
+policy — the schedule is what produces replicas, and removing the schedule while a
+standby waits would strand it at the checkpoint it holds, so the pair is enforced in both
+directions. The source's replicator runs alongside the scheduler: each time the scheduler
+makes a root checkpoint, the newest one — process image, filesystem root, and the
+workload data key — is pushed to the standby over the same mutually authenticated peer
+channel a migration uses. Incrementals are not replicated; the standby always holds
+self-contained roots, so any one of them restores on its own.
+
+The standby side is a duty list. Each duty records the workload id, the authenticated
+source identity, the checkpoint it is armed with, retention, and its failover history,
+and the standby's tick loop (10s) runs retention on armed duties and then judges death.
+The judgment is two-signal by construction: the standby first reads the control plane's
+presence record for the source — looked up by the machine id it authenticated, which is
+why the source's configured `control_plane.machine_id` must match its agent identity —
+and a record that is missing or fresh means no action. Only when the record says the
+source is offline, or its last heartbeat is older than 90 seconds, does the standby
+probe the source's advertised peer listener itself; a probe that fails on a
+misconfiguration (no URL, unreachable) never fails over on its own — silence alone is
+not death. When both signals agree, the standby runs the restore path (prepare, commit,
+rollback on failure), marks the duty failed-over with the reason, and clears the
+workload's failover policy while leaving its checkpoint schedule — the restored workload
+is live but unprotected until re-armed. A failed attempt is recorded on the duty and
+retried a minute later. The operator path, `standby trigger`, runs the same restore but
+starts by probing the source and says so when the source answers. There is no fencing
+mechanism — nothing revokes the source's claim to the workload — so a failover during a
+live source runs an independent copy; the probe warning and the staleness bound are the
+documented defenses, not a guarantee.
+
 ## Observability
 
 The agent emits structured JSON logs (slog), serves Prometheus text metrics on its local
@@ -136,9 +203,24 @@ logged.
 
 ## Boundaries and limitations
 
-The current live-migration mode uses a real CRIU `pre-dump` while the workload runs, then
-creates the authoritative final checkpoint with the process stopped. It does not assume a
-copy-on-write filesystem adapter or transparent dirty-page convergence. Network identity is
+The current live-migration mode interleaves CRIU `pre-dump` with transfer, the way
+spec §10 draws the flow: an initial checkpoint is transferred while the workload runs,
+changes are tracked, and each further pass's delta transfers the moment the pass
+completes — each pass parenting the previous one so unchanged memory travels early —
+until a pass's delta converges or a pass cap is reached. Each pass's images are
+packaged as their own content-addressed asset, so chunks stream to the destination in
+`KEY_READY` state (authenticated by machine identity and content digests, before any
+manifest exists), and the destination session is reserved and measured from pass 1's
+actual packaged size rather than a guess. The short freeze at the end pays only the
+final delta. A migration record's `downtime`
+is the freeze-to-resumed window: from the pause before the final dump (recorded in the
+checkpoint manifest as `freeze_started_at`) to the destination's restore call returning
+with the process resumed and health-validated. It is never the migration's wall clock —
+pre-copy passes run while the workload is live, and the commit and source-cleanup stages
+run after it is already executing on the destination — and a live migration that fails
+before its freeze reports zero downtime, because the workload ran the whole time; its
+metrics separate `pre_copy_transferred_bytes` from the frozen window's transfer. It does not assume a copy-on-write
+filesystem adapter. Network identity is
 preserved as a SHIFT-layer virtual address with published port mappings, never claimed as a
 routable address that follows the process; socket state itself only travels under CRIU TCP
 repair. GPU state and external services are represented in compatibility reports and state

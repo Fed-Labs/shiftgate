@@ -35,7 +35,7 @@ import (
 )
 
 // requireE2E skips unless the environment can really checkpoint and restore.
-func requireE2E(t *testing.T) {
+func requireE2E(t testing.TB) {
 	t.Helper()
 	if os.Getenv("SHIFT_TEST_E2E") != "1" {
 		t.Skip("set SHIFT_TEST_E2E=1 to run end-to-end tests with real CRIU checkpoint/restore")
@@ -54,7 +54,7 @@ func requireE2E(t *testing.T) {
 
 // requireStress gates the heavyweight scenarios behind their own flag so a
 // default E2E run stays minutes, not hours.
-func requireStress(t *testing.T) {
+func requireStress(t testing.TB) {
 	t.Helper()
 	requireE2E(t)
 	if os.Getenv("SHIFT_TEST_STRESS") != "1" {
@@ -78,7 +78,7 @@ type agentProcess struct {
 // local API listens on a Unix socket; the peer API on a loopback TLS port
 // with a self-signed development certificate — the same configuration two
 // development agents use for a real encrypted migration.
-func startAgent(t *testing.T, name string) *agentProcess {
+func startAgent(t testing.TB, name string) *agentProcess {
 	t.Helper()
 	return startAgentAt(t, name, t.TempDir(), t.TempDir())
 }
@@ -87,7 +87,15 @@ func startAgent(t *testing.T, name string) *agentProcess {
 // stop it and boot a successor over the same state — the machine-restart
 // scenarios. Everything on disk (identity, workloads, checkpoints, chunk
 // store, migration journal) is recovered by the new process.
-func startAgentAt(t *testing.T, name, stateDir, socketDir string) *agentProcess {
+func startAgentAt(t testing.TB, name, stateDir, socketDir string) *agentProcess {
+	t.Helper()
+	return startAgentWith(t, name, stateDir, socketDir, nil)
+}
+
+// startAgentWith boots an agent whose configuration the caller can adjust
+// before the service opens — the hosted-storage scenario, whose object store
+// and control-plane reporter blocks cannot be expressed through the defaults.
+func startAgentWith(t testing.TB, name, stateDir, socketDir string, mutate func(*config.Agent)) *agentProcess {
 	t.Helper()
 	socket := filepath.Join(socketDir, name+".sock")
 	port, err := freePort()
@@ -103,6 +111,16 @@ func startAgentAt(t *testing.T, name, stateDir, socketDir string) *agentProcess 
 	configuration.ObjectStore = config.DefaultAgent().ObjectStore
 	configuration.LogLevel = "warn"
 	configuration.Updates = config.DefaultAgent().Updates
+	// Each agent gets its own cgroup root, the way two agents on two machines
+	// have theirs on two filesystems: workload cgroup paths are derived from
+	// the workload id alone, so a shared root would put both agents' trees for
+	// one workload in a single directory — the migration the destination
+	// restores would sit in the cgroup the source's cleanup is about to
+	// remove, and a stop that should be instant would retry EBUSY instead.
+	configuration.CgroupRoot = filepath.Join("/sys/fs/cgroup", "shift-e2e-"+strings.NewReplacer("/", "_", "\\", "_", "..", "_").Replace(name))
+	if mutate != nil {
+		mutate(&configuration)
+	}
 
 	service, err := agent.Open(configuration, nil)
 	if err != nil {
@@ -159,7 +177,7 @@ func startAgentAt(t *testing.T, name, stateDir, socketDir string) *agentProcess 
 // outcome on the done channel exactly once, so the wait is guarded: the
 // test's explicit stop and the cleanup registered at startup share one
 // shutdown instead of the second waiter blocking for its full timeout.
-func (p *agentProcess) stop(t *testing.T) {
+func (p *agentProcess) stop(t testing.TB) {
 	t.Helper()
 	p.stopOnce.Do(func() {
 		p.cancel()
@@ -171,7 +189,7 @@ func (p *agentProcess) stop(t *testing.T) {
 	})
 }
 
-func waitForAgent(t *testing.T, client *agentclient.Client) {
+func waitForAgent(t testing.TB, client *agentclient.Client) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -201,7 +219,7 @@ func (p *agentProcess) peerURL() string {
 }
 
 // machineID returns this agent's identity, as the other side sees it.
-func (p *agentProcess) machineID(t *testing.T) string {
+func (p *agentProcess) machineID(t testing.TB) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -214,7 +232,7 @@ func (p *agentProcess) machineID(t *testing.T) string {
 
 // createWorkload registers a workload through the real local API and waits
 // for it to reach the running state.
-func createWorkload(t *testing.T, client *agentclient.Client, name string, root string, command ...string) model.Workload {
+func createWorkload(t testing.TB, client *agentclient.Client, name string, root string, command ...string) model.Workload {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -239,7 +257,7 @@ func createWorkload(t *testing.T, client *agentclient.Client, name string, root 
 }
 
 // waitForWorkload polls until the workload reports the wanted status.
-func waitForWorkload(t *testing.T, client *agentclient.Client, workloadID string, want model.WorkloadStatus) model.Workload {
+func waitForWorkload(t testing.TB, client *agentclient.Client, workloadID string, want model.WorkloadStatus) model.Workload {
 	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
 	var last model.Workload
@@ -275,7 +293,7 @@ func waitForWorkload(t *testing.T, client *agentclient.Client, workloadID string
 }
 
 // waitUntil polls a condition with a deadline and a failure message.
-func waitUntil(t *testing.T, timeout time.Duration, description string, condition func() (bool, string)) {
+func waitUntil(t testing.TB, timeout time.Duration, description string, condition func() (bool, string)) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -307,7 +325,7 @@ func migrationTerminal(stage model.MigrationStage) bool {
 
 // waitForMigrationTerminal polls the migration until it reaches a terminal
 // stage and returns it, failing the test on the timeout instead of guessing.
-func waitForMigrationTerminal(t *testing.T, client *agentclient.Client, migrationID string) model.Migration {
+func waitForMigrationTerminal(t testing.TB, client *agentclient.Client, migrationID string) model.Migration {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Minute)
 	for time.Now().Before(deadline) {
@@ -328,7 +346,7 @@ func waitForMigrationTerminal(t *testing.T, client *agentclient.Client, migratio
 
 // fileLineCount counts lines in a file inside a workload root — the evidence
 // that a process kept running across checkpoint/restore/migration.
-func fileLineCount(t *testing.T, path string) int {
+func fileLineCount(t testing.TB, path string) int {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -345,7 +363,7 @@ func fileLineCount(t *testing.T, path string) int {
 
 // writeRandomFile writes size bytes of crypto-random data to path — an
 // incompressible payload that forces real chunk transfer work.
-func writeRandomFile(t *testing.T, path string, size int64) error {
+func writeRandomFile(t testing.TB, path string, size int64) error {
 	t.Helper()
 	file, err := os.Create(path)
 	if err != nil {
@@ -372,7 +390,7 @@ func writeRandomFile(t *testing.T, path string, size int64) error {
 // corruptFirstChunk flips bytes in the middle of the first chunk file it
 // finds under root. The bytes corrupted are ciphertext, so the AEAD tag no
 // longer matches and any honest reader must reject the chunk.
-func corruptFirstChunk(t *testing.T, root string) (string, error) {
+func corruptFirstChunk(t testing.TB, root string) (string, error) {
 	t.Helper()
 	var chunkPath string
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {

@@ -35,12 +35,95 @@
   pids and memory limits would count both, failing the restore halfway
   through on a budget it was supposed to fit in. A commit reaps the parked
   copy; a rollback moves it back and resumes it.
-- Incremental checkpoints are supported through retained CRIU parent images. The child
-  archive carries the reconstructed image set and records its parent for deduplication and
-  lineage. Restoring a chain validates and materializes ancestors oldest-first.
-- Live migration uses CRIU pre-copy (`pre-dump`) before the final checkpoint. The final
-  checkpoint remains authoritative and the workload is stopped for the final transfer;
-  transparent dirty-page convergence and filesystem copy-on-write are not assumed.
+- Incremental checkpoints are supported through retained CRIU parent images. A checkpoint
+  that leaves its workload running arms CRIU's memory tracker, so a later incremental
+  checkpoint of the same process diffs against it; the child's archive carries only its
+  delta image set and records its parent for lineage. Restoring a chain validates and
+  materializes the ancestor image sets as nested sibling directories — the layout CRIU's
+  parent symlinks describe — oldest-first. An incremental against a checkpoint made
+  before memory tracking was armed, or against a process that was restored rather than
+  the original, is refused by CRIU's pid-reuse detection rather than silently producing
+  a broken image set.
+- Live migration uses iterative CRIU pre-copy (`pre-dump`) interleaved with transfer.
+  Each pass parents the previous one, so memory that stops changing travels while the
+  workload keeps running — each pass's images transfer the moment the pass completes —
+  and the loop ends early when a pass's delta converges (a fraction of the first
+  pass's bytes) or at the pass cap — a write-heavy workload honestly runs to the cap
+  and pays the longer freeze instead of looping forever. The destination reserves a
+  measured upper bound (the root tree plus pass 1's packaged size per pass plus the
+  final) before the first chunk leaves, so a destination without room for that worst
+  case refuses up front; a workload that dirties memory faster than the passes
+  converge can still exceed the bound mid-transfer, and the migration then fails with
+  the source preserved and running. The final checkpoint remains authoritative and
+  the workload is stopped for the final transfer; the pre-dump passes reduce, never
+  eliminate, the frozen transfer. Transparent filesystem copy-on-write is not assumed.
+- Periodic checkpoint policies snapshot a running workload every interval (floor 10
+  seconds) without stopping it. Each periodic snapshot is a full checkpoint — every
+  retained snapshot restores on its own, at the cost of full-size storage per snapshot —
+  and it arms the memory tracker, so operator-made incrementals chain off it. Retention
+  (`keep_last`) deletes the oldest snapshots beyond the count but never an ancestor a
+  kept checkpoint still depends on, so an operator's incremental chain can hold older
+  checkpoints past the count. Pruning deletes manifests and checkpoint directories
+  locally only: content-addressed chunks — local and mirrored — survive deletion for
+  deduplication and restore, consistent with the storage-GC limitation below, and
+  mirrored cloud objects are not garbage-collected by local pruning. The schedule is
+  measured from the newest checkpoint and skipped while a workload is not running or a
+  migration is in flight; there is no cross-node coordination of policies — each agent
+  applies the policies in the workload specs it owns.
+- Warm-standby failover replicates only the newest root checkpoint per scheduler
+  pass over the peer channel — incrementals are not replicated, so the recovery
+  point is the last root checkpoint and the exposure window is one checkpoint
+  interval, not the incremental chain. Failover itself has no fencing: a standby
+  that restores while the source is actually alive runs an independent copy, and
+  SHIFT's defenses are the trigger command's live-source probe warning (an
+  operator's check) and, on the automatic path, the two-signal rule — the
+  standby acts only when the source's peer listener is unreachable and its
+  control-plane presence record is stale (90 seconds without a heartbeat) or
+  offline. That judgment needs both facts: automatic failover requires a control
+  plane, both machines reporting presence to it, and the source configured with
+  `control_plane.agent_url` (otherwise there is nothing to probe). The source's
+  configured `control_plane.machine_id` must equal its agent identity's machine
+  id — the standby looks the source up by the identity it authenticated, and a
+  mismatched configured id makes the record unfindable and the duty never
+  fails over automatically. Clock skew between the machines shifts the
+  staleness judgment by the skew. Withdrawing a designation (`--off`) does not
+  delete the checkpoints already replicated to the standby, and a workload
+  restored by failover keeps its checkpoint schedule but drops its failover
+  designation — it must be re-armed before it is protected again.
+- Lazy restore (`shiftgate restore --lazy`, `standby trigger --lazy`) needs
+  userfaultfd on both the kernel and the CRIU build (`criu check --feature
+  uffd`) and is refused up front when either is missing. It starts the
+  process before its memory image is fully materialized: the lazy-pages
+  daemon serves page faults on demand and streams the remaining pages in the
+  background, exiting when every image page has been transferred or the
+  process is gone. Until that exit the checkpoint's image set stays on the
+  machine — the daemon reads it — and the agent removes it within seconds of
+  the daemon finishing; an agent restart re-arms the watch for a live daemon
+  and cleans up a dead one's images. A daemon that dies while pages are still
+  unserved takes the workload with it (a userfaultfd with no server faults
+  fatally), and killing the agent does not kill the daemon — that is
+  deliberate. A checkpoint of a lazily restored workload is correct — reading
+  the process's memory faults the remaining pages in through the daemon — but
+  its measured duration pays the deferred page-in. Lazy restores record an
+  honest `time_to_first_execution_ms` (eager restores record the same
+  measure), and on the reference benchmark — 171 MB restored from local disk
+  — lazy measured 144 ms against 123 ms eager: no improvement, because
+  local-disk materialization is already fast. The lazy trade-off pays off
+  only when materializing memory dominates startup (very large heaps, slow
+  storage). Automatic failover, migration restores, and the control plane's
+  agent-command restore are always eager: nobody opted into the lazy
+  trade-off there, and a migration's downtime metric must mean the process
+  is fully on the destination.
+- Checkpoint chunks are compressed with zstd before encryption. Chunks written by
+  earlier versions are gzip, and both remain restorable — after decryption the codec
+  is identified from the frame's magic bytes, never guessed from the manifest label —
+  so pre-upgrade checkpoints and mirrored objects stay readable. A deduplicated
+  re-write of already-stored plaintext reuses whichever encoding reached disk first
+  and the manifest labels the bytes actually stored. An agent binary from before the
+  zstd switch cannot decompress zstd chunks, so during a rolling upgrade destinations
+  must be upgraded before they receive state an upgraded source wrote; the failure is
+  the destination's real decompression error, which fails the migration and preserves
+  the source rather than producing a broken restore.
 - Filesystem capture is always consistent, never torn, by one of two mechanisms, and the
   checkpoint manifest records which one ran. On btrfs, a workload root that is a
   subvolume is snapshotted atomically (`btrfs subvolume snapshot -r`, which requires
@@ -99,12 +182,23 @@
   checkpoint/restore is rejected under both policies when the destination cannot restore
   that state, because proceeding would silently discard it.
 - The control plane stores machine presence and migration intent. Agents optionally report
-  presence with a scoped API key, but the dashboard cannot start, stop, checkpoint, restore,
-  or dispatch migrations. CLI/agent operations are not automatically reconciled into
+  presence with a scoped API key, and the dashboard dispatches workload commands
+  (start/stop/pause/resume, checkpoint, restore, migrate) through the agent's
+  mutually authenticated remote listener when one is registered — commands sent to
+  machines without a reachable `agent_url` are refused, never queued. CLI/agent
+  operations are not automatically reconciled into
   control-plane workload, checkpoint, or migration records; agents perform actual transfers
   directly. Object-storage mirroring is implemented for local and
   S3-compatible backends but is not enabled by default; operators must provision backend
-  credentials, lifecycle policies, quotas, and backups.
+  credentials, lifecycle policies, quotas, and backups. Platform-hosted storage
+  (control-plane credential brokering) enforces the plan quota on credential
+  issuance and meters usage by reconciling bucket bytes, but performs no
+  per-checkpoint garbage collection in the cloud: mirrored objects are
+  content-addressed chunks retained for restore and deduplication, so deleting
+  a checkpoint does not delete its mirrored objects. Cleanup today is
+  operator-side (`mc rm --recursive` on the organization's prefix, accepting
+  the loss of restore/dedup for those chunks) or a plan upgrade; fine-grained
+  cloud GC that tracks live references is planned, not faked here.
 - Forking produces an independent workload with its own filesystem copy, its own key
   namespace, its own full checkpoint, and its own virtual network address; SHIFT
   deliberately implements no state-merge operation, and only records the lineage a future
@@ -117,7 +211,19 @@
 - A fork whose process tree is activated runs inside a private mount namespace, so
   checkpointing that fork again from outside the namespace is not supported. Fork state is
   captured before activation, so the fork's own checkpoint is always available; re-capture
-  the fork by restoring that checkpoint into its own root instead.
+  the fork by restoring that checkpoint into its own root instead. The same applies to
+  every member of a clone set: a clone is a restore, and re-capturing it means restoring
+  a checkpoint into its own root.
+- A clone set (one checkpoint, many running workloads on one machine) is sized for a
+  single host: `--count` is capped at 128 and `--parallel` at 16 concurrent CRIU
+  restores, each of which holds a copy of the workload's memory while it runs. Clone
+  members read the source checkpoint's stored chunks directly instead of re-encrypting
+  them under their own key namespaces the way forks do, so a member's identity — its
+  workload record, root directory, and every checkpoint it takes afterwards — is its
+  own, but its derived state is not re-keyed: deleting the source checkpoint makes the
+  set's recorded origin untraceable, though the running members are unaffected. A
+  workload that declares TCP ports can only be cloned one member at a time, because
+  every member would rebind the same host port; larger sets are refused up front.
 - Observability is per-process. Structured logs, the Prometheus endpoint, traces, and
   diagnostics series (migration outcomes, durations, downtime, checkpoint and restore
   outcomes, transfer volume, resource gauges) reset when the agent restarts; durable history

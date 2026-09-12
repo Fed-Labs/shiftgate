@@ -44,6 +44,15 @@ func OpenManager(stateDir string, requireCgroup bool, logger *slog.Logger) (*Man
 }
 
 func OpenManagerWithKeys(stateDir string, requireCgroup bool, logger *slog.Logger, keys *securestore.Manager) (*Manager, error) {
+	return OpenManagerWithCgroups(stateDir, "", requireCgroup, logger, keys)
+}
+
+// OpenManagerWithCgroups opens a manager whose workload cgroups live under
+// cgroupRoot instead of the default root. Distinct roots are how two agents
+// on one machine stay out of each other's cgroups: every path the manager
+// derives — workload cgroups, parked frozen sources — lands under the root it
+// was given, so an agent only ever touches trees it owns.
+func OpenManagerWithCgroups(stateDir, cgroupRoot string, requireCgroup bool, logger *slog.Logger, keys *securestore.Manager) (*Manager, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -51,7 +60,7 @@ func OpenManagerWithKeys(stateDir string, requireCgroup bool, logger *slog.Logge
 	if err != nil {
 		return nil, err
 	}
-	cgroups, err := NewCgroupManager(requireCgroup)
+	cgroups, err := NewCgroupManager(requireCgroup, cgroupRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -98,6 +107,55 @@ func (m *Manager) Create(spec model.WorkloadSpec) (model.Workload, error) {
 		return model.Workload{}, err
 	}
 	return workload, nil
+}
+
+// SetCheckpointPolicy replaces a workload's periodic-checkpoint policy and
+// persists it, so a schedule survives agent restarts. A workload's spec is
+// otherwise immutable — the policy is the one operator-facing mutation
+// because schedules change with operational reality while a workload's
+// identity does not. A nil policy disables scheduling.
+func (m *Manager) SetCheckpointPolicy(idOrName string, policy *model.CheckpointPolicySpec) (model.Workload, error) {
+	if err := policy.Validate(); err != nil {
+		return model.Workload{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	workload, err := m.Get(idOrName)
+	if err != nil {
+		return model.Workload{}, err
+	}
+	// Removing the schedule while a standby waits for replicas would strand
+	// the standby at the checkpoint it already holds — the same silent-staleness
+	// lie the spec-level cross-check refuses, enforced here because a policy
+	// change on a live workload never re-runs spec validation.
+	if policy == nil && workload.Spec.FailoverPolicy != nil {
+		return model.Workload{}, errors.New("workload has a failover policy; remove it first (workload failover NAME --off) or keep a checkpoint schedule")
+	}
+	workload.Spec.CheckpointPolicy = policy
+	workload.Spec.UpdatedAt = time.Now().UTC()
+	return workload, m.records.Put(workload.Spec.ID, workload)
+}
+
+// SetFailoverPolicy attaches (or, with nil, removes) a workload's warm-standby
+// designation. The policy itself is inert data here: the replication that
+// follows it runs in the agent's policy loop, and this setter only persists
+// the operator's intent where the spec already lives.
+func (m *Manager) SetFailoverPolicy(idOrName string, policy *model.FailoverPolicySpec) (model.Workload, error) {
+	if err := policy.Validate(); err != nil {
+		return model.Workload{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	workload, err := m.Get(idOrName)
+	if err != nil {
+		return model.Workload{}, err
+	}
+	if policy != nil && workload.Spec.CheckpointPolicy == nil {
+		return model.Workload{}, errors.New("failover policy requires a checkpoint policy: without periodic checkpoints nothing would replicate to the standby")
+	}
+	workload.Spec.FailoverPolicy = policy
+	workload.Spec.UpdatedAt = time.Now().UTC()
+	return workload, m.records.Put(workload.Spec.ID, workload)
 }
 
 func (m *Manager) Get(idOrName string) (model.Workload, error) {
@@ -287,8 +345,22 @@ func (m *Manager) Stop(idOrName string, timeout time.Duration) (model.Workload, 
 	process := *workload.Process
 	m.stopping[workload.Spec.ID] = true
 	m.mu.Unlock()
-	_ = syscall.Kill(-process.PGID, syscall.SIGCONT)
-	if err := syscall.Kill(-process.PGID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+	// A checkpointed tree sits stopped where CRIU left it: SIGTERM only
+	// queues behind the stop and burns the whole grace period, and resuming
+	// it with SIGCONT first would let the frozen rollback copy execute. The
+	// checkpoint's data is already durable in the chunk store, so it is
+	// killed outright — SIGKILL is delivered to stopped processes directly.
+	terminate := syscall.SIGTERM
+	if workload.Status == model.WorkloadCheckpointed {
+		terminate = syscall.SIGKILL
+		// A tree CRIU left stopped may also sit in a frozen cgroup, where
+		// even SIGKILL stays pending until the freezer opens. Thaw first
+		// so the kill is delivered, not queued.
+		_ = m.cgroups.Thaw(workload.Spec.ID)
+	} else {
+		_ = syscall.Kill(-process.PGID, syscall.SIGCONT)
+	}
+	if err := syscall.Kill(-process.PGID, terminate); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return model.Workload{}, err
 	}
 	deadline := time.Now().Add(timeout)
@@ -312,8 +384,21 @@ func (m *Manager) Stop(idOrName string, timeout time.Duration) (model.Workload, 
 	if err := m.records.Put(workload.Spec.ID, workload); err != nil {
 		return model.Workload{}, err
 	}
-	_ = m.cgroups.Remove(workload.Spec.ID)
+	m.removeCgroup(workload.Spec.ID)
 	return workload, nil
+}
+
+// removeCgroup tears down the workload's cgroup directory and reports what
+// happened: an occupied directory is another tenant's, not a failure.
+func (m *Manager) removeCgroup(workloadID string) {
+	if err := m.cgroups.Remove(workloadID); err != nil {
+		if errors.Is(err, ErrCgroupOccupied) {
+			m.logger.Debug("workload cgroup left in place — it still holds processes",
+				"workload_id", workloadID)
+			return
+		}
+		m.logger.Debug("remove workload cgroup", "workload_id", workloadID, "error", err)
+	}
 }
 
 // Retire marks a workload's process as intentionally ended — the agent is
@@ -579,7 +664,7 @@ func (m *Manager) wait(id string, startTicks uint64, command *exec.Cmd, logFile 
 	if putErr := m.records.Put(id, workload); putErr != nil {
 		m.logger.Error("persist workload exit", "workload_id", id, "error", putErr)
 	}
-	_ = m.cgroups.Remove(id)
+	m.removeCgroup(id)
 	m.logger.Info("workload exited", "workload_id", id, "exit_code", exitCode, "status", workload.Status)
 }
 

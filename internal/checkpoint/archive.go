@@ -17,17 +17,26 @@ import (
 	"shift.dev/shift/internal/model"
 )
 
-func captureDirectory(ctx context.Context, store *chunkstore.Store, workloadID, assetName, path string, exclusions []string, restoreOrder int) (chunkstore.PutResult, error) {
-	parent := filepath.Dir(path)
-	base := filepath.Base(path)
+// captureDirectory archives one or more entries of a directory tree into the
+// chunk store. Bases name archive members relative to root; a CRIU image chain
+// is captured as several sibling bases because its image sets reference each
+// other through parent symlinks and must never be flattened into one
+// directory. Exclusions are matched against base-relative member paths.
+func captureDirectory(ctx context.Context, store *chunkstore.Store, workloadID, assetName, root string, bases []string, exclusions []string, restoreOrder int) (chunkstore.PutResult, error) {
+	if len(bases) == 0 {
+		return chunkstore.PutResult{}, errors.New("asset " + assetName + " has no archive bases")
+	}
 	args := []string{
 		"--create", "--format=pax", "--numeric-owner", "--acls", "--xattrs", "--xattrs-include=*", "--sparse",
-		"--one-file-system", "--directory", parent,
+		"--one-file-system", "--directory", root,
 	}
-	for _, exclusion := range exclusions {
-		args = append(args, "--exclude", filepath.ToSlash(filepath.Join(base, exclusion)))
+	for _, base := range bases {
+		for _, exclusion := range exclusions {
+			args = append(args, "--exclude", filepath.ToSlash(filepath.Join(base, exclusion)))
+		}
 	}
-	args = append(args, "--", base)
+	args = append(args, "--")
+	args = append(args, bases...)
 	command := exec.CommandContext(ctx, "tar", args...)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
@@ -47,7 +56,7 @@ func captureDirectory(ctx context.Context, store *chunkstore.Store, workloadID, 
 		return chunkstore.PutResult{}, storeErr
 	}
 	if waitErr != nil {
-		return chunkstore.PutResult{}, fmt.Errorf("archive %s: %w: %s", path, waitErr, strings.TrimSpace(stderr.String()))
+		return chunkstore.PutResult{}, fmt.Errorf("archive %s: %w: %s", assetName, waitErr, strings.TrimSpace(stderr.String()))
 	}
 	return result, nil
 }
@@ -86,51 +95,28 @@ func extractDirectory(ctx context.Context, store *chunkstore.Store, workloadID s
 	return nil
 }
 
-// mergeDirectory copies files that are absent from destination. It is used to
-// make a CRIU final dump self-contained after a pre-dump: files emitted by the
-// final dump win, while unchanged image files are inherited from the pre-dump.
-func mergeDirectory(source, destination string) error {
-	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+// directoryBytes sums the regular files under a directory, skipping CRIU's
+// "work" scratch directory (it holds the pass log, not image data). For a
+// pre-dump pass this is the dirty-memory delta that pass carried — the
+// signal the iterative pre-copy loop converges on.
+func directoryBytes(root string) int64 {
+	total := int64(0)
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		relative, err := filepath.Rel(source, path)
-		if err != nil {
-			return err
-		}
-		if relative == "." {
-			return nil
-		}
-		target := filepath.Join(destination, relative)
 		if entry.IsDir() {
-			return os.MkdirAll(target, 0o700)
-		}
-		if _, err := os.Lstat(target); err == nil {
+			if entry.Name() == "work" && path == filepath.Join(root, "work") {
+				return filepath.SkipDir
+			}
 			return nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			link, err := os.Readlink(path)
-			if err != nil {
-				return err
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-				return err
-			}
-			return os.Symlink(link, target)
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-			return err
-		}
-		// CRIU image files are written once and never modified, so cloning
-		// them copy-on-write where the filesystem allows is safe and turns
-		// the pre-dump merge into a metadata operation on btrfs and xfs.
-		if _, err := filesystem.CloneFile(path, target); err != nil {
-			return err
+		if info, err := entry.Info(); err == nil && info.Mode().IsRegular() {
+			total += info.Size()
 		}
 		return nil
 	})
+	return total
 }
 
 // materializeRoot moves a staged, extracted workload root into its final

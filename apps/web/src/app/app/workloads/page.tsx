@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "@/lib/store";
 import { api } from "@/lib/api";
 import { StateObject } from "@/components/state";
+import { MigrateDialog } from "@/components/migrate-dialog";
 import { formatBytes, cn } from "@/lib/utils";
 import type { AgentAction } from "@/lib/types";
 import Link from "next/link";
@@ -24,6 +25,7 @@ export default function WorkloadsPage() {
   const queryClient = useQueryClient();
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [migrating, setMigrating] = useState<string | null>(null);
 
   const workloadsQuery = useQuery({ queryKey: ["workloads", orgId], queryFn: () => api.listWorkloads(orgId), enabled: !!orgId });
   const machinesQuery = useQuery({ queryKey: ["machines", orgId], queryFn: () => api.listMachines(orgId), enabled: !!orgId });
@@ -53,7 +55,9 @@ export default function WorkloadsPage() {
   };
 
   const workloads = workloadsQuery.data || [];
-  const machineMap = new Map((machinesQuery.data || []).map((m) => [m.machine_id, m]));
+  const machines = machinesQuery.data || [];
+  const machineMap = new Map(machines.map((m) => [m.machine_id, m]));
+  const migrateTarget = migrating ? workloads.find((w) => w.id === migrating) : null;
 
   return (
     <div className="max-w-6xl mx-auto px-5 md:px-10 py-10">
@@ -118,9 +122,13 @@ export default function WorkloadsPage() {
 
                 {/* actions */}
                 <div className="flex items-center gap-1.5">
-                  <Link href={`/app/workloads/${w.id}`} className="font-mono text-[10px] tracking-[0.12em] text-bg bg-accent px-3 py-1.5 hover:bg-accent-dim transition-colors">
+                  <button
+                    disabled={!w.machine_id || command.isPending}
+                    onClick={() => setMigrating(w.id)}
+                    className="font-mono text-[10px] tracking-[0.12em] text-bg bg-accent px-3 py-1.5 hover:bg-accent-dim transition-colors disabled:opacity-30"
+                  >
                     MOVE
-                  </Link>
+                  </button>
                   {actions.filter((a) => a.states.includes(status)).map((a) => (
                     <button
                       key={a.key}
@@ -139,6 +147,14 @@ export default function WorkloadsPage() {
             );
           })}
         </div>
+      )}
+
+      {migrateTarget && (
+        <MigrateDialog
+          workload={migrateTarget}
+          machines={machines}
+          onClose={() => setMigrating(null)}
+        />
       )}
     </div>
   );

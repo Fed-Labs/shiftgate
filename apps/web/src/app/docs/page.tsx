@@ -102,11 +102,11 @@ export default function DocsIndexPage() {
         {/* Quick install */}
         <div className="mb-16 rounded-lg border border-border bg-bg-elevated p-6">
           <p className="text-xs font-mono uppercase tracking-wider text-text-muted mb-3">
-            Build and verify
+            Quick install
           </p>
           <pre className="code-block text-sm">
-            <code>{`make build
-./bin/shiftgate doctor`}</code>
+            <code>{`curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh | bash
+shiftgate doctor`}</code>
           </pre>
         </div>
 

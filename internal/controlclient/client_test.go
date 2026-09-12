@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"shift.dev/shift/internal/config"
 )
 
 // The tests here drive the same flows the desktop client exercises: login
@@ -198,5 +200,33 @@ func TestFailedRefreshClearsTheStore(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("token store was not cleared after a failed refresh: %v", err)
+	}
+}
+
+// TestNewDefaultsToThePlatformControlPlane pins the hosted behavior: an empty
+// URL means the platform's control plane, the way a hosted service's SDK
+// carries its endpoint, so operators never have to name it.
+func TestNewDefaultsToThePlatformControlPlane(t *testing.T) {
+	client, err := New("", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.URL() != config.DefaultControlPlaneURL {
+		t.Fatalf("client URL = %q, want the platform default %q", client.URL(), config.DefaultControlPlaneURL)
+	}
+
+	// An explicit URL still wins — private control planes keep working — and
+	// keeps working without a trailing slash.
+	client, err = New("https://control.example.test/", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.URL() != "https://control.example.test" {
+		t.Fatalf("client URL = %q, want the explicit URL", client.URL())
+	}
+
+	// A URL without a scheme stays a configuration error, not a runtime one.
+	if _, err := New("control.example.test", time.Second); err == nil {
+		t.Fatal("expected an error for a URL without a scheme")
 	}
 }

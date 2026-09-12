@@ -309,6 +309,7 @@ func insertAudit(ctx context.Context, tx pgx.Tx, input AuditInput) error {
 
 var ErrEntitlementExceeded = errors.New("organization machine entitlement is exhausted")
 var ErrStorageEntitlementExceeded = errors.New("organization checkpoint storage entitlement is exhausted")
+var ErrEntitlementMissing = errors.New("organization entitlement row was not found")
 var ErrOwnerRoleImmutable = errors.New("organization owner role cannot be changed through the member endpoint")
 var ErrCheckpointMachineMismatch = errors.New("checkpoint machine does not match the workload assignment")
 var ErrCheckpointParentInvalid = errors.New("incremental checkpoint parent is unavailable or belongs to another workload")

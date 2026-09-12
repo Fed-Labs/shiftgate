@@ -3,7 +3,8 @@
 The versioned control-plane contract is [OpenAPI](../api/openapi/shift.yaml). It covers
 authentication (password and single sign-on), organizations, machines, workload metadata,
 checkpoints, migration jobs, migration events, API keys, usage, entitlements, the plan
-catalog, checkout and billing portal, audit events, retention policies, health, Stripe
+catalog, checkout and billing portal, audit events, retention policies, hosted checkpoint
+storage (status, agent credential issuance, usage reconciliation), health, Stripe
 webhooks, and SCIM v2 user provisioning.
 
 API keys are opaque `Bearer` credentials. They are bound to the organization in which they
@@ -32,6 +33,27 @@ filtered by the caller's ownership of the source workload.
 `POST /v1/checkpoints/{id}/mirror` retries publication of a checkpoint already committed
 to the agent's encrypted local repository. The operation is idempotent and does not alter
 the workload runtime state.
+
+`POST /v1/workloads/{id}/policy` arms or changes a periodic checkpoint policy on the
+workload: `interval_seconds` (floor 10) and optional `keep_last` retention count. A
+missing or non-positive interval removes the policy. While the workload runs, the agent
+takes a full `leave_running` checkpoint every interval and, with `keep_last`, prunes the
+oldest snapshots beyond the count — never an ancestor a kept checkpoint still needs.
+The schedule is measured from the newest checkpoint, so it survives agent restarts, and
+a checkpoint already in flight for the workload makes a concurrent create fail with
+`422 CHECKPOINT_FAILED` rather than queue. The response is the updated workload; an
+impossible policy is `422 POLICY_INVALID`.
+
+`POST /v1/migrations/preflight` runs a migration's discovery and validation without
+creating one. The request is the same shape as migration creation; the agent reaches the
+destination over the peer channel, inspects the source, runs the same compatibility
+check the migration's validate stage would run on the same inputs, and returns both
+machine profiles, the resolved destination identity, the compatibility report, and the
+network plan the migration would apply. Nothing is frozen, moved, or recorded. An
+unreachable destination is `502 DESTINATION_UNREACHABLE`; a destination that resolves to
+the source machine or to a machine other than the requested id is `422
+DESTINATION_IS_SOURCE` / `422 DESTINATION_IDENTITY_MISMATCH` — the same codes a real
+migration would fail with.
 
 ## Fleet capability queries and retention
 

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"shift.dev/shift/internal/chunkstore"
@@ -27,11 +28,7 @@ type CreateOptions struct {
 	ParentID     string
 	LeaveRunning bool
 	TCPState     bool
-	// PreCopy runs a CRIU pre-dump while the workload is still running and
-	// uses those images as the parent for the final dump. It is the CRIU
-	// primitive used by live migration; the final dump remains authoritative.
-	PreCopy bool
-	Timeout time.Duration
+	Timeout      time.Duration
 }
 
 type Engine interface {
@@ -43,21 +40,23 @@ type Engine interface {
 }
 
 type Service struct {
-	stateDir    string
-	runtime     *shiftruntime.Manager
-	identity    *identity.Identity
-	inventory   *linuxplatform.Inventory
-	chunks      *chunkstore.Store
-	repository  *Repository
-	mirror      *Mirror
-	criu        Engine
-	network     DestinationNetwork
-	diagnostics *observability.Diagnostics
-	logger      *slog.Logger
+	stateDir        string
+	runtime         *shiftruntime.Manager
+	identity        *identity.Identity
+	inventory       *linuxplatform.Inventory
+	chunks          *chunkstore.Store
+	repository      *Repository
+	mirror          *Mirror
+	criu            Engine
+	network         DestinationNetwork
+	diagnostics     *observability.Diagnostics
+	logger          *slog.Logger
+	createInFlight  map[string]struct{}
+	createInFlightM sync.Mutex
 }
 
 func NewService(stateDir string, runtimeManager *shiftruntime.Manager, machineIdentity *identity.Identity, inventory *linuxplatform.Inventory, chunks *chunkstore.Store, repository *Repository, criu Engine, logger *slog.Logger) *Service {
-	return &Service{stateDir: stateDir, runtime: runtimeManager, identity: machineIdentity, inventory: inventory, chunks: chunks, repository: repository, criu: criu, logger: logger}
+	return &Service{stateDir: stateDir, runtime: runtimeManager, identity: machineIdentity, inventory: inventory, chunks: chunks, repository: repository, criu: criu, logger: logger, createInFlight: make(map[string]struct{})}
 }
 
 func (s *Service) SetMirror(mirror *Mirror) {
@@ -92,6 +91,22 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 		s.diagnostics.CheckpointFinished(observability.OutcomeSuccess)
 	}()
 	started := time.Now().UTC()
+	// A checkpoint freezes the workload and mutates its runtime state; two
+	// concurrent ones on the same workload would corrupt both. The guard
+	// covers every caller — the API, a fork of a running source, a migration,
+	// and the periodic policy scheduler — and turns a race into a refusal.
+	s.createInFlightM.Lock()
+	if _, busy := s.createInFlight[workloadID]; busy {
+		s.createInFlightM.Unlock()
+		return model.CheckpointManifest{}, fmt.Errorf("a checkpoint of workload %s is already in progress", workloadID)
+	}
+	s.createInFlight[workloadID] = struct{}{}
+	s.createInFlightM.Unlock()
+	defer func() {
+		s.createInFlightM.Lock()
+		delete(s.createInFlight, workloadID)
+		s.createInFlightM.Unlock()
+	}()
 	workload, err := s.runtime.Get(workloadID)
 	if err != nil {
 		return model.CheckpointManifest{}, err
@@ -115,9 +130,6 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 	}
 	if options.Kind == model.CheckpointFull && options.ParentID != "" {
 		return model.CheckpointManifest{}, errors.New("full checkpoint cannot have a parent checkpoint")
-	}
-	if options.PreCopy && options.ParentID != "" {
-		return model.CheckpointManifest{}, errors.New("pre-copy and a retained checkpoint parent cannot be combined")
 	}
 	ctx, cancel := commandTimeout(parent, options.Timeout)
 	defer cancel()
@@ -158,40 +170,36 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 		}
 		parentImages = filepath.Join(parentImages, "images")
 	}
-	preCopyImages := ""
-	if options.PreCopy && originallyRunning {
-		preCopyImages = filepath.Join(staging, "precopy-images")
-		if err := os.MkdirAll(preCopyImages, 0o700); err != nil {
-			return model.CheckpointManifest{}, err
-		}
-		if err := s.criu.PreDump(ctx, DumpOptions{
-			PID: workload.Process.PID, ImagesDirectory: preCopyImages,
-			TCPState: options.TCPState, ShellJob: true, FileLocks: true,
-			ExternalUNIX: true, ManageCgroups: "soft",
-		}); err != nil {
-			return model.CheckpointManifest{}, fmt.Errorf("criu pre-dump: %w", err)
-		}
-		parentImages = preCopyImages
-	}
+	freezeStartedAt := time.Time{}
 	if originallyRunning {
 		if _, err := s.runtime.Pause(workload.Spec.ID); err != nil {
 			return model.CheckpointManifest{}, fmt.Errorf("freeze workload: %w", err)
 		}
+		// The workload provably stopped executing at this instant; the
+		// timestamp travels in the manifest so downtime is measured from
+		// the real freeze, never from the checkpoint's start — which for a
+		// live migration includes pre-copy passes that ran while the
+		// workload was still running.
+		freezeStartedAt = time.Now().UTC()
 	}
 	if err := s.criu.Dump(ctx, DumpOptions{
 		PID: workload.Process.PID, ImagesDirectory: imagesDirectory, ParentImages: parentImages,
 		TCPState: options.TCPState, ShellJob: true, FileLocks: true, ExternalUNIX: true,
 		LeaveStopped: true, ManageCgroups: "soft",
+		// A checkpoint that leaves the workload running can become the parent
+		// of a later incremental checkpoint, so its dump must arm the memory
+		// tracker — CRIU refuses to diff against an untracked parent.
+		TrackMemory: options.LeaveRunning,
 	}); err != nil {
 		return model.CheckpointManifest{}, err
 	}
-	if parentImages != "" {
-		// CRIU's final image set references unchanged pages in its parent.
-		// Package both sets so restore remains self-contained on another agent.
-		if err := mergeDirectory(parentImages, imagesDirectory); err != nil {
-			return model.CheckpointManifest{}, fmt.Errorf("merge CRIU parent images: %w", err)
-		}
-	}
+	// The final image set references unchanged pages in its parent through the
+	// parent symlink CRIU writes beside it, so the sibling image sets must
+	// travel with it: pre-copy passes are packaged alongside images/ below,
+	// and a retained parent chain is re-materialized at restore time. The sets
+	// can never be overlaid into one directory — CRIU image files collide by
+	// name across a chain, and the colliding older file is exactly the one
+	// restore still needs.
 	// The filesystem asset must describe the workload root exactly as it was
 	// while frozen. Where the root sits on a snapshot-capable filesystem,
 	// SHIFT takes an atomic copy-on-write snapshot and reads the archive from
@@ -252,11 +260,16 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 		resumedEarly = true
 		resumeOnFailure = false
 	}
-	imageResult, err := captureDirectory(ctx, s.chunks, workload.Spec.ID, "process-state", imagesDirectory, nil, 20)
+	// The process-state asset carries the checkpoint's own image set. An
+	// incremental checkpoint's asset stays delta-only; restore materializes
+	// its ancestor chain beside it. A live-migration checkpoint never comes
+	// through here — its pre-copy passes are packaged as separate assets by
+	// the LiveSession as each pass completes.
+	imageResult, err := captureDirectory(ctx, s.chunks, workload.Spec.ID, "process-state", staging, []string{filepath.Base(imagesDirectory)}, []string{"work"}, 20)
 	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
-	filesystemResult, err := captureDirectory(ctx, s.chunks, workload.Spec.ID, "filesystem-root", captureRoot, rootExclusions, 10)
+	filesystemResult, err := captureDirectory(ctx, s.chunks, workload.Spec.ID, "filesystem-root", filepath.Dir(captureRoot), []string{filepath.Base(captureRoot)}, rootExclusions, 10)
 	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
@@ -281,7 +294,7 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 		return model.CheckpointManifest{}, err
 	}
 	assets := []model.AssetManifest{filesystemResult.Asset, imageResult.Asset}
-	metrics := model.CheckpointMetrics{StartedAt: started}
+	metrics := model.CheckpointMetrics{StartedAt: started, FreezeStartedAt: freezeStartedAt}
 	for _, asset := range assets {
 		metrics.PlainBytes += asset.PlainSize
 		metrics.StoredBytes += asset.StoredSize
@@ -295,7 +308,7 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 		ID: checkpointID, ParentID: options.ParentID, Kind: options.Kind,
 		Workload: workload.Spec, SourceIdentity: s.identity.Machine, SourceMachine: machine,
 		CreatedAt: started, Assets: assets, RequiredBytes: metrics.PlainBytes, Metrics: metrics,
-		Engine:         model.CheckpointEngineInfo{Name: "CRIU", Version: criuVersion, LeaveRunning: options.LeaveRunning, ParentImages: parentImages != "", PreCopy: options.PreCopy, TCPState: options.TCPState, ShellJob: true, FileLocks: true},
+		Engine:         model.CheckpointEngineInfo{Name: "CRIU", Version: criuVersion, LeaveRunning: options.LeaveRunning, ParentImages: parentImages != "", TCPState: options.TCPState, ShellJob: true, FileLocks: true},
 		StateInventory: stateInventory(options.TCPState), DeviceNeeds: workload.Spec.Resources.GPUs,
 		Filesystem:      capture,
 		Dependencies:    discovery.Dependencies,
@@ -341,43 +354,20 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 	return manifest, nil
 }
 
-// materializeParentImages reconstructs a CRIU image chain in oldest-first
-// order. Incremental image archives only contain changed files; extracting
-// each ancestor before its child gives CRIU a complete image directory.
+// materializeParentImages reconstructs the parent checkpoint's CRIU image tree
+// under destination: the parent's own image set at destination/images and each
+// older ancestor nested one parent-images/ level deeper — the layout the
+// parent symlinks inside those image sets point at, so the incremental dump
+// CRIU is about to run can follow the whole chain.
 func (s *Service) materializeParentImages(ctx context.Context, workloadID, parentID, destination string) error {
-	var chain []model.CheckpointManifest
-	seen := make(map[string]struct{})
-	for currentID := parentID; currentID != ""; {
-		if _, exists := seen[currentID]; exists {
-			return errors.New("checkpoint parent chain contains a cycle")
-		}
-		seen[currentID] = struct{}{}
-		if len(chain) >= 256 {
-			return errors.New("checkpoint parent chain exceeds 256 entries")
-		}
-		manifest, err := s.repository.Load(currentID)
-		if err != nil {
-			return fmt.Errorf("load parent checkpoint %s: %w", currentID, err)
-		}
-		if manifest.Workload.ID != workloadID {
-			return fmt.Errorf("parent checkpoint %s belongs to workload %s", currentID, manifest.Workload.ID)
-		}
-		chain = append(chain, manifest)
-		currentID = manifest.ParentID
+	parent, err := s.repository.Load(parentID)
+	if err != nil {
+		return fmt.Errorf("load parent checkpoint %s: %w", parentID, err)
 	}
-	for index := len(chain) - 1; index >= 0; index-- {
-		asset, ok := assetByName(chain[index].Assets, "process-state")
-		if !ok {
-			return fmt.Errorf("parent checkpoint %s has no process-state asset", chain[index].ID)
-		}
-		if err := s.chunks.ValidateAsset(ctx, workloadID, asset); err != nil {
-			return fmt.Errorf("validate parent process state %s: %w", chain[index].ID, err)
-		}
-		if err := extractDirectory(ctx, s.chunks, workloadID, asset, destination); err != nil {
-			return fmt.Errorf("extract parent process state %s: %w", chain[index].ID, err)
-		}
+	if parent.Workload.ID != workloadID {
+		return fmt.Errorf("parent checkpoint %s belongs to workload %s", parentID, parent.Workload.ID)
 	}
-	return nil
+	return materializeProcessChain(ctx, s.repository, s.chunks, parent, destination)
 }
 
 func (s *Service) Load(id string) (model.CheckpointManifest, error) {
@@ -386,6 +376,104 @@ func (s *Service) Load(id string) (model.CheckpointManifest, error) {
 
 func (s *Service) List(workloadID string) []Summary {
 	return s.repository.List(workloadID)
+}
+
+// Delete removes a checkpoint from the local repository. It refuses while any
+// other retained checkpoint of the workload still needs it as an ancestor: an
+// incremental checkpoint's images carry only a delta, so deleting its parent
+// would quietly make the survivor unrestorable. Delete the descendant first.
+// Chunks are content addressed and shared between checkpoints, so they are
+// reclaimed by garbage collection rather than here; removing the manifest is
+// what makes a checkpoint unreachable.
+func (s *Service) Delete(id string) error {
+	manifest, err := s.repository.Load(id)
+	if err != nil {
+		return err
+	}
+	if err := s.deleteUnlessNeeded(manifest); err != nil {
+		return err
+	}
+	return s.repository.Delete(id)
+}
+
+// deleteUnlessNeeded walks every other checkpoint of the workload and refuses
+// when one of them reaches the candidate through its parent chain.
+func (s *Service) deleteUnlessNeeded(manifest model.CheckpointManifest) error {
+	byID := make(map[string]Summary)
+	for _, summary := range s.repository.List(manifest.Workload.ID) {
+		byID[summary.ID] = summary
+	}
+	for _, summary := range byID {
+		if summary.ID == manifest.ID {
+			continue
+		}
+		hops := 0
+		for parentID := summary.ParentID; parentID != ""; {
+			hops++
+			if hops > 256 {
+				return fmt.Errorf("checkpoint parent chain of %s exceeds 256 entries", summary.ID)
+			}
+			if parentID == manifest.ID {
+				return fmt.Errorf("checkpoint %s is still the parent of retained checkpoint %s", manifest.ID, summary.ID)
+			}
+			parent, ok := byID[parentID]
+			if !ok {
+				// The chain is already broken higher up; that is a fact to
+				// report elsewhere, not a reason to widen the damage.
+				break
+			}
+			parentID = parent.ParentID
+		}
+	}
+	return nil
+}
+
+// PruneWorkload deletes the workload's oldest checkpoints until at most
+// keepLast remain, returning the deleted ids. A checkpoint an older
+// descendant still needs survives even when that leaves more than keepLast
+// behind: keeping a count would mean making a retained incremental
+// checkpoint unrestorable. Mirrored objects in the object store are
+// content-addressed and shared; local pruning does not delete them there.
+func (s *Service) PruneWorkload(workloadID string, keepLast int) ([]string, error) {
+	if keepLast < 0 {
+		return nil, errors.New("keep count cannot be negative")
+	}
+	summaries := s.repository.List(workloadID)
+	if len(summaries) <= keepLast {
+		return nil, nil
+	}
+	byID := make(map[string]Summary, len(summaries))
+	for _, summary := range summaries {
+		byID[summary.ID] = summary
+	}
+	// Retention protects more than the newest keepLast ids: every ancestor
+	// those still reference is load-bearing and must survive too.
+	protected := make(map[string]bool)
+	for _, summary := range summaries[:keepLast] {
+		protected[summary.ID] = true
+		for parentID := summary.ParentID; parentID != ""; {
+			parent, ok := byID[parentID]
+			if !ok {
+				break
+			}
+			if protected[parentID] {
+				break
+			}
+			protected[parentID] = true
+			parentID = parent.ParentID
+		}
+	}
+	deleted := []string{}
+	for _, summary := range summaries[keepLast:] {
+		if protected[summary.ID] {
+			continue
+		}
+		if err := s.Delete(summary.ID); err != nil {
+			return deleted, err
+		}
+		deleted = append(deleted, summary.ID)
+	}
+	return deleted, nil
 }
 
 func (s *Service) Import(manifest model.CheckpointManifest) error {

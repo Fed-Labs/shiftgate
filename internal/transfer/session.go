@@ -18,11 +18,29 @@ const (
 	SessionKeyReady      SessionState = "KEY_READY"
 	SessionManifestReady SessionState = "MANIFEST_READY"
 	SessionVerified      SessionState = "VERIFIED"
-	SessionRestored      SessionState = "RESTORED"
-	SessionCommitted     SessionState = "COMMITTED"
-	SessionRolledBack    SessionState = "ROLLED_BACK"
-	SessionFailed        SessionState = "FAILED"
+	// SessionHeld is a replication session the standby accepted and parked:
+	// its manifest is imported, its chunks are stored, and the checkpoint is
+	// restorable at any time. The standby's duty record — not the session —
+	// is the operational truth from here on; the session is the transport
+	// envelope and expires on its own clock.
+	SessionHeld       SessionState = "HELD"
+	SessionRestored   SessionState = "RESTORED"
+	SessionCommitted  SessionState = "COMMITTED"
+	SessionRolledBack SessionState = "ROLLED_BACK"
+	SessionFailed     SessionState = "FAILED"
 )
+
+// PurposeReplication marks a session as a warm-standby replication push
+// rather than a migration. The empty purpose means a migration.
+const PurposeReplication = "replication"
+
+// validPurpose reports whether a reserve request's purpose is one this
+// build understands. An unknown purpose is refused rather than treated as a
+// migration: a future purpose this agent cannot honor must fail loudly, not
+// silently mis-handle.
+func validPurpose(purpose string) bool {
+	return purpose == "" || purpose == PurposeReplication
+}
 
 type Session struct {
 	ID              string       `json:"id"`
@@ -34,10 +52,23 @@ type Session struct {
 	EstimatedBytes  int64        `json:"estimated_bytes"`
 	ReceivedBytes   int64        `json:"received_bytes"`
 	RestoreID       string       `json:"restore_id,omitempty"`
-	CreatedAt       time.Time    `json:"created_at"`
-	UpdatedAt       time.Time    `json:"updated_at"`
-	ExpiresAt       time.Time    `json:"expires_at"`
-	FailureReason   string       `json:"failure_reason,omitempty"`
+	// Purpose distinguishes a migration session from a warm-standby
+	// replication push. Empty means a migration.
+	Purpose string `json:"purpose,omitempty"`
+	// SourceAgentURL is the replication source's advertised peer listener,
+	// recorded when the standby accepts a held session so its supervisor
+	// knows where to probe the source's liveness. Empty for migrations, and
+	// possibly empty for a replication whose source advertises no dialable
+	// URL — such a standby can never confirm death automatically and only an
+	// operator-commanded failover is possible.
+	SourceAgentURL string `json:"source_agent_url,omitempty"`
+	// KeepLast is the standby retention the source asked for with its held
+	// replication session. Zero keeps every replicated checkpoint.
+	KeepLast      int       `json:"keep_last,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	FailureReason string    `json:"failure_reason,omitempty"`
 }
 
 type Sessions struct {
@@ -68,9 +99,15 @@ func (s *Sessions) Reserve(session Session) (Session, error) {
 	if session.ID == "" || session.SourceMachineID == "" || session.WorkloadID == "" {
 		return Session{}, errors.New("session id, source machine, and workload are required")
 	}
+	if !validPurpose(session.Purpose) {
+		return Session{}, fmt.Errorf("unknown transfer purpose %q", session.Purpose)
+	}
 	if existing, err := s.records.Get(session.ID); err == nil {
 		if existing.SourceMachineID != session.SourceMachineID || existing.WorkloadID != session.WorkloadID {
 			return Session{}, errors.New("transfer id is already bound to another source or workload")
+		}
+		if existing.Purpose != session.Purpose {
+			return Session{}, errors.New("transfer id is already bound to another purpose")
 		}
 		return existing, nil
 	}

@@ -79,7 +79,7 @@ func TestE2EShellCheckpointRestore(t *testing.T) {
 		t.Fatalf("counter still running after stop: %d → %d", baseline, after)
 	}
 
-	record, err := agentProc.client.Restore(ctx, manifest.ID, 300)
+	record, err := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 300})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -100,6 +100,164 @@ func TestE2EShellCheckpointRestore(t *testing.T) {
 	if restored.Spec.ID != workload.Spec.ID {
 		t.Fatalf("restore created a different workload: %s", restored.Spec.ID)
 	}
+}
+
+// TestE2EIncrementalCheckpointRestores proves an incremental checkpoint —
+// whose CRIU image set only carries its delta against a retained parent —
+// restores through the materialized parent chain. The final image set
+// references unchanged pages in its parent through a symlink, so restore must
+// place the ancestor image sets beside it as sibling directories; overlaying
+// them into one directory would let their same-named page files shadow each
+// other and the restore would fail to find pages it needs.
+func TestE2EIncrementalCheckpointRestores(t *testing.T) {
+	requireE2E(t)
+	agentProc := startAgent(t, "incremental-agent")
+	root := t.TempDir()
+	script := filepath.Join(root, "run.sh")
+	if err := os.WriteFile(script, []byte(counterScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	workload := createWorkload(t, agentProc.client, "incremental-counter", root, script)
+	logPath := filepath.Join(root, "progress.log")
+	waitUntil(t, 30*time.Second, "counter to make progress", func() (bool, string) {
+		return fileLineCount(t, logPath) >= 2, fmt.Sprintf("lines=%d", fileLineCount(t, logPath))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	parent, err := agentProc.client.CreateCheckpoint(ctx, agentclient.CheckpointCreateRequest{
+		WorkloadID:   workload.Spec.ID,
+		LeaveRunning: func(v bool) *bool { return &v }(true),
+	})
+	if err != nil {
+		t.Fatalf("full checkpoint: %v", err)
+	}
+	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadRunning)
+	waitUntil(t, 30*time.Second, "counter to advance past the full checkpoint", func() (bool, string) {
+		return fileLineCount(t, logPath) >= 4, fmt.Sprintf("lines=%d", fileLineCount(t, logPath))
+	})
+
+	child, err := agentProc.client.CreateCheckpoint(ctx, agentclient.CheckpointCreateRequest{
+		WorkloadID:   workload.Spec.ID,
+		Kind:         model.CheckpointIncremental,
+		ParentID:     parent.ID,
+		LeaveRunning: func(v bool) *bool { return &v }(false),
+	})
+	if err != nil {
+		t.Fatalf("incremental checkpoint: %v", err)
+	}
+	if child.Kind != model.CheckpointIncremental || child.ParentID != parent.ID || !child.Engine.ParentImages {
+		t.Fatalf("unexpected incremental manifest: kind=%s parent=%s engine=%+v", child.Kind, child.ParentID, child.Engine)
+	}
+	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadCheckpointed)
+	baseline := fileLineCount(t, logPath)
+	time.Sleep(2500 * time.Millisecond)
+	if after := fileLineCount(t, logPath); after != baseline {
+		t.Fatalf("counter still running after checkpoint: %d → %d", baseline, after)
+	}
+
+	record, err := agentProc.client.Restore(ctx, child.ID, agentclient.RestoreRequest{TimeoutSeconds: 300})
+	if err != nil {
+		t.Fatalf("restore incremental checkpoint: %v", err)
+	}
+	if record.State != checkpoint.RestoreCommitted {
+		t.Fatalf("restore ended in %s (error: %s), want %s", record.State, record.Error, checkpoint.RestoreCommitted)
+	}
+	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadRunning)
+	waitUntil(t, 60*time.Second, "restored counter to write more lines", func() (bool, string) {
+		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
+	})
+}
+
+// TestE2EPeriodicCheckpointPolicy proves the agent's periodic-checkpoint
+// loop against real CRIU: a workload whose spec carries a policy is
+// checkpointed every interval while it keeps running, and retention
+// deletes the oldest snapshot once the kept count is exceeded. The first
+// checkpoint's disappearance from the list — while two newer ones exist —
+// is the pruning evidence.
+func TestE2EPeriodicCheckpointPolicy(t *testing.T) {
+	requireE2E(t)
+	agentProc := startAgent(t, "policy-agent")
+	root := t.TempDir()
+	script := filepath.Join(root, "run.sh")
+	if err := os.WriteFile(script, []byte(counterScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	workload := createWorkload(t, agentProc.client, "policed-counter", root, script)
+	logPath := filepath.Join(root, "progress.log")
+	waitUntil(t, 30*time.Second, "counter to make progress", func() (bool, string) {
+		return fileLineCount(t, logPath) >= 2, fmt.Sprintf("lines=%d", fileLineCount(t, logPath))
+	})
+	startLines := fileLineCount(t, logPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	policed, err := agentProc.client.SetCheckpointPolicy(ctx, workload.Spec.ID, 10, 2)
+	if err != nil {
+		t.Fatalf("set checkpoint policy: %v", err)
+	}
+	if policed.Spec.CheckpointPolicy == nil || policed.Spec.CheckpointPolicy.IntervalSeconds != 10 || policed.Spec.CheckpointPolicy.KeepLast != 2 {
+		t.Fatalf("policy was not applied: %+v", policed.Spec.CheckpointPolicy)
+	}
+
+	// The loop ticks every 5 seconds and snapshots every 10, so the first
+	// periodic checkpoint appears within roughly 15 seconds.
+	waitUntil(t, 90*time.Second, "first periodic checkpoint", func() (bool, string) {
+		summaries, err := agentProc.client.Checkpoints(ctx, workload.Spec.ID)
+		if err != nil {
+			return false, err.Error()
+		}
+		return len(summaries) >= 1, fmt.Sprintf("checkpoints=%d", len(summaries))
+	})
+	summaries, err := agentProc.client.Checkpoints(ctx, workload.Spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID := summaries[0].ID
+
+	// A second snapshot arrives one interval later; the third pushes the
+	// first past the retention count, so the first must disappear while
+	// two newer checkpoints remain.
+	waitUntil(t, 90*time.Second, "retention to replace the first checkpoint", func() (bool, string) {
+		summaries, err := agentProc.client.Checkpoints(ctx, workload.Spec.ID)
+		if err != nil {
+			return false, err.Error()
+		}
+		for _, summary := range summaries {
+			if summary.ID == firstID {
+				return false, fmt.Sprintf("checkpoints=%d, first still retained", len(summaries))
+			}
+		}
+		return len(summaries) == 2, fmt.Sprintf("checkpoints=%d", len(summaries))
+	})
+
+	summaries, err = agentProc.client.Checkpoints(ctx, workload.Spec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("retention must keep exactly two checkpoints, got %d", len(summaries))
+	}
+	for _, summary := range summaries {
+		if summary.Kind != model.CheckpointFull {
+			t.Fatalf("periodic checkpoints are full snapshots, got %s", summary.Kind)
+		}
+		if summary.CreatedAt.Before(policed.Spec.UpdatedAt) {
+			t.Fatalf("checkpoint %s predates the policy: %s", summary.ID, summary.CreatedAt)
+		}
+	}
+
+	// Policy checkpoints never stop the workload, and the workload must
+	// outlive several intervals of freezing and pruning.
+	running := waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadRunning)
+	if running.Status != model.WorkloadRunning {
+		t.Fatalf("workload must keep running under its policy: %s", running.Status)
+	}
+	waitUntil(t, 30*time.Second, "counter to keep advancing", func() (bool, string) {
+		return fileLineCount(t, logPath) > startLines+5, fmt.Sprintf("lines=%d start=%d", fileLineCount(t, logPath), startLines)
+	})
 }
 
 // TestE2EPythonProcess runs a real Python interpreter workload through
@@ -144,7 +302,7 @@ while True:
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadCheckpointed)
 	baseline := fileLineCount(t, logPath)
 
-	record, err := agentProc.client.Restore(ctx, manifest.ID, 300)
+	record, err := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 300})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -219,7 +377,7 @@ setInterval(() => {
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadCheckpointed)
 	baseline := fileLineCount(t, logPath)
 
-	record, err := agentProc.client.Restore(ctx, manifest.ID, 300)
+	record, err := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 300})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -334,7 +492,7 @@ http.server.HTTPServer(("127.0.0.1", %d), Handler).serve_forever()
 	}
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadCheckpointed)
 
-	record, err := agentProc.client.Restore(ctx, manifest.ID, 300)
+	record, err := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 300})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -423,7 +581,7 @@ wait
 	}
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadCheckpointed)
 
-	record, err := agentProc.client.Restore(ctx, manifest.ID, 300)
+	record, err := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 300})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -516,7 +674,7 @@ done
 	}
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadCheckpointed)
 
-	record, err := agentProc.client.Restore(ctx, manifest.ID, 300)
+	record, err := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 300})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}

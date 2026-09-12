@@ -58,7 +58,7 @@ func TestE2ECheckpointCorruptionDetected(t *testing.T) {
 
 	// Restore over corrupted state: it must fail, with the failure visible
 	// to the caller — not a hang, not a silent success.
-	_, restoreErr := agentProc.client.Restore(ctx, manifest.ID, 120)
+	_, restoreErr := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 120})
 	if restoreErr == nil {
 		t.Fatal("restore succeeded over corrupted state; corruption went undetected")
 	}

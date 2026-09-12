@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -122,6 +124,8 @@ type fakeS3 struct {
 	nextUpload    int
 	authorization string
 	amzDate       string
+	securityToken string
+	listToken     string
 }
 
 type handlerTransport struct {
@@ -154,7 +158,16 @@ func (server *fakeS3) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	defer server.mu.Unlock()
 	server.authorization = request.Header.Get("Authorization")
 	server.amzDate = request.Header.Get("X-Amz-Date")
+	server.securityToken = request.Header.Get("X-Amz-Security-Token")
 	key := strings.TrimPrefix(request.URL.Path, "/shift-test/")
+	if request.Method == http.MethodGet && hasRawQueryKey(request.URL.RawQuery, "list-type") {
+		// The request prefix is already fully qualified (store prefix + the
+		// caller's prefix); match and emit whole keys, like real S3. The
+		// client strips the store prefix from the keys it reports.
+		server.listToken = request.URL.Query().Get("continuation-token")
+		server.writeListPage(writer, request.URL.Query().Get("prefix"))
+		return
+	}
 	uploadID := request.URL.Query().Get("uploadId")
 	if request.Method == http.MethodPost && hasRawQueryKey(request.URL.RawQuery, "uploads") {
 		server.nextUpload++
@@ -251,13 +264,61 @@ func (server *fakeS3) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	}
 }
 
+// writeListPage answers a ListObjectsV2 request. Keys are page-sized from the
+// sorted set so the client's continuation-token loop is actually exercised:
+// every page carries at most two objects and a token for the rest.
+func (server *fakeS3) writeListPage(writer http.ResponseWriter, prefix string) {
+	token := server.listToken
+	keys := make([]string, 0, len(server.objects))
+	for key := range server.objects {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	sortStrings(keys)
+	if token != "" {
+		filtered := keys[:0]
+		for _, key := range keys {
+			if key > token {
+				filtered = append(filtered, key)
+			}
+		}
+		keys = filtered
+	}
+	result := struct {
+		XMLName               xml.Name       `xml:"ListBucketResult"`
+		Contents              []fakeS3Object `xml:"Contents"`
+		IsTruncated           bool           `xml:"IsTruncated"`
+		NextContinuationToken string         `xml:"NextContinuationToken"`
+	}{}
+	page := 2
+	if len(keys) < page {
+		page = len(keys)
+	}
+	for _, key := range keys[:page] {
+		result.Contents = append(result.Contents, fakeS3Object{Key: key, Size: int64(len(server.objects[key].content)), LastModified: "2026-09-06T12:00:00.000Z"})
+	}
+	if len(keys) > page {
+		result.IsTruncated = true
+		result.NextContinuationToken = keys[page-1]
+	}
+	writeXML(writer, http.StatusOK, result)
+}
+
 type fakeS3Part struct {
 	Number int    `xml:"PartNumber"`
 	ETag   string `xml:"ETag"`
 	Size   int64  `xml:"Size"`
 }
 
+type fakeS3Object struct {
+	Key          string `xml:"Key"`
+	Size         int64  `xml:"Size"`
+	LastModified string `xml:"LastModified"`
+}
+
 func hasRawQueryKey(rawQuery, key string) bool {
+
 	for _, part := range strings.Split(rawQuery, "&") {
 		if part == key || strings.HasPrefix(part, key+"=") {
 			return true
@@ -285,5 +346,122 @@ func sortInts(values []int) {
 		for current := index; current > 0 && values[current] < values[current-1]; current-- {
 			values[current], values[current-1] = values[current-1], values[current]
 		}
+	}
+}
+
+func sortStrings(values []string) {
+	sort.Strings(values)
+}
+
+func TestS3ListPrefixPagesAndStripsPrefix(t *testing.T) {
+	serverState := newFakeS3()
+	store, err := OpenS3(S3Config{
+		Endpoint: "http://s3.test", Region: "test-1", Bucket: "shift-test", Prefix: "tenant-a",
+		AccessKeyID: "access", SecretAccessKey: "secret", StateDir: t.TempDir(), ForcePathStyle: true,
+		HTTPClient: &http.Client{Transport: handlerTransport{handler: serverState}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := map[string]int{"org/o1/chunks/c1": 10, "org/o1/chunks/c2": 20, "org/o1/checkpoints/cp/manifest": 5, "org/o2/chunks/c3": 99}
+	for key, size := range contents {
+		if _, err := store.Put(context.Background(), key, bytes.NewReader(bytes.Repeat([]byte("x"), size)), int64(size), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type seen struct {
+		key  string
+		size int64
+	}
+	var listed []seen
+	// The fake pages two objects at a time, so five matching objects force
+	// multiple continuation round trips.
+	if err := store.ListPrefix(context.Background(), "org/o1", func(info ObjectInfo) error {
+		listed = append(listed, seen{key: info.Key, size: info.Size})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 3 {
+		t.Fatalf("ListPrefix returned %d objects, want 3: %#v", len(listed), listed)
+	}
+	total := int64(0)
+	for _, entry := range listed {
+		if !strings.HasPrefix(entry.key, "org/o1/") {
+			t.Fatalf("foreign object leaked into listing: %q", entry.key)
+		}
+		total += entry.size
+	}
+	if total != 35 {
+		t.Fatalf("ListPrefix sizes summed to %d, want 35", total)
+	}
+	// Early termination: visiting stops the walk without another page.
+	stopped := 0
+	if err := store.ListPrefix(context.Background(), "org/o1", func(info ObjectInfo) error {
+		stopped++
+		return errors.New("stop")
+	}); err == nil || !strings.Contains(err.Error(), "stop") {
+		t.Fatalf("ListPrefix did not propagate the visitor error: %v", err)
+	}
+	if stopped != 1 {
+		t.Fatalf("ListPrefix visited %d objects after the visitor stopped, want 1", stopped)
+	}
+}
+
+func TestS3StatelessClientListsButRefusesMultipart(t *testing.T) {
+	serverState := newFakeS3()
+	// No StateDir: the read-only broker shape the control plane builds.
+	store, err := OpenS3(S3Config{
+		Endpoint: "http://s3.test", Region: "test-1", Bucket: "shift-test",
+		AccessKeyID: "access", SecretAccessKey: "secret", ForcePathStyle: true,
+		HTTPClient: &http.Client{Transport: handlerTransport{handler: serverState}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(context.Background(), "org/o1/chunks/c1", bytes.NewReader([]byte("x")), 1, ""); err != nil {
+		t.Fatalf("stateless Put failed: %v", err)
+	}
+	var total int64
+	if err := store.ListPrefix(context.Background(), "org/o1", func(info ObjectInfo) error {
+		total += info.Size
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("stateless ListPrefix summed %d, want 1", total)
+	}
+	if _, err := store.InitiateMultipart(context.Background(), "org/o1/chunks/c2", 10, ""); !errors.Is(err, ErrNoStateDirectory) {
+		t.Fatalf("stateless InitiateMultipart: %v, want ErrNoStateDirectory", err)
+	}
+	if _, err := store.UploadPart(context.Background(), "upload-1", 1, bytes.NewReader([]byte("x")), 1, ""); !errors.Is(err, ErrNoStateDirectory) {
+		t.Fatalf("stateless UploadPart: %v, want ErrNoStateDirectory", err)
+	}
+}
+
+func TestS3SetCredentialsRotatesSigning(t *testing.T) {
+	serverState := newFakeS3()
+	store, err := OpenS3(S3Config{
+		Endpoint: "http://s3.test", Region: "test-1", Bucket: "shift-test",
+		AccessKeyID: "access", SecretAccessKey: "secret", StateDir: t.TempDir(), ForcePathStyle: true,
+		HTTPClient: &http.Client{Transport: handlerTransport{handler: serverState}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetCredentials("rotated", "rotated-secret", "rotated-token")
+	if _, err := store.Put(context.Background(), "checkpoints/cp/chunk", bytes.NewReader([]byte("x")), 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	serverState.mu.Lock()
+	defer serverState.mu.Unlock()
+	if !strings.HasPrefix(serverState.authorization, "AWS4-HMAC-SHA256 Credential=rotated/") {
+		t.Fatalf("request was not signed with the rotated credential: %q", serverState.authorization)
+	}
+	// A session token must be carried on the request when the rotated
+	// credentials included one.
+	if serverState.securityToken != "rotated-token" {
+		t.Fatalf("rotated session token was not sent: %q", serverState.securityToken)
 	}
 }

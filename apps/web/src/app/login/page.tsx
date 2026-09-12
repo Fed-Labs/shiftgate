@@ -11,7 +11,7 @@ import { errorMessage } from "@/lib/utils";
 
 export default function LoginPage() {
   const router = useRouter();
-  const { setAuth } = useAuth();
+  const { setAuth, restoreOrganization } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -25,6 +25,9 @@ export default function LoginPage() {
     try {
       const { user, tokens } = await api.login(email, password);
       setAuth(user, tokens);
+      // A login response carries no organization; adopt the user's existing
+      // one so the dashboard's organization pages have an id to query with.
+      await restoreOrganization();
       router.push("/app");
     } catch (err: unknown) {
       setError(errorMessage(err, "Login failed"));

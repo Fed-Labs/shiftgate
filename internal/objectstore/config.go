@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+// ControlPlaneBackend names the object-store backend whose credentials arrive
+// from the control plane at runtime instead of static configuration.
+const ControlPlaneBackend = "control-plane"
+
 type Config struct {
 	Enabled         bool   `json:"enabled"`
 	Backend         string `json:"backend"`
@@ -43,8 +47,16 @@ func (configuration Config) Validate() error {
 		if configuration.StateDir == "" || !filepath.IsAbs(configuration.StateDir) {
 			return errors.New("S3 state directory must be an absolute path")
 		}
+	case "control-plane":
+		// The broker client's credentials, endpoint, and bucket all arrive from
+		// the control plane at runtime; only the multipart state directory is
+		// the agent's own. The control-plane reporter's presence is validated
+		// by the agent config, which owns that block.
+		if configuration.StateDir == "" || !filepath.IsAbs(configuration.StateDir) {
+			return errors.New("control-plane object store requires an absolute state directory for multipart state")
+		}
 	default:
-		return errors.New("object-store backend must be local or s3")
+		return errors.New("object-store backend must be local, s3, or control-plane")
 	}
 	return nil
 }
@@ -66,6 +78,11 @@ func (configuration Config) Open() (Store, error) {
 			SessionToken: configuration.SessionToken, Prefix: configuration.Prefix,
 			StateDir: configuration.StateDir, ForcePathStyle: configuration.ForcePathStyle,
 		})
+	case "control-plane":
+		// The broker store is constructed by the agent's hosted-storage loop
+		// once the control plane issues credentials, so opening one directly
+		// from static configuration is a configuration mistake.
+		return nil, errors.New("the control-plane object store is opened by the agent from issued credentials, not from static configuration")
 	default:
 		return nil, ErrUnsupported
 	}

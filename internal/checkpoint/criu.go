@@ -31,6 +31,11 @@ type DumpOptions struct {
 	LeaveStopped    bool
 	LeaveRunning    bool
 	ManageCgroups   string
+	// TrackMemory arms CRIU's soft-dirty memory tracker for this dump. A dump
+	// whose process keeps running must arm it: a later incremental checkpoint
+	// diffs against this dump's images, and CRIU refuses an untracked parent
+	// with "Pid-reuse detection failed" / "Can't dump page with parasite".
+	TrackMemory bool
 }
 
 type RestoreOptions struct {
@@ -45,6 +50,13 @@ type RestoreOptions struct {
 	// the absolute path recorded in the checkpointed process images, which is
 	// what lets a fork and its source run at the same time on one machine.
 	BindMounts []BindMount
+	// LazyPages starts the restored process before its memory image is fully
+	// loaded: the caller must have started a lazy-pages daemon over the same
+	// image set (StartLazyPages), and CRIU's restore then hands memory serving
+	// to it — pages stream in through userfaultfd as the workload touches
+	// them. Restore returns once the tree exists and is executing, not once
+	// the memory is resident.
+	LazyPages bool
 }
 
 func NewCRIU(binary string) (*CRIU, error) {
@@ -81,6 +93,18 @@ func (c *CRIU) Check(ctx context.Context) error {
 	output, err := exec.CommandContext(ctx, c.binary, "check").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("criu kernel check failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// CheckFeature asks CRIU whether one named feature works on this machine —
+// `criu check --feature uffd` for the userfaultfd lazy restore needs. The
+// kernel, not the binary version, decides; the answer is CRIU's own probe
+// result, never inferred from a version string.
+func (c *CRIU) CheckFeature(ctx context.Context, feature string) error {
+	output, err := exec.CommandContext(ctx, c.binary, "check", "--feature", feature).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("criu check --feature %s failed: %w: %s", feature, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -129,6 +153,9 @@ func (c *CRIU) Restore(ctx context.Context, options RestoreOptions) (int, error)
 		"--pidfile", pidFile,
 	}
 	args = appendFeatureArgs(args, options.TCPState, options.ShellJob, options.FileLocks, options.ExternalUNIX, options.ManageCgroups)
+	if options.LazyPages {
+		args = append(args, "--lazy-pages")
+	}
 	if err := c.runInNamespace(ctx, options.ImagesDirectory, args, options.BindMounts); err != nil {
 		return 0, err
 	}
@@ -177,7 +204,15 @@ func (c *CRIU) dumpArgs(action string, options DumpOptions) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, "--prev-images-dir", relative, "--track-mem")
+		args = append(args, "--prev-images-dir", relative)
+	}
+	// The tracker serves two roles and this covers both: an incremental dump
+	// diffs memory against its parent's images, and a dump whose process
+	// continues becomes the parent of a later incremental. A dump whose
+	// process is about to stop arms nothing — nothing can ever diff against
+	// a dead process.
+	if options.ParentImages != "" || options.TrackMemory {
+		args = append(args, "--track-mem")
 	}
 	if options.LeaveRunning {
 		args = append(args, "--leave-running")

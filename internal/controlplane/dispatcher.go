@@ -158,7 +158,7 @@ func (server *Server) handleAgentCommand(writer http.ResponseWriter, request *ht
 			writeError(writer, http.StatusNotFound, "WORKLOAD_NOT_FOUND", "workload target was not found on this machine")
 			return
 		}
-		result, err := client.Restore(commandContext, input.CheckpointID, input.TimeoutSeconds)
+		result, err := client.Restore(commandContext, input.CheckpointID, agentclient.RestoreRequest{TimeoutSeconds: input.TimeoutSeconds})
 		if err != nil {
 			writeAgentError(writer, err)
 			return

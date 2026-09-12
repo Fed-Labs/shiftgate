@@ -122,7 +122,7 @@ export function FinalCTA() {
 
         <div className="mt-16 code-block max-w-xl">
           <span className="text-text-muted">$ </span>
-          <span className="text-accent">curl -fsSL https://shiftgate.dev/install.sh | sh</span>
+          <span className="text-accent">curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh | bash</span>
         </div>
       </div>
     </section>

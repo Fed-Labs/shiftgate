@@ -9,12 +9,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"shift.dev/shift/internal/config"
 )
 
 // Client talks to one control plane. It is safe for concurrent use.
@@ -33,12 +34,15 @@ type APIError struct {
 
 func (e *APIError) Error() string { return e.Code + ": " + e.Message }
 
-// New builds a client for a control-plane base URL. The URL must be http(s);
-// anything else is a configuration error, not a runtime one.
+// New builds a client for a control-plane base URL. An empty URL means the
+// platform's control plane — the platform hosts it, so its address is part of
+// the product rather than per-operator configuration (overridable with
+// --control-url or SHIFT_CONTROL_URL). Anything that is set but not http(s) is
+// a configuration error, not a runtime one.
 func New(baseURL string, timeout time.Duration) (*Client, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
-		return nil, errors.New("control plane URL is required")
+		baseURL = config.DefaultControlPlaneURL
 	}
 	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		return nil, fmt.Errorf("control plane URL must be http(s), got %q", baseURL)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -64,23 +65,98 @@ const (
 )
 
 type WorkloadSpec struct {
-	ID            string               `json:"id"`
-	Name          string               `json:"name"`
-	Command       []string             `json:"command"`
-	RootPath      string               `json:"root_path"`
-	WorkingDir    string               `json:"working_dir"`
-	Environment   map[string]string    `json:"environment,omitempty"`
-	UID           int                  `json:"uid"`
-	GID           int                  `json:"gid"`
-	Paths         []PathSpec           `json:"paths"`
-	Ports         []PortSpec           `json:"ports,omitempty"`
-	HealthCheck   *HealthCheckSpec     `json:"health_check,omitempty"`
-	Resources     ResourceRequirements `json:"resources"`
-	DevicePolicy  DevicePolicy         `json:"device_policy"`
-	NetworkPolicy NetworkPolicy        `json:"network_policy"`
-	Lineage       *Lineage             `json:"lineage,omitempty"`
-	CreatedAt     time.Time            `json:"created_at"`
-	UpdatedAt     time.Time            `json:"updated_at"`
+	ID               string                `json:"id"`
+	Name             string                `json:"name"`
+	Command          []string              `json:"command"`
+	RootPath         string                `json:"root_path"`
+	WorkingDir       string                `json:"working_dir"`
+	Environment      map[string]string     `json:"environment,omitempty"`
+	UID              int                   `json:"uid"`
+	GID              int                   `json:"gid"`
+	Paths            []PathSpec            `json:"paths"`
+	Ports            []PortSpec            `json:"ports,omitempty"`
+	HealthCheck      *HealthCheckSpec      `json:"health_check,omitempty"`
+	Resources        ResourceRequirements  `json:"resources"`
+	DevicePolicy     DevicePolicy          `json:"device_policy"`
+	NetworkPolicy    NetworkPolicy         `json:"network_policy"`
+	CheckpointPolicy *CheckpointPolicySpec `json:"checkpoint_policy,omitempty"`
+	FailoverPolicy   *FailoverPolicySpec   `json:"failover_policy,omitempty"`
+	Lineage          *Lineage              `json:"lineage,omitempty"`
+	CreatedAt        time.Time             `json:"created_at"`
+	UpdatedAt        time.Time             `json:"updated_at"`
+}
+
+// CheckpointPolicySpec schedules agent-side periodic checkpoints for a
+// workload: a full checkpoint every IntervalSeconds while it runs, and — when
+// KeepLast is set — pruning of the workload's oldest checkpoints down to that
+// count. A policy checkpoint is a full checkpoint on purpose: every retained
+// snapshot is independently restorable, and the operator's incremental
+// checkpoints keep working because a leave-running dump arms CRIU's memory
+// tracker.
+type CheckpointPolicySpec struct {
+	// IntervalSeconds is the spacing between checkpoints, measured from the
+	// last checkpoint (or the workload's creation when none exists yet). The
+	// minimum is 10 seconds: every checkpoint briefly freezes the workload,
+	// and a shorter interval would have it spend most of its time frozen.
+	IntervalSeconds int `json:"interval_seconds"`
+	// KeepLast caps how many of the workload's checkpoints to retain. Zero
+	// keeps everything — pruning is deliberately opt-in. A checkpoint that a
+	// retained checkpoint's lineage still needs is never pruned, even when
+	// that leaves more than KeepLast behind.
+	KeepLast int `json:"keep_last,omitempty"`
+}
+
+// Validate rejects a policy the scheduler could not honor. A nil policy — no
+// scheduling — is valid.
+func (p *CheckpointPolicySpec) Validate() error {
+	if p == nil {
+		return nil
+	}
+	if p.IntervalSeconds < 10 {
+		return errors.New("checkpoint interval must be at least 10 seconds")
+	}
+	if p.KeepLast < 0 {
+		return errors.New("checkpoint keep_last cannot be negative")
+	}
+	return nil
+}
+
+// FailoverPolicySpec designates a warm standby for a workload. The workload's
+// newest root checkpoint — which the checkpoint policy this spec requires
+// keeps arriving on schedule — is replicated to the standby agent over the
+// mutually authenticated peer channel together with the workload key, so the
+// standby holds a restorable copy it did not have to ask for. Failover never
+// happens on the source's word alone: the standby restores only when the
+// source's death is confirmed — its peer listener is unreachable AND the
+// control plane reports it offline — or an operator explicitly commands the
+// failover.
+type FailoverPolicySpec struct {
+	// AgentURL is the standby agent's peer listener — the same kind of https
+	// URL a migration destination uses.
+	AgentURL string `json:"agent_url"`
+	// MachineID optionally pins the standby's identity. When set, replication
+	// refuses to deposit state on a machine whose identity does not match,
+	// so a mistyped address cannot silently land on the wrong host.
+	MachineID string `json:"machine_id,omitempty"`
+	// KeepLast caps how many of the workload's replicated checkpoints the
+	// standby retains. Zero keeps everything there too.
+	KeepLast int `json:"keep_last,omitempty"`
+}
+
+// Validate rejects a failover policy the replicator could not honor. A nil
+// policy — no standby — is valid.
+func (p *FailoverPolicySpec) Validate() error {
+	if p == nil {
+		return nil
+	}
+	parsed, err := url.Parse(p.AgentURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("failover standby agent URL must be a plain https URL")
+	}
+	if p.KeepLast < 0 {
+		return errors.New("failover keep_last cannot be negative")
+	}
+	return nil
 }
 
 // Lineage records the exact state a workload was derived from. It is set when a
@@ -165,6 +241,20 @@ func (s *WorkloadSpec) Normalize() error {
 	}
 	if s.NetworkPolicy == "" {
 		s.NetworkPolicy = NetworkReconnect
+	}
+	if err := s.CheckpointPolicy.Validate(); err != nil {
+		return fmt.Errorf("checkpoint policy: %w", err)
+	}
+	if err := s.FailoverPolicy.Validate(); err != nil {
+		return fmt.Errorf("failover policy: %w", err)
+	}
+	// A failover policy without a checkpoint policy would replicate nothing:
+	// the replicator follows the newest root checkpoint, and without a
+	// schedule no new one arrives. Refusing here is the honest answer — a
+	// workload whose standby silently held nothing would fail over into a
+	// state far older than the operator believes exists.
+	if s.FailoverPolicy != nil && s.CheckpointPolicy == nil {
+		return errors.New("failover policy requires a checkpoint policy: without periodic checkpoints nothing would replicate to the standby")
 	}
 	if err := s.Lineage.Validate(); err != nil {
 		return err
@@ -533,9 +623,12 @@ type CheckpointEngineInfo struct {
 	LeaveRunning bool   `json:"leave_running"`
 	ParentImages bool   `json:"parent_images"`
 	PreCopy      bool   `json:"pre_copy,omitempty"`
-	TCPState     bool   `json:"tcp_state"`
-	ShellJob     bool   `json:"shell_job"`
-	FileLocks    bool   `json:"file_locks"`
+	// PreCopyPasses is how many pre-dump iterations actually ran while the
+	// workload kept running — the honest count, not the requested cap.
+	PreCopyPasses int  `json:"pre_copy_passes,omitempty"`
+	TCPState      bool `json:"tcp_state"`
+	ShellJob      bool `json:"shell_job"`
+	FileLocks     bool `json:"file_locks"`
 }
 
 type SecurityEnvelope struct {
@@ -546,7 +639,13 @@ type SecurityEnvelope struct {
 }
 
 type CheckpointMetrics struct {
-	StartedAt         time.Time     `json:"started_at"`
+	StartedAt time.Time `json:"started_at"`
+	// FreezeStartedAt is the instant the workload actually stopped
+	// executing — the pause before the final dump. It is zero when nothing
+	// was frozen (the workload was already stopped or paused). Downtime is
+	// measured from here rather than from StartedAt: pre-copy passes and
+	// changed-file accounting run while the workload is still live.
+	FreezeStartedAt   time.Time     `json:"freeze_started_at,omitzero"`
 	CompletedAt       time.Time     `json:"completed_at"`
 	Duration          time.Duration `json:"duration"`
 	PlainBytes        int64         `json:"plain_bytes"`
@@ -614,14 +713,23 @@ const (
 	MigrationCancelled    MigrationStage = "CANCELLED"
 )
 
+// A failure at any pre-commit stage can enter ROLLING_BACK directly: a
+// migration whose source is still being preserved must never be observable
+// in FAILED, which every observer treats as terminal. FAILED is reserved
+// for terminally failed migrations — a rollback that itself needs an
+// operator, or a stage that cannot roll back.
 var migrationTransitions = map[MigrationStage]map[MigrationStage]bool{
-	MigrationCreated:      {MigrationDiscover: true, MigrationFailed: true, MigrationCancelled: true},
-	MigrationDiscover:     {MigrationValidate: true, MigrationFailed: true, MigrationCancelled: true},
-	MigrationValidate:     {MigrationSnapshot: true, MigrationFailed: true, MigrationCancelled: true},
-	MigrationSnapshot:     {MigrationPrepare: true, MigrationFailed: true, MigrationCancelled: true},
-	MigrationPrepare:      {MigrationTransfer: true, MigrationFailed: true, MigrationCancelled: true},
-	MigrationTransfer:     {MigrationVerify: true, MigrationFailed: true, MigrationCancelled: true},
-	MigrationVerify:       {MigrationRestore: true, MigrationFailed: true, MigrationCancelled: true},
+	MigrationCreated:  {MigrationDiscover: true, MigrationFailed: true, MigrationCancelled: true},
+	MigrationDiscover: {MigrationValidate: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
+	MigrationValidate: {MigrationSnapshot: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
+	// A live migration opens the destination session inside its snapshot
+	// stage — each pre-copy pass's images transfer as the pass completes — so
+	// it moves straight from SNAPSHOT to TRANSFER; a cold migration creates
+	// its whole checkpoint first and reserves between the two.
+	MigrationSnapshot:     {MigrationPrepare: true, MigrationTransfer: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
+	MigrationPrepare:      {MigrationTransfer: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
+	MigrationTransfer:     {MigrationVerify: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
+	MigrationVerify:       {MigrationRestore: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
 	MigrationRestore:      {MigrationPostValidate: true, MigrationFailed: true, MigrationRollingBack: true, MigrationCancelled: true},
 	MigrationPostValidate: {MigrationSwitch: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
 	MigrationSwitch:       {MigrationCommit: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
@@ -649,14 +757,19 @@ type Destination struct {
 }
 
 type MigrationMetrics struct {
-	TotalStateBytes     int64         `json:"total_state_bytes"`
-	TransferredBytes    int64         `json:"transferred_bytes"`
-	DeduplicatedBytes   int64         `json:"deduplicated_bytes"`
-	CheckpointDuration  time.Duration `json:"checkpoint_duration"`
-	RestoreDuration     time.Duration `json:"restore_duration"`
-	Downtime            time.Duration `json:"downtime"`
-	TransferDuration    time.Duration `json:"transfer_duration"`
-	TransferBytesPerSec float64       `json:"transfer_bytes_per_second"`
+	TotalStateBytes   int64 `json:"total_state_bytes"`
+	TransferredBytes  int64 `json:"transferred_bytes"`
+	DeduplicatedBytes int64 `json:"deduplicated_bytes"`
+	// PreCopyTransferredBytes is the part of TransferredBytes a live
+	// migration moved during its pre-copy passes — while the workload kept
+	// running. The difference between the two fields is what had to travel
+	// inside the frozen window.
+	PreCopyTransferredBytes int64         `json:"pre_copy_transferred_bytes,omitempty"`
+	CheckpointDuration      time.Duration `json:"checkpoint_duration"`
+	RestoreDuration         time.Duration `json:"restore_duration"`
+	Downtime                time.Duration `json:"downtime"`
+	TransferDuration        time.Duration `json:"transfer_duration"`
+	TransferBytesPerSec     float64       `json:"transfer_bytes_per_second"`
 }
 
 type MigrationEvent struct {
@@ -670,12 +783,16 @@ type MigrationEvent struct {
 }
 
 type Migration struct {
-	ID              string              `json:"id"`
-	WorkloadID      string              `json:"workload_id"`
-	CheckpointID    string              `json:"checkpoint_id,omitempty"`
-	SourceMachineID string              `json:"source_machine_id"`
-	Destination     Destination         `json:"destination"`
-	Mode            MigrationMode       `json:"mode"`
+	ID              string        `json:"id"`
+	WorkloadID      string        `json:"workload_id"`
+	CheckpointID    string        `json:"checkpoint_id,omitempty"`
+	SourceMachineID string        `json:"source_machine_id"`
+	Destination     Destination   `json:"destination"`
+	Mode            MigrationMode `json:"mode"`
+	// PreCopyPasses caps the pre-dump iterations a live migration runs
+	// before freezing the source (0 = the agent's default policy). The
+	// checkpoint manifest records how many actually ran.
+	PreCopyPasses   int                 `json:"pre_copy_passes,omitempty"`
 	Stage           MigrationStage      `json:"stage"`
 	Compatibility   CompatibilityReport `json:"compatibility"`
 	Network         NetworkPlan         `json:"network"`
@@ -709,6 +826,59 @@ func (m *Migration) Transition(to MigrationStage, message string, progress float
 		m.CompletedAt = &completed
 	}
 	return nil
+}
+
+// Standby duty states. Armed means the standby holds state and watches the
+// source; failed_over means the workload was restored there and the duty is
+// the failover's history.
+const (
+	StandbyArmed      = "armed"
+	StandbyFailedOver = "failed_over"
+)
+
+// StandbyDuty is the standby agent's record of one workload it protects:
+// what state it holds, from which source, and — after a failover — from what
+// checkpoint the workload was restored there. The duty, not the transfer
+// session that delivered the state, is the operational truth: sessions
+// expire on their own clock, duties persist until withdrawn or failed over.
+type StandbyDuty struct {
+	WorkloadID       string    `json:"workload_id"`
+	WorkloadName     string    `json:"workload_name,omitempty"`
+	WorkloadUID      int       `json:"workload_uid,omitempty"`
+	SourceMachineID  string    `json:"source_machine_id"`
+	SourceAgentURL   string    `json:"source_agent_url,omitempty"`
+	KeepLast         int       `json:"keep_last,omitempty"`
+	LastCheckpointID string    `json:"last_checkpoint_id"`
+	LastCheckpointAt time.Time `json:"last_checkpoint_at"`
+	HeldAt           time.Time `json:"held_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+
+	// State is "armed" while the standby holds state and watches the source,
+	// "failed_over" once the workload was restored here — after which the
+	// duty is the failover's history, not an active watch.
+	State             string    `json:"state"`
+	FailoverAt        time.Time `json:"failover_at,omitempty"`
+	FailoverRestoreID string    `json:"failover_restore_id,omitempty"`
+	FailoverReason    string    `json:"failover_reason,omitempty"`
+
+	LastFailoverError string    `json:"last_failover_error,omitempty"`
+	NextAttemptAt     time.Time `json:"next_attempt_at,omitempty"`
+}
+
+// ReplicationEntry is the source agent's ledger record for one workload it
+// replicates to a standby: what was pushed, to whom, and how the last
+// attempt went. It is the source-side counterpart of the standby's duty.
+type ReplicationEntry struct {
+	WorkloadID       string    `json:"workload_id"`
+	WorkloadName     string    `json:"workload_name,omitempty"`
+	StandbyURL       string    `json:"standby_url"`
+	StandbyMachineID string    `json:"standby_machine_id,omitempty"`
+	KeepLast         int       `json:"keep_last,omitempty"`
+	LastCheckpointID string    `json:"last_checkpoint_id,omitempty"`
+	LastPushAt       time.Time `json:"last_push_at,omitempty"`
+	LastError        string    `json:"last_error,omitempty"`
+	LastErrorAt      time.Time `json:"last_error_at,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 type ErrorResponse struct {

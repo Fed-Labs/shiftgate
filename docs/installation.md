@@ -71,9 +71,11 @@ paths in `deployments/systemd/agent.json.example`, then run:
 sudo ./install.sh --systemd
 ```
 
-Use `--prefix /custom/path` for a non-system prefix. If service activation fails, the
-installer removes the newly installed binaries and restores any prior `.pre-shift`
-versions.
+Use `--prefix /custom/path` for a non-system prefix. From the moment the
+installer begins replacing binaries, any failure — a failed step as much as a
+failed service activation — restores the prior installation exactly: replaced
+binaries come back from their `.pre-shift` aside copies, binaries the run
+itself added are removed, and a replaced systemd unit is put back.
 
 For an unprivileged test install outside the protected system paths, set both the prefix
 and the explicit opt-in:
@@ -106,6 +108,30 @@ remote checkpoint mirroring. When enabled, provide an S3-compatible endpoint and
 credentials in that file; do not put access keys in the agent JSON committed to source
 control.
 
+### Hosted checkpoint mirroring
+
+When the control plane hosts storage (see
+[Deployment — hosting checkpoint storage](deployment.md#hosting-checkpoint-storage-platform-side-mirroring)),
+agents can mirror without any storage credentials of their own. Add to
+`/etc/shift/agent.env` alongside the control-plane reporter settings above:
+
+```sh
+SHIFT_OBJECTSTORE_ENABLED=true
+SHIFT_OBJECTSTORE_BACKEND=control-plane
+SHIFT_OBJECTSTORE_STATE_DIR=/var/lib/shift/objectstore-state
+```
+
+The agent fetches short-lived, organization-scoped credentials from the
+control plane with the machines-scope API key it already carries, refreshing
+at half the credential lifetime — no storage secrets ever sit on the agent.
+Before the first fetch, mirroring (and therefore checkpoint create) reports
+`credentials not yet available` rather than silently skipping the cloud copy.
+If the organization goes over its storage quota, credential issuance stops and
+checkpoints report a quota failure while local checkpointing continues
+untouched; mirroring resumes once usage drops below the plan limit (the
+dashboard's reconcile brings usage back to the bucket's truth) or the plan is
+upgraded.
+
 ## Connecting an agent host to the dashboard
 
 The web app talks to `shift-control`; the CLI talks to the local `shift-agent`. For
@@ -114,7 +140,10 @@ create an organization API key scoped to `machines`, then add these settings to
 `/etc/shift/agent.env`:
 
 ```sh
-SHIFT_CONTROL_URL=https://control.example.test
+# Optional: unset means the platform's control plane — the endpoint every
+# SHIFT client dials by default. Set it only when the dashboard runs on a
+# private control plane.
+# SHIFT_CONTROL_URL=https://control.example.test
 SHIFT_CONTROL_ORGANIZATION_ID=ORGANIZATION_ID
 SHIFT_CONTROL_MACHINE_ID=machine_id_from_inventory
 SHIFT_CONTROL_MACHINE_NAME=edge-01
@@ -125,8 +154,10 @@ SHIFT_CONTROL_REPORT_INTERVAL=30s
 ```
 
 Restart `shift-agent.service` afterwards. The key authorizes presence and inventory
-reporting only. Dashboard workload actions remain unavailable until a separate
-authenticated dispatcher is implemented; the reporter does not reconcile CLI-created
+reporting; the dashboard dispatches workload commands (including one-click migrations
+from the Workloads page) through the agent's remote peer listener — set
+`SHIFT_CONTROL_AGENT_URL` for that, and machines without a reachable listener stay
+report-only. The reporter does not reconcile CLI-created
 workload or checkpoint records into the dashboard.
 
 ## Control plane
@@ -138,6 +169,13 @@ characters), then run:
 ```sh
 ./bin/shift-control --listen 127.0.0.1:8090
 ```
+
+Running a private control plane: every SHIFT client dials the platform
+endpoint (`config.DefaultControlPlaneURL`) by default — the way a hosted
+service's SDK ships its endpoint — so to point clients at this private
+instance, set `--control-url` / `SHIFT_CONTROL_URL` (CLI, agents) or
+`NEXT_PUBLIC_API_URL` (dashboard) to its address (for a local instance,
+`http://127.0.0.1:8090`, matching the stock listen address above).
 
 The service applies `database/migrations/*.sql` transactionally at startup. Do not expose
 the development HTTP listener directly to the public internet; terminate TLS at a

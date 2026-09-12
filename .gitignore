@@ -15,3 +15,7 @@ apps/desktop/dist/
 apps/desktop/src-tauri/target/
 target/
 
+
+# Local end-to-end verification stacks (live credentials, agent state, object data)
+.e2e-storage/
+.e2e-hosted/

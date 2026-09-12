@@ -16,6 +16,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,15 +54,28 @@ type Service struct {
 	repository  *checkpoint.Repository
 	restorer    *checkpoint.Restorer
 	forker      *checkpoint.Forker
+	cloner      *checkpoint.Cloner
 	sessions    *transfer.Sessions
 	peerServer  *transfer.Server
 	migrations  *migration.Orchestrator
 	network     *network.Coordinator
 	reporter    *controlplane.Reporter
 	updates     *update.Manager
-	startedAt   time.Time
-	serversMu   sync.Mutex
-	servers     []*http.Server
+	// hostedStorage drives the control-plane object-store credential loop when
+	// object_store.backend is "control-plane"; nil otherwise.
+	hostedStorage *hostedStorageLoop
+	// standby is this agent's warm-standby duty supervisor: the records of
+	// the workloads it holds replicated state for, and the loop that watches
+	// their sources. Always non-nil; without a control plane it simply never
+	// confirms a death automatically.
+	standby *standbySupervisor
+	// replicator pushes checkpoints to the standbys named by workload
+	// failover policies. Always non-nil; it does nothing when no workload
+	// carries a policy.
+	replicator *failoverReplicator
+	startedAt  time.Time
+	serversMu  sync.Mutex
+	servers    []*http.Server
 }
 
 const (
@@ -96,7 +110,7 @@ func Open(configuration config.Agent, logger *slog.Logger) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	runtimeManager, err := shiftruntime.OpenManagerWithKeys(configuration.StateDir, false, logger, keys)
+	runtimeManager, err := shiftruntime.OpenManagerWithCgroups(configuration.StateDir, configuration.CgroupRoot, false, logger, keys)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +140,30 @@ func Open(configuration config.Agent, logger *slog.Logger) (*Service, error) {
 	diagnostics := observability.NewDiagnostics()
 	checkpointService.SetDiagnostics(diagnostics)
 	var remoteObjects objectstore.Store
-	if configuration.ObjectStore.Enabled {
+	var hosted *hostedStorageLoop
+	deferred := objectstore.NewDeferred()
+	backend := strings.ToLower(strings.TrimSpace(configuration.ObjectStore.Backend))
+	if configuration.ObjectStore.Enabled && backend == objectstore.ControlPlaneBackend {
+		// Hosted mirroring: the store is empty until the control plane issues
+		// credentials. The reporter's control-plane block is the credential
+		// source, so it is required here — an agent that cannot authenticate
+		// to a control plane cannot fetch credentials either.
+		if !configuration.ControlPlane.Enabled() {
+			return nil, errors.New("object_store.backend control-plane requires a configured control_plane block (url, organization_id, machine_id, api_key)")
+		}
+		if strings.TrimSpace(configuration.ObjectStore.StateDir) == "" {
+			return nil, errors.New("object_store.backend control-plane requires object_store.state_dir for multipart state")
+		}
+		hosted = newHostedStorageLoop(hostedStorageConfig{
+			controlURL:     configuration.ControlPlane.URL,
+			organization:   configuration.ControlPlane.OrganizationID,
+			apiKey:         configuration.ControlPlane.APIKey,
+			stateDir:       configuration.ObjectStore.StateDir,
+			requestTimeout: configuration.ControlPlane.RequestTimeout,
+		}, deferred, logger.With("component", "hosted_storage"))
+		remoteObjects = deferred
+		checkpointService.SetMirror(checkpoint.NewMirror(remoteObjects, chunks, repository))
+	} else if configuration.ObjectStore.Enabled {
 		remoteObjects, err = configuration.ObjectStore.Open()
 		if err != nil {
 			return nil, fmt.Errorf("open object store: %w", err)
@@ -138,6 +175,10 @@ func Open(configuration config.Agent, logger *slog.Logger) (*Service, error) {
 		return nil, err
 	}
 	forker, err := checkpoint.OpenForker(checkpointService)
+	if err != nil {
+		return nil, err
+	}
+	cloner, err := checkpoint.OpenCloner(checkpointService)
 	if err != nil {
 		return nil, err
 	}
@@ -166,9 +207,10 @@ func Open(configuration config.Agent, logger *slog.Logger) (*Service, error) {
 		identity: machineIdentity,
 		keys:     keys, inventory: inventory, runtime: runtimeManager, chunks: chunks,
 		objectStore: remoteObjects,
-		checkpoints: checkpointService, repository: repository, restorer: restorer, forker: forker, sessions: sessions,
-		network:   coordinator,
-		startedAt: time.Now().UTC(),
+		checkpoints: checkpointService, repository: repository, restorer: restorer, forker: forker, cloner: cloner, sessions: sessions,
+		network:       coordinator,
+		hostedStorage: hosted,
+		startedAt:     time.Now().UTC(),
 	}
 	authenticate := transfer.CertificateMachineID
 	if configuration.InsecureDevelopment {
@@ -206,6 +248,49 @@ func Open(configuration config.Agent, logger *slog.Logger) (*Service, error) {
 		}
 		return transfer.NewClient(destination.AgentURL, destination.ServerName, configuration.TLS.CertificateFile, configuration.TLS.PrivateKeyFile, caFile)
 	}
+	// peerClientFor builds a client for any peer listener — a migration
+	// destination, a failover standby, or a source being probed — from the
+	// same TLS material, so every peer channel in the agent answers to one
+	// configuration. An empty server name verifies the certificate against
+	// the names it carries; identity is pinned by machine id where it
+	// matters, not by hostname.
+	peerClientFor := func(endpoint string) (*transfer.Client, error) {
+		if configuration.InsecureDevelopment {
+			return transfer.NewDevelopmentClient(endpoint, configuration.TLS.CertificateFile, configuration.TLS.PrivateKeyFile)
+		}
+		caFile := configuration.TLS.PeerCAFile
+		if caFile == "" {
+			caFile = configuration.TLS.ClientCAFile
+		}
+		return transfer.NewClient(endpoint, "", configuration.TLS.CertificateFile, configuration.TLS.PrivateKeyFile, caFile)
+	}
+	standbyDuties, err := securestore.OpenEncryptedCollection[model.StandbyDuty](filepath.Join(configuration.StateDir, "metadata", "standby-duties.enc.json"), "standby-duties-v1", keys)
+	if err != nil {
+		return nil, err
+	}
+	replicationLedger, err := securestore.OpenEncryptedCollection[model.ReplicationEntry](filepath.Join(configuration.StateDir, "metadata", "failover-replication.enc.json"), "failover-replication-v1", keys)
+	if err != nil {
+		return nil, err
+	}
+	// The standby's presence query uses the control-plane reporter's own
+	// settings: without them this agent cannot confirm a source's death and
+	// its supervisor only ever acts on an explicit operator trigger.
+	presenceURL, presenceOrg, presenceKey := "", "", ""
+	if configuration.ControlPlane.Enabled() {
+		presenceURL = configuration.ControlPlane.URL
+		presenceOrg = configuration.ControlPlane.OrganizationID
+		presenceKey = configuration.ControlPlane.APIKey
+	}
+	service.standby = openStandbySupervisor(standbyDuties, runtimeManager, checkpointService, restorer,
+		presenceURL, presenceOrg, presenceKey, peerClientFor, logger.With("component", "standby"))
+	service.replicator = &failoverReplicator{
+		ledger: replicationLedger, runtime: runtimeManager, checkpoints: checkpointService,
+		keys: keys, chunks: chunks, identity: machineIdentity, peerClient: peerClientFor,
+		advertisedURL:     configuration.ControlPlane.AgentURL,
+		migrationInFlight: func(workloadID string) bool { return service.migrationInFlight(workloadID) },
+		logger:            logger.With("component", "failover_replicator"),
+	}
+	service.peerServer.SetReplicationWatcher(service.standby)
 	migrations, err := migration.Open(configuration.StateDir, keys, runtimeManager, checkpointService, repository, chunks, machineIdentity, inventory, factory, configuration.MaxConcurrentMigrations, logger)
 	if err != nil {
 		return nil, err
@@ -261,6 +346,11 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	go s.objectStoreCleanupLoop(runContext)
 	go s.runSampler(runContext, s.diagnostics)
+	go s.runCheckpointPolicies(runContext)
+	go s.standby.run(runContext)
+	if s.hostedStorage != nil {
+		go s.hostedStorage.run(runContext)
+	}
 	if s.otlp != nil {
 		go s.otlp.Run(runContext)
 	}

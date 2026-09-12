@@ -20,6 +20,7 @@ tags:
   - name: Compute
   - name: Usage
   - name: Billing
+  - name: Storage
   - name: Webhooks
   - name: SCIM
 paths:
@@ -514,6 +515,89 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Entitlement' }
+  /v1/organizations/{organizationID}/storage:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Storage]
+      security: [{ bearerAuth: [] }]
+      operationId: getStorageStatus
+      description: |
+        Platform-hosted checkpoint storage status. Usage is metered by
+        reconciling actual object bytes in the organization's bucket prefix —
+        never from agent claims — and refreshes synchronously when the stored
+        figures are stale. When hosting is disabled the response is
+        `{enabled: false}` with no location fields.
+      responses:
+        '200':
+          description: Storage status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StorageStatus' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/organizations/{organizationID}/storage/credentials:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    get:
+      tags: [Storage]
+      security: [{ bearerAuth: [] }]
+      operationId: getStorageCredentials
+      description: |
+        Short-lived, organization-scoped object-store credentials for agent
+        mirroring. Agents call this with a machines-scope API key and refresh
+        at half the credential lifetime. Over quota the response is 403 and
+        no credentials are issued — mirroring stops while local checkpointing
+        continues.
+      responses:
+        '200':
+          description: Issued credentials; the secrets are shown once and never logged
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StorageCredentials' }
+        '403':
+          description: Over plan quota — issuance suspended until usage drops or the plan is upgraded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message, used_storage_bytes, max_storage_bytes]
+                properties:
+                  code: { type: string, enum: [STORAGE_QUOTA_EXCEEDED] }
+                  message: { type: string }
+                  used_storage_bytes: { type: integer, format: int64 }
+                  max_storage_bytes: { type: integer, format: int64 }
+        '503':
+          description: This control plane does not host checkpoint storage
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: { type: string, enum: [STORAGE_NOT_CONFIGURED] }
+                  message: { type: string }
+  /v1/organizations/{organizationID}/storage/reconcile:
+    parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
+    post:
+      tags: [Storage]
+      security: [{ bearerAuth: [] }]
+      operationId: reconcileStorage
+      description: Forces a usage recount from the bucket. Admin, billing scope.
+      responses:
+        '200':
+          description: Refreshed status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StorageStatus' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503':
+          description: This control plane does not host checkpoint storage
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message]
+                properties:
+                  code: { type: string, enum: [STORAGE_NOT_CONFIGURED] }
+                  message: { type: string }
   /v1/organizations/{organizationID}/api-keys:
     parameters: [{ $ref: '#/components/parameters/OrganizationID' }]
     get:
@@ -1416,6 +1500,31 @@ components:
         used_storage_bytes: { type: integer, format: int64, minimum: 0 }
         max_machines: { type: integer, description: -1 means unlimited }
         stripe_customer_id: { type: string }
+    StorageStatus:
+      type: object
+      required: [enabled, used_storage_bytes, max_storage_bytes, over_quota]
+      properties:
+        enabled: { type: boolean, description: False when this control plane does not host storage; location fields are then absent }
+        endpoint: { type: string, description: Object-store endpoint handed to agents }
+        bucket: { type: string }
+        prefix: { type: string, description: The organization's exclusive key prefix, "org/{organizationID}/" }
+        used_storage_bytes: { type: integer, format: int64, minimum: 0, description: Reconciled from actual bucket bytes }
+        max_storage_bytes: { type: integer, format: int64, description: -1 means unlimited }
+        over_quota: { type: boolean }
+        last_reconciled_at: { type: string, format: date-time }
+    StorageCredentials:
+      type: object
+      required: [endpoint, region, bucket, prefix, access_key_id, secret_access_key, session_token, expiration]
+      properties:
+        endpoint: { type: string }
+        region: { type: string }
+        bucket: { type: string }
+        prefix: { type: string }
+        access_key_id: { type: string }
+        secret_access_key: { type: string, description: Returned once to the caller; never logged or audited }
+        session_token: { type: string, description: Returned once to the caller; never logged or audited }
+        expiration: { type: string, format: date-time }
+        force_path_style: { type: boolean, description: True for S3-compatible stores addressed path-style }
     Plan:
       type: object
       required: [key, name, price_cents, description, features, max_machines, max_storage_bytes]

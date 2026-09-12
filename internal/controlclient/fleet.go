@@ -88,6 +88,20 @@ type Entitlement struct {
 	StripeCustomerID string `json:"stripe_customer_id,omitempty"`
 }
 
+// StorageStatus is the organization's platform-hosted checkpoint storage
+// view. When Enabled is false the control plane does not host storage and the
+// location fields are empty.
+type StorageStatus struct {
+	Enabled          bool       `json:"enabled"`
+	Endpoint         string     `json:"endpoint,omitempty"`
+	Bucket           string     `json:"bucket,omitempty"`
+	Prefix           string     `json:"prefix,omitempty"`
+	UsedStorageBytes int64      `json:"used_storage_bytes"`
+	MaxStorageBytes  int64      `json:"max_storage_bytes"`
+	OverQuota        bool       `json:"over_quota"`
+	LastReconciledAt *time.Time `json:"last_reconciled_at,omitempty"`
+}
+
 // UsageSummary is one metered kind over one period.
 type UsageSummary struct {
 	Kind        string `json:"kind"`
@@ -355,6 +369,12 @@ func (session *Session) RegisterCheckpoint(ctx context.Context, organizationID s
 func (session *Session) Entitlement(ctx context.Context, organizationID string) (Entitlement, error) {
 	var result Entitlement
 	return result, session.call(ctx, "GET", organizationPath(organizationID, "/entitlement"), nil, &result)
+}
+
+// Storage reads the organization's hosted checkpoint storage status.
+func (session *Session) Storage(ctx context.Context, organizationID string) (StorageStatus, error) {
+	var result StorageStatus
+	return result, session.call(ctx, "GET", organizationPath(organizationID, "/storage"), nil, &result)
 }
 
 // Usage summarizes metered usage over an inclusive date range. Both bounds

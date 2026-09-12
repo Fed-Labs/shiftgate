@@ -132,8 +132,7 @@ func (f *Forker) Fork(parent context.Context, sourceWorkloadID string, options F
 	if err := f.service.chunks.ValidateAsset(ctx, manifest.Workload.ID, filesystemAsset); err != nil {
 		return ForkRecord{}, fmt.Errorf("validate fork point filesystem: %w", err)
 	}
-	processAssets, err := processAssetChain(ctx, f.service.repository, f.service.chunks, manifest)
-	if err != nil {
+	if _, err := processChain(ctx, f.service.repository, f.service.chunks, manifest); err != nil {
 		return ForkRecord{}, err
 	}
 	sessionID, err := model.NewID()
@@ -174,7 +173,7 @@ func (f *Forker) Fork(parent context.Context, sourceWorkloadID string, options F
 	// The fork's declared ports are reserved when the fork is activated —
 	// a fork that is only materialized runs nothing and holds nothing. See
 	// activate().
-	if err = f.materialize(ctx, &record, manifest, filesystemAsset, processAssets, forkSpec); err != nil {
+	if err = f.materialize(ctx, &record, manifest, filesystemAsset, forkSpec); err != nil {
 		return record, err
 	}
 	if !options.Activate {
@@ -216,7 +215,7 @@ func (f *Forker) forkPoint(ctx context.Context, source model.Workload, options F
 // materialize writes the fork's own filesystem copy and its own full checkpoint.
 // Chunks are re-encrypted under the fork's key namespace so that deleting or
 // rotating the source workload can never invalidate the fork's state.
-func (f *Forker) materialize(ctx context.Context, record *ForkRecord, manifest model.CheckpointManifest, filesystemAsset model.AssetManifest, processAssets []model.AssetManifest, forkSpec model.WorkloadSpec) error {
+func (f *Forker) materialize(ctx context.Context, record *ForkRecord, manifest model.CheckpointManifest, filesystemAsset model.AssetManifest, forkSpec model.WorkloadSpec) error {
 	if err := os.MkdirAll(filepath.Dir(record.RootPath), 0o755); err != nil {
 		return err
 	}
@@ -233,10 +232,8 @@ func (f *Forker) materialize(ctx context.Context, record *ForkRecord, manifest m
 	if err != nil {
 		return err
 	}
-	for _, processAsset := range processAssets {
-		if err := extractDirectory(ctx, f.service.chunks, manifest.Workload.ID, processAsset, record.ImagesDirectory); err != nil {
-			return err
-		}
+	if err := materializeProcessChain(ctx, f.service.repository, f.service.chunks, manifest, record.ImagesDirectory); err != nil {
+		return err
 	}
 	images := filepath.Join(record.ImagesDirectory, "images")
 	if info, statErr := os.Stat(images); statErr != nil || !info.IsDir() {
@@ -258,7 +255,7 @@ func (f *Forker) materialize(ctx context.Context, record *ForkRecord, manifest m
 		return err
 	}
 	record.CreatedWorkload = created
-	forkManifest, err := f.captureFork(ctx, manifest, forkSpec, images)
+	forkManifest, err := f.captureFork(ctx, manifest, forkSpec, record.ImagesDirectory)
 	if err != nil {
 		return err
 	}
@@ -273,19 +270,31 @@ func (f *Forker) materialize(ctx context.Context, record *ForkRecord, manifest m
 }
 
 // captureFork writes a self-contained full checkpoint owned by the fork. The
-// CRIU image chain is flattened first, so the fork's checkpoint has no parent
-// and stays valid independently of the source's retention policy.
-func (f *Forker) captureFork(ctx context.Context, manifest model.CheckpointManifest, forkSpec model.WorkloadSpec, images string) (model.CheckpointManifest, error) {
+// whole image tree — the forked set plus every parent set its symlinks
+// reference — is captured, so the fork's checkpoint has no parent and stays
+// valid independently of the source's retention policy.
+func (f *Forker) captureFork(ctx context.Context, manifest model.CheckpointManifest, forkSpec model.WorkloadSpec, imagesRoot string) (model.CheckpointManifest, error) {
 	started := time.Now().UTC()
 	checkpointID, err := model.NewID()
 	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
-	imageResult, err := captureDirectory(ctx, f.service.chunks, forkSpec.ID, "process-state", images, nil, 20)
+	entries, err := os.ReadDir(imagesRoot)
 	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
-	filesystemResult, err := captureDirectory(ctx, f.service.chunks, forkSpec.ID, "filesystem-root", forkSpec.RootPath, exclusionsForRoot(forkSpec), 10)
+	bases := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		bases = append(bases, entry.Name())
+	}
+	if len(bases) == 0 {
+		return model.CheckpointManifest{}, errors.New("fork point has no process images to capture")
+	}
+	imageResult, err := captureDirectory(ctx, f.service.chunks, forkSpec.ID, "process-state", imagesRoot, bases, []string{"work"}, 20)
+	if err != nil {
+		return model.CheckpointManifest{}, err
+	}
+	filesystemResult, err := captureDirectory(ctx, f.service.chunks, forkSpec.ID, "filesystem-root", filepath.Dir(forkSpec.RootPath), []string{filepath.Base(forkSpec.RootPath)}, exclusionsForRoot(forkSpec), 10)
 	if err != nil {
 		return model.CheckpointManifest{}, err
 	}

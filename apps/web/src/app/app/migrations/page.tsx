@@ -65,7 +65,7 @@ export default function MigrationsPage() {
       <div className="p-8">
         <EmptyState
           title="No migrations yet"
-          description="Dashboard rows show reported intent. Run a migration with the CLI on its source machine."
+          description="Move a workload from its detail page or the Workloads fleet (the MOVE button), or run one from the CLI on its source machine."
         />
       </div>
     );

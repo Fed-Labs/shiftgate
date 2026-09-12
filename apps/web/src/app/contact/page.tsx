@@ -139,12 +139,12 @@ export default function ContactPage() {
                       File issues, browse the source, contribute.
                     </p>
                     <a
-                      href="https://github.com/shiftgate"
+                      href="https://github.com/Fed-Labs/shiftgate"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="text-sm text-accent hover:text-accent-dim transition-colors"
                     >
-                      github.com/shiftgate
+                      github.com/Fed-Labs/shiftgate
                     </a>
                   </div>
                 </div>

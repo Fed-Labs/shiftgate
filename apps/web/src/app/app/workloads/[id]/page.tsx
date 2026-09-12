@@ -6,6 +6,7 @@ import { useState } from "react";
 import { useAuth } from "@/lib/store";
 import { api } from "@/lib/api";
 import { StateObject, ResourceReadout } from "@/components/state";
+import { MigrateDialog } from "@/components/migrate-dialog";
 import { cn } from "@/lib/utils";
 import type { AgentAction } from "@/lib/types";
 import Link from "next/link";
@@ -15,6 +16,7 @@ export default function WorkloadDetailPage({ params }: { params: Promise<{ id: s
   const orgId = useAuth((s) => s.organization?.id || "");
   const queryClient = useQueryClient();
   const [message, setMessage] = useState<string | null>(null);
+  const [migrating, setMigrating] = useState(false);
 
   const workloadQuery = useQuery({ queryKey: ["workloads", orgId], queryFn: () => api.listWorkloads(orgId), enabled: !!orgId });
   const machinesQuery = useQuery({ queryKey: ["machines", orgId], queryFn: () => api.listMachines(orgId), enabled: !!orgId });
@@ -88,12 +90,13 @@ export default function WorkloadDetailPage({ params }: { params: Promise<{ id: s
 
           {/* Actions */}
           <div className="mt-6 flex flex-col gap-2">
-            <Link
-              href="/app/migrations"
-              className="block text-center font-mono text-[12px] tracking-[0.2em] text-bg bg-accent px-5 py-3 hover:bg-accent-dim transition-colors"
+            <button
+              onClick={() => setMigrating(true)}
+              disabled={!machine}
+              className="block text-center font-mono text-[12px] tracking-[0.2em] text-bg bg-accent px-5 py-3 hover:bg-accent-dim transition-colors disabled:opacity-30 disabled:pointer-events-none"
             >
               MOVE →
-            </Link>
+            </button>
             <div className="grid grid-cols-3 gap-2">
               <Action onClick={() => command.mutate("checkpoint")} disabled={!machine || command.isPending || !canStop}>CHECKPOINT</Action>
               <Action onClick={() => command.mutate(canStart ? "start" : "pause")} disabled={!machine || command.isPending}>
@@ -129,6 +132,14 @@ export default function WorkloadDetailPage({ params }: { params: Promise<{ id: s
           </div>
         </div>
       </div>
+
+      {migrating && (
+        <MigrateDialog
+          workload={workload}
+          machines={machinesQuery.data || []}
+          onClose={() => setMigrating(false)}
+        />
+      )}
     </div>
   );
 }

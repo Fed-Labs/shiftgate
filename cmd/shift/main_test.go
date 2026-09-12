@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"shift.dev/shift/internal/checkpoint"
+	"shift.dev/shift/internal/migration"
 	"shift.dev/shift/internal/model"
 )
 
@@ -112,5 +113,85 @@ func TestCheckpointMirrorCommand(t *testing.T) {
 	}
 	if result.CheckpointID != "checkpoint-test" || result.Objects != 4 || result.Bytes != 8192 {
 		t.Fatalf("unexpected CLI result: %+v", result)
+	}
+}
+
+// TestMachineCommandPrintsIdentity proves `machines` leads with the full
+// machine id — the exact value a remote `migrate --machine-id` pin compares
+// against, so it must never be truncated.
+func TestMachineCommandPrintsIdentity(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "agent.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Skipf("Unix socket integration is unavailable in this environment: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/machine" {
+			http.Error(writer, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(model.MachineCapabilities{
+			MachineID: "983da9077690dfb819724b0173ee754ea1a716dcb83f991412991dfc83c36380",
+			Hostname:  "workstation", OS: "linux", Architecture: "amd64",
+		})
+	})}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	defer func() {
+		_ = server.Shutdown(context.Background())
+		<-serveDone
+	}()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := run([]string{"--agent", "unix://" + socketPath, "machines"}, &stdout, &stderr); err != nil {
+		t.Fatalf("machines command failed: %v: %s", err, stderr.String())
+	}
+	rendered := stdout.String()
+	if !strings.Contains(rendered, "MACHINE 983da9077690dfb819724b0173ee754ea1a716dcb83f991412991dfc83c36380") {
+		t.Fatalf("machines output must lead with the full machine id:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "workstation") {
+		t.Fatalf("machines output missing the machine row:\n%s", rendered)
+	}
+}
+
+// TestPrintPreflight proves the dry-run report renders the verdict, both
+// machines, the network plan, and every warning and rejection with its
+// remedy — the output an operator reads before deciding to migrate.
+func TestPrintPreflight(t *testing.T) {
+	var output bytes.Buffer
+	printPreflight(&output, migration.PreflightResult{
+		Workload:      model.WorkloadSpec{Name: "demo"},
+		SourceMachine: model.MachineCapabilities{MachineID: "source-machine-1234", Hostname: "src", OS: "linux", Architecture: "amd64", Kernel: "6.12.38"},
+		Destination: model.MachineCapabilities{
+			MachineID: "destination-machine-5678", Hostname: "dst", OS: "linux", Architecture: "arm64",
+			Kernel: "6.12.38", MemoryBytes: 32 << 30,
+			CRIU: model.CRIUCapabilities{Installed: true, Version: "3.17.1", Healthy: true},
+		},
+		Mode:    model.MigrationLive,
+		Network: model.NetworkPlan{Summary: "forwarders re-established on ports 8080"},
+		Report: model.CompatibilityReport{Compatible: false, Issues: []model.CompatibilityIssue{
+			{Code: "ARCH_MISMATCH", Severity: "error", Resource: "cpu", Description: "source is amd64 and destination is arm64", Adaptation: "select a destination with matching architecture"},
+			{Code: "GPU_MODEL_DIFFERS", Severity: "warning", Resource: "gpu", Description: "workload used NVIDIA A100; destination offers NVIDIA H100", Adaptation: "validate accelerator-sensitive behavior after restore"},
+		}},
+	})
+	rendered := output.String()
+	for _, want := range []string{
+		"Preflight for workload demo (mode live)",
+		"destination: destinat on dst — linux/arm64",
+		"source:      source-m on src — linux/amd64",
+		"CRIU 3.17.1", "32.0 GiB memory",
+		"forwarders re-established on ports 8080",
+		"compatible:  no — the migration would be rejected",
+		"rejections (1) — each of these fails the migration:",
+		"ARCH_MISMATCH [cpu] source is amd64 and destination is arm64 — select a destination with matching architecture",
+		"warnings (1) — the migration proceeds, but check these:",
+		"GPU_MODEL_DIFFERS [gpu] workload used NVIDIA A100; destination offers NVIDIA H100",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("dry-run output missing %q:\n%s", want, rendered)
+		}
 	}
 }

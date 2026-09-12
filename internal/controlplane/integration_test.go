@@ -231,7 +231,14 @@ func TestPostgreSQLControlPlaneFlow(t *testing.T) {
 		t.Fatalf("portal before any subscription: %#v", portalError)
 	}
 
-	subscriptionPayload := `{"id":"evt_sub_created","type":"customer.subscription.created","data":{"object":{"id":"sub_1","customer":"cus_integration_1","status":"active","current_period_end":1893456000,"metadata":{"organization_id":"` + registration.Organization.ID + `","plan":"pro","max_storage_bytes":"999999999999","max_machines":"9999"}}}}`
+	// The webhook's event id is unique per run: ApplyStripeSubscription is
+	// idempotent by event id, so an id an earlier run already applied would
+	// be recognized as a replay and this run's upgrade would never land.
+	subscriptionEventID, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscriptionPayload := `{"id":"evt_` + subscriptionEventID + `","type":"customer.subscription.created","data":{"object":{"id":"sub_1","customer":"cus_integration_1","status":"active","current_period_end":1893456000,"metadata":{"organization_id":"` + registration.Organization.ID + `","plan":"pro","max_storage_bytes":"999999999999","max_machines":"9999"}}}}`
 	webhookRequest, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/webhooks/stripe", strings.NewReader(subscriptionPayload))
 	webhookRequest.Header.Set("Content-Type", "application/json")
 	webhookRequest.Header.Set("Stripe-Signature", stripeSignature("whsec_integration", subscriptionPayload, time.Now().Unix()))

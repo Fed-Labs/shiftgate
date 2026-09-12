@@ -109,6 +109,36 @@ type Entitlement struct {
 	StripeCustomerID string `json:"stripe_customer_id,omitempty"`
 }
 
+// StorageStatus is the hosted-storage answer for one organization. When the
+// control plane does not host storage, Enabled is false and the endpoint
+// fields are empty — the caller learns that self-hosted mirroring is the
+// deployment's model instead of a quota that does not exist.
+type StorageStatus struct {
+	Enabled          bool       `json:"enabled"`
+	Endpoint         string     `json:"endpoint,omitempty"`
+	Bucket           string     `json:"bucket,omitempty"`
+	Prefix           string     `json:"prefix,omitempty"`
+	UsedStorageBytes int64      `json:"used_storage_bytes"`
+	MaxStorageBytes  int64      `json:"max_storage_bytes"`
+	OverQuota        bool       `json:"over_quota"`
+	LastReconciledAt *time.Time `json:"last_reconciled_at,omitempty"`
+}
+
+// StorageCredentials is one short-lived credential set scoped to a single
+// organization's prefix. The secret fields exist only in this response and in
+// the agent process that consumed it; they are never logged or audited.
+type StorageCredentials struct {
+	Endpoint        string    `json:"endpoint"`
+	Region          string    `json:"region"`
+	Bucket          string    `json:"bucket"`
+	Prefix          string    `json:"prefix"`
+	AccessKeyID     string    `json:"access_key_id"`
+	SecretAccessKey string    `json:"secret_access_key"`
+	SessionToken    string    `json:"session_token"`
+	Expiration      time.Time `json:"expiration"`
+	ForcePathStyle  bool      `json:"force_path_style"`
+}
+
 type AuditEvent struct {
 	ID             string         `json:"id"`
 	OrganizationID string         `json:"organization_id,omitempty"`

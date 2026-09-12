@@ -3,9 +3,17 @@ import type {
   Machine, Workload, MigrationJob, MigrationEvent,
   Checkpoint, Entitlement, AuditEvent, APIKey, APIKeyCreated, AgentCommandResponse,
   UsageSummary, Health, ApiError, PlanCatalogEntry,
+  ComputeInventory, ComputeOffer, ComputeReservation, StorageStatus,
 } from "./types";
 
-const BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8090";
+// The control plane every dashboard client talks to — the same address agents
+// are told to use. The platform hosts the control plane, so the address is
+// part of the product (mirroring DefaultControlPlaneURL in
+// internal/config/config.go); NEXT_PUBLIC_API_URL overrides it when a
+// deployment serves the API from another origin.
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://shiftgate.dev";
+
+const BASE = API_BASE;
 
 class ApiClient {
   private accessToken: string | null = null;
@@ -180,6 +188,24 @@ class ApiClient {
   // Entitlements
   getEntitlement(orgId: string) {
     return this.request<Entitlement>(`/v1/organizations/${orgId}/entitlement`);
+  }
+
+  // Hosted checkpoint storage
+  getStorageStatus(orgId: string) {
+    return this.request<StorageStatus>(`/v1/organizations/${orgId}/storage`);
+  }
+
+  // Compute marketplace
+  computeInventory(orgId: string) {
+    return this.request<ComputeInventory>(`/v1/organizations/${orgId}/compute/inventory`);
+  }
+
+  listComputeOffers(orgId: string) {
+    return this.request<ComputeOffer[]>(`/v1/organizations/${orgId}/compute/offers`);
+  }
+
+  listComputeReservations(orgId: string) {
+    return this.request<ComputeReservation[]>(`/v1/organizations/${orgId}/compute/reservations`);
   }
 
   // Billing

@@ -117,6 +117,12 @@ const COMMAND_GROUPS: CommandGroup[] = [
         description: "Restore locally through the selected agent, validate health, and commit only after validation succeeds.",
       },
       {
+        name: "clone",
+        syntax: "shiftgate clone CHECKPOINT_ID --count N",
+        description: "Derive many independent running workloads from one checkpoint on this machine. Every clone keeps its own identity, root directory, and process; filesystem copies are reflink clone-on-write where the filesystem allows. The set is all-or-nothing — any member failure rolls back every member.",
+        flags: ["--count <1-128>", "--prefix <name>", "--parallel <1-16>", "--timeout <seconds>", "list", "inspect CLONE_ID", "rollback CLONE_ID"],
+      },
+      {
         name: "mirror",
         syntax: "shiftgate checkpoint mirror CHECKPOINT_ID",
         description: "Retry publication to configured local or S3-compatible object storage after a transient failure.",

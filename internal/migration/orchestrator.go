@@ -43,7 +43,11 @@ type CreateRequest struct {
 	WorkloadID  string              `json:"workload_id"`
 	Destination model.Destination   `json:"destination"`
 	Mode        model.MigrationMode `json:"mode"`
-	Timeout     time.Duration       `json:"timeout"`
+	// PreCopyPasses caps the pre-dump iterations of a live migration's
+	// pre-copy loop (0 = the default single pass). Ignored for cold
+	// migrations, which freeze the source immediately.
+	PreCopyPasses int           `json:"pre_copy_passes,omitempty"`
+	Timeout       time.Duration `json:"timeout"`
 }
 
 type Orchestrator struct {
@@ -126,7 +130,8 @@ func (o *Orchestrator) Create(parent context.Context, request CreateRequest) (mo
 	migration := model.Migration{
 		ID: id, WorkloadID: workload.Spec.ID, SourceMachineID: o.identity.Machine.ID,
 		Destination: request.Destination, Mode: request.Mode, Stage: model.MigrationCreated,
-		CreatedAt: now, UpdatedAt: now, SourcePreserved: true, Revision: 1,
+		PreCopyPasses: request.PreCopyPasses,
+		CreatedAt:     now, UpdatedAt: now, SourcePreserved: true, Revision: 1,
 		Events: []model.MigrationEvent{{Sequence: 1, Stage: model.MigrationCreated, Message: "migration created", Timestamp: now, Progress: 0}},
 	}
 	if err := o.records.Put(id, migration); err != nil {
@@ -145,6 +150,88 @@ func (o *Orchestrator) Create(parent context.Context, request CreateRequest) (mo
 	o.mu.Unlock()
 	go o.run(ctx, id, request.Timeout)
 	return migration, nil
+}
+
+// Preflight failures that carry the same codes a real migration would fail
+// with, so a dry run never invents its own vocabulary.
+var (
+	ErrDestinationUnreachable      = errors.New("destination unreachable")
+	ErrDestinationIsSource         = errors.New("source and destination resolve to the same machine identity")
+	ErrDestinationIdentityMismatch = errors.New("destination certificate does not match the requested machine")
+)
+
+// PreflightResult is everything a dry run can state about a would-be
+// migration: the two machines as the compatibility checker saw them, the
+// report, and the network plan the migration would apply. Nothing is moved,
+// frozen, or recorded — no migration record is created.
+type PreflightResult struct {
+	Workload      model.WorkloadSpec        `json:"workload"`
+	SourceMachine model.MachineCapabilities `json:"source_machine"`
+	Destination   model.MachineCapabilities `json:"destination"`
+	Mode          model.MigrationMode       `json:"mode"`
+	Report        model.CompatibilityReport `json:"report"`
+	Network       model.NetworkPlan         `json:"network"`
+}
+
+// Preflight answers whether a migration would be admitted, without moving
+// anything: it resolves the destination over the peer channel, gathers the
+// source inventory, and runs the same compatibility check the migration's
+// validate stage runs on the same inputs, plus the network plan computed
+// before anything moves. An unreachable destination, a destination that is
+// the source, and an identity mismatch come back as the sentinel errors —
+// the same codes a real migration would fail with; everything the checker
+// finds is in the report, where an error-severity issue means the migration
+// would be rejected.
+func (o *Orchestrator) Preflight(ctx context.Context, request CreateRequest) (PreflightResult, error) {
+	parsed, err := url.Parse(request.Destination.AgentURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return PreflightResult{}, errors.New("destination agent URL must use https")
+	}
+	if request.Mode == "" {
+		request.Mode = model.MigrationCold
+	}
+	if request.Mode != model.MigrationCold && request.Mode != model.MigrationLive {
+		return PreflightResult{}, fmt.Errorf("unsupported migration mode %q", request.Mode)
+	}
+	workload, err := o.runtime.Get(request.WorkloadID)
+	if err != nil {
+		return PreflightResult{}, err
+	}
+	if workload.Status != model.WorkloadRunning && workload.Status != model.WorkloadPaused {
+		return PreflightResult{}, fmt.Errorf("workload must be running or paused, got %s", workload.Status)
+	}
+	peer, err := o.clients(request.Destination)
+	if err != nil {
+		return PreflightResult{}, fmt.Errorf("%w: %v", ErrDestinationUnreachable, err)
+	}
+	destination, err := peer.Machine(ctx)
+	if err != nil {
+		return PreflightResult{}, fmt.Errorf("%w: %v", ErrDestinationUnreachable, err)
+	}
+	if destination.MachineID == o.identity.Machine.ID {
+		return PreflightResult{}, ErrDestinationIsSource
+	}
+	if request.Destination.MachineID != "" && request.Destination.MachineID != destination.MachineID {
+		return PreflightResult{}, ErrDestinationIdentityMismatch
+	}
+	source, err := o.inventory.Inspect(ctx)
+	if err != nil {
+		return PreflightResult{}, fmt.Errorf("source inventory: %w", err)
+	}
+	manifest := model.CheckpointManifest{
+		Format: model.StateFormatName, FormatVersion: model.StateFormatVersion,
+		Workload: workload.Spec, SourceMachine: source, RequiredBytes: int64(workload.Spec.Resources.StorageBytes),
+		DeviceNeeds: workload.Spec.Resources.GPUs,
+	}
+	report := (compatibility.Checker{}).Check(manifest, destination)
+	plan, err := network.PlanFor(workload.Spec)
+	if err != nil {
+		return PreflightResult{}, fmt.Errorf("network plan: %w", err)
+	}
+	return PreflightResult{
+		Workload: workload.Spec, SourceMachine: source, Destination: destination,
+		Mode: request.Mode, Report: report, Network: plan,
+	}, nil
 }
 
 func (o *Orchestrator) Get(id string) (model.Migration, error) {
@@ -207,13 +294,24 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 	var peer PeerClient
 	reserved := false
 	committed := false
+	// downtimeStart is the instant the workload actually stopped executing
+	// (the final checkpoint's freeze); workloadResumedAt is the instant it was
+	// provably running on the destination (the restore call resumes it and
+	// validates health before returning). Both stay zero until they happen.
 	downtimeStart := time.Time{}
+	workloadResumedAt := time.Time{}
 	fail := func(code string, cause error) {
 		// Downtime is the freeze window: zero when the failure happened
-		// before the workload was ever stopped.
+		// before the workload was ever stopped. Once the destination has
+		// resumed the workload the window ended there — later bookkeeping
+		// failures happen while it is already running.
 		downtime := time.Duration(0)
 		if !downtimeStart.IsZero() {
-			downtime = time.Since(downtimeStart)
+			end := time.Now()
+			if !workloadResumedAt.IsZero() {
+				end = workloadResumedAt
+			}
+			downtime = end.Sub(downtimeStart)
 		}
 		if errors.Is(cause, context.Canceled) {
 			o.handleCancellation(context.Background(), id, peer, reserved, committed, cause, downtime)
@@ -243,11 +341,11 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 		return
 	}
 	if destination.MachineID == o.identity.Machine.ID {
-		fail("DESTINATION_IS_SOURCE", errors.New("source and destination resolve to the same machine identity"))
+		fail("DESTINATION_IS_SOURCE", ErrDestinationIsSource)
 		return
 	}
 	if migration.Destination.MachineID != "" && migration.Destination.MachineID != destination.MachineID {
-		fail("DESTINATION_IDENTITY_MISMATCH", errors.New("destination certificate does not match the requested machine"))
+		fail("DESTINATION_IDENTITY_MISMATCH", ErrDestinationIdentityMismatch)
 		return
 	}
 	_ = o.update(id, func(value *model.Migration) error {
@@ -301,7 +399,10 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 	}
 	snapshotMessage := "freezing source and creating checkpoint"
 	if migration.Mode == model.MigrationLive {
-		snapshotMessage = "running CRIU pre-copy and creating the final checkpoint"
+		snapshotMessage = "running pre-copy passes while the workload keeps running"
+		if workload.Status != model.WorkloadRunning {
+			snapshotMessage = "workload is already paused; creating the final checkpoint directly"
+		}
 	}
 	// A drain-policy workload stops being reachable before it is frozen:
 	// its published listeners stop accepting and in-flight connections get
@@ -312,17 +413,142 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 		fail("STATE_PERSIST_FAILED", err)
 		return
 	}
-	downtimeStart = time.Now()
-	preCopy := migration.Mode == model.MigrationLive
-	manifest, err := o.checkpoints.Create(ctx, workload.Spec.ID, checkpoint.CreateOptions{
-		Kind: model.CheckpointFull, LeaveRunning: false,
-		TCPState: workload.Spec.NetworkPolicy == model.NetworkPreserve,
-		PreCopy:  preCopy,
-		Timeout:  timeout / 2,
-	})
-	if err != nil {
-		fail("CHECKPOINT_FAILED", err)
-		return
+	var manifest model.CheckpointManifest
+	var preCopyTransferred int64
+	var live *checkpoint.LiveSession
+	if migration.Mode == model.MigrationLive {
+		// The pass cap travels with the migration record so it survives the
+		// request that started it.
+		if live, err = o.checkpoints.BeginLive(ctx, workload.Spec.ID, checkpoint.LiveOptions{
+			Passes:   migration.PreCopyPasses,
+			TCPState: workload.Spec.NetworkPolicy == model.NetworkPreserve,
+			Timeout:  timeout / 2,
+		}); err != nil {
+			fail("CHECKPOINT_FAILED", err)
+			return
+		}
+		// Abort is deferred rather than placed on each failure path: it is a
+		// no-op once Finalize or Abort closed the session, and any failure
+		// before that must release the staging tree and the single-checkpoint
+		// guard the session holds.
+		defer live.Abort()
+	}
+	// Downtime is the freeze window the migration itself adds. A cold
+	// migration freezes inside its checkpoint, and a live migration of an
+	// already-paused workload cannot know when that pause happened, so for
+	// both the checkpoint's start remains the earliest defensible bound. A
+	// live migration of a running workload freezes only inside Finalize, so
+	// until that instant there is no downtime window at all — a failure
+	// before the freeze leaves the workload having run the whole time.
+	downtimeStart = time.Time{}
+	if live == nil || !live.CanPass() {
+		downtimeStart = time.Now()
+	}
+	if live != nil && live.CanPass() {
+		// Spec §10: each pass's images transfer the moment the pass completes
+		// — while the workload keeps running — so the freeze at the end
+		// carries only the final delta. The destination session opens here
+		// rather than in a separate stage: the reservation is measured from
+		// pass 1's actual packaged size instead of guessed, and the key the
+		// passes are encrypted under is imported before the first chunk
+		// leaves — the chunks land in KEY_READY, before any manifest exists.
+		firstPass, passErr := live.Pass(ctx)
+		if passErr != nil {
+			fail("CHECKPOINT_FAILED", passErr)
+			return
+		}
+		estimated, estimateErr := checkpoint.EstimateLiveTransferBytes(workload.Spec, firstPass.Asset.StoredSize, live.PassLimit())
+		if estimateErr != nil {
+			// The walk came back partial: reserve the measured part and warn.
+			// The capture itself fails on the same unreadable tree, so the
+			// reservation never outlives the transfer it was measured for.
+			o.logger.Warn("live transfer reservation used a partial root walk",
+				"migration_id", id, "workload_id", workload.Spec.ID, "error", estimateErr)
+		}
+		if _, err := peer.Reserve(ctx, transfer.ReserveRequest{
+			ID: id, SourceMachineID: o.identity.Machine.ID, WorkloadID: workload.Spec.ID,
+			EstimatedBytes: estimated, ExpiresAt: time.Now().Add(timeout),
+		}); err != nil {
+			fail("DESTINATION_RESERVATION_FAILED", err)
+			return
+		}
+		reserved = true
+		dataKey, keyErr := o.keys.ExportWorkloadKey(workload.Spec.ID, live.KeyVersion())
+		if keyErr != nil {
+			fail("KEY_EXPORT_FAILED", keyErr)
+			return
+		}
+		if err := peer.ImportKey(ctx, id, workload.Spec.ID, live.KeyVersion(), dataKey); err != nil {
+			fail("KEY_TRANSFER_FAILED", err)
+			return
+		}
+		_ = o.update(id, func(value *model.Migration) error {
+			appendEvent(value, "destination session reserved; pre-copy transfers begin while the workload keeps running", 0.12, 0, 0)
+			return nil
+		})
+		current := firstPass
+		for {
+			uploadStarted := time.Now()
+			passBytes, uploadErr := o.uploadChunks(ctx, id, peer, current.Asset.Chunks,
+				0.12+0.16*float64(current.Index-1)/float64(live.PassLimit()), 0.16/float64(live.PassLimit()),
+				fmt.Sprintf("transferring pre-copy pass %d while the workload keeps running", current.Index))
+			if uploadErr != nil {
+				fail("CHUNK_TRANSFER_FAILED", uploadErr)
+				return
+			}
+			if o.diagnostics != nil {
+				o.diagnostics.Transferred("upload", passBytes, time.Since(uploadStarted))
+			}
+			preCopyTransferred += passBytes
+			// Recorded per pass, not once at the end: a migration that fails
+			// mid-loop still reports the bytes its passes actually moved.
+			_ = o.update(id, func(value *model.Migration) error {
+				value.Metrics.PreCopyTransferredBytes = preCopyTransferred
+				value.Metrics.TransferredBytes = preCopyTransferred
+				return nil
+			})
+			if !current.More {
+				break
+			}
+			if current, passErr = live.Pass(ctx); passErr != nil {
+				fail("CHECKPOINT_FAILED", passErr)
+				return
+			}
+		}
+		_ = o.progress(id, "freezing the workload for the final delta checkpoint", 0.28, 0, 0)
+	}
+	if live != nil {
+		manifest, err = live.Finalize(ctx)
+		if err != nil {
+			// A freeze that happened inside the failing Finalize still counts:
+			// the workload was stopped from that instant until the session
+			// thawed it, and only that window is the migration's downtime —
+			// never the passes, which ran while it was live.
+			if frozen := live.FreezeStartedAt(); !frozen.IsZero() {
+				downtimeStart = frozen
+			}
+			fail("CHECKPOINT_FAILED", err)
+			return
+		}
+	} else {
+		manifest, err = o.checkpoints.Create(ctx, workload.Spec.ID, checkpoint.CreateOptions{
+			Kind: model.CheckpointFull, LeaveRunning: false,
+			TCPState: workload.Spec.NetworkPolicy == model.NetworkPreserve,
+			Timeout:  timeout / 2,
+		})
+		if err != nil {
+			fail("CHECKPOINT_FAILED", err)
+			return
+		}
+	}
+	// Downtime begins at the instant the checkpoint actually froze the
+	// workload, not at the checkpoint's start: live-mode pre-copy passes run
+	// while the workload is still live and are not downtime. A workload that
+	// was already paused when the migration began was frozen before this
+	// migration existed, so its freeze instant is unknown and the
+	// checkpoint's start remains the earliest defensible bound.
+	if !manifest.Metrics.FreezeStartedAt.IsZero() {
+		downtimeStart = manifest.Metrics.FreezeStartedAt
 	}
 	if err := o.update(id, func(value *model.Migration) error {
 		value.CheckpointID = manifest.ID
@@ -333,26 +559,32 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 		fail("STATE_PERSIST_FAILED", err)
 		return
 	}
-	if err := o.transition(id, model.MigrationPrepare, "reserving destination and establishing workload key", 0.28); err != nil {
-		fail("STATE_PERSIST_FAILED", err)
-		return
-	}
-	if _, err := peer.Reserve(ctx, transfer.ReserveRequest{
-		ID: id, SourceMachineID: o.identity.Machine.ID, WorkloadID: workload.Spec.ID,
-		EstimatedBytes: manifest.Metrics.StoredBytes, ExpiresAt: time.Now().Add(timeout),
-	}); err != nil {
-		fail("DESTINATION_RESERVATION_FAILED", err)
-		return
-	}
-	reserved = true
-	dataKey, err := o.keys.ExportWorkloadKey(workload.Spec.ID, manifest.Security.KeyVersion)
-	if err != nil {
-		fail("KEY_EXPORT_FAILED", err)
-		return
-	}
-	if err := peer.ImportKey(ctx, id, workload.Spec.ID, manifest.Security.KeyVersion, dataKey); err != nil {
-		fail("KEY_TRANSFER_FAILED", err)
-		return
+	if !reserved {
+		// A cold migration — or a live one of a workload that was already
+		// paused, with nothing to pre-copy — opens the destination session
+		// against the finished checkpoint, so the reservation is its exact
+		// stored size.
+		if err := o.transition(id, model.MigrationPrepare, "reserving destination and establishing workload key", 0.28); err != nil {
+			fail("STATE_PERSIST_FAILED", err)
+			return
+		}
+		if _, err := peer.Reserve(ctx, transfer.ReserveRequest{
+			ID: id, SourceMachineID: o.identity.Machine.ID, WorkloadID: workload.Spec.ID,
+			EstimatedBytes: manifest.Metrics.StoredBytes, ExpiresAt: time.Now().Add(timeout),
+		}); err != nil {
+			fail("DESTINATION_RESERVATION_FAILED", err)
+			return
+		}
+		reserved = true
+		dataKey, err := o.keys.ExportWorkloadKey(workload.Spec.ID, manifest.Security.KeyVersion)
+		if err != nil {
+			fail("KEY_EXPORT_FAILED", err)
+			return
+		}
+		if err := peer.ImportKey(ctx, id, workload.Spec.ID, manifest.Security.KeyVersion, dataKey); err != nil {
+			fail("KEY_TRANSFER_FAILED", err)
+			return
+		}
 	}
 	if err := o.transition(id, model.MigrationTransfer, "negotiating missing chunks", 0.32); err != nil {
 		fail("STATE_PERSIST_FAILED", err)
@@ -364,7 +596,7 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 		return
 	}
 	transferStarted := time.Now()
-	transferred, err := o.uploadChunks(ctx, id, peer, missing.Missing)
+	transferred, err := o.uploadChunks(ctx, id, peer, missing.Missing, 0.32, 0.38, "transferring encrypted checkpoint chunks")
 	transferDuration := time.Since(transferStarted)
 	if err != nil {
 		fail("CHUNK_TRANSFER_FAILED", err)
@@ -374,7 +606,11 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 		o.diagnostics.Transferred("upload", transferred, transferDuration)
 	}
 	if err := o.update(id, func(value *model.Migration) error {
-		value.Metrics.TransferredBytes = transferred
+		// TransferredBytes counts everything the migration moved — the
+		// pre-copy passes plus the frozen window — while the rate describes
+		// only the frozen window, the part that was downtime.
+		value.Metrics.TransferredBytes = preCopyTransferred + transferred
+		value.Metrics.PreCopyTransferredBytes = preCopyTransferred
 		value.Metrics.DeduplicatedBytes = missing.DeduplicatedBytes
 		value.Metrics.TransferDuration = transferDuration
 		if transferDuration > 0 {
@@ -403,8 +639,14 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 		return
 	}
 	restoreDuration := time.Since(restoreStarted)
+	// The restore call returns with the process already resumed and health
+	// validated on the destination, so the freeze window ends here. The
+	// validation round-trip, commit, and source cleanup that follow happen
+	// while the workload is running and are not downtime.
+	workloadResumedAt = time.Now()
 	_ = o.update(id, func(value *model.Migration) error {
 		value.Metrics.RestoreDuration = restoreDuration
+		value.Metrics.Downtime = workloadResumedAt.Sub(downtimeStart)
 		return nil
 	})
 	if err := o.transition(id, model.MigrationPostValidate, "destination process passed health validation", 0.90); err != nil {
@@ -441,7 +683,6 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 	o.recordSourceOutcome(id, workload.Spec.ID, networkPlan, network.StatusCompleted, "workload migrated to "+destination.MachineID)
 	cleanupErr := o.stopSourceWithRetry(workload.Spec.ID)
 	if err := o.update(id, func(value *model.Migration) error {
-		value.Metrics.Downtime = time.Since(downtimeStart)
 		if cleanupErr == nil {
 			value.SourcePreserved = false
 		} else {
@@ -464,10 +705,12 @@ func (o *Orchestrator) run(parent context.Context, id string, timeout time.Durat
 		return
 	}
 	o.logger.Info("migration completed", "migration_id", id, "workload_id", workload.Spec.ID, "destination", destination.MachineID, "source_preserved", cleanupErr != nil)
-	o.recordOutcome(id, observability.OutcomeSuccess, time.Since(downtimeStart))
+	// The same freeze-to-resumed window the record reports, not the whole
+	// migration's wall clock.
+	o.recordOutcome(id, observability.OutcomeSuccess, workloadResumedAt.Sub(downtimeStart))
 }
 
-func (o *Orchestrator) uploadChunks(ctx context.Context, migrationID string, peer PeerClient, refs []model.ChunkRef) (int64, error) {
+func (o *Orchestrator) uploadChunks(ctx context.Context, migrationID string, peer PeerClient, refs []model.ChunkRef, progressBase, progressSpan float64, message string) (int64, error) {
 	if len(refs) == 0 {
 		return 0, nil
 	}
@@ -539,7 +782,7 @@ func (o *Orchestrator) uploadChunks(ctx context.Context, migrationID string, pee
 		transferred += result.ref.StoredSize
 		completed++
 		if completed == len(refs) || completed%8 == 0 {
-			_ = o.progress(migrationID, "transferring encrypted checkpoint chunks", 0.32+0.38*float64(transferred)/float64(maxInt64(total, 1)), transferred, total)
+			_ = o.progress(migrationID, message, progressBase+progressSpan*float64(transferred)/float64(maxInt64(total, 1)), transferred, total)
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -566,6 +809,10 @@ func (o *Orchestrator) handleFailure(ctx context.Context, id string, peer PeerCl
 	_ = o.update(id, func(value *model.Migration) error {
 		value.FailureCode = code
 		value.FailureReason = cause.Error()
+		// The freeze window the attempt actually caused — zero when the
+		// workload was never stopped, which a live migration that fails
+		// before its freeze must be able to state plainly.
+		value.Metrics.Downtime = downtime
 		return nil
 	})
 	if committed {
@@ -576,13 +823,19 @@ func (o *Orchestrator) handleFailure(ctx context.Context, id string, peer PeerCl
 		o.recordOutcome(id, observability.OutcomeSuccess, downtime)
 		return
 	}
-	if model.CanTransition(migration.Stage, model.MigrationFailed) {
+	// Roll the migration back rather than parking it in FAILED: observers
+	// treat FAILED as terminal, so a migration whose source is still being
+	// preserved must never be observable in FAILED. The stage machine lets
+	// every pre-commit stage enter ROLLING_BACK directly; the terminal
+	// state is decided after the rollback attempt — ROLLED_BACK when the
+	// source was preserved, FAILED only when the rollback itself needs an
+	// operator.
+	if model.CanTransition(migration.Stage, model.MigrationRollingBack) {
+		_ = o.transition(id, model.MigrationRollingBack, "rolling back destination and preserving source", migrationProgress(migration.Stage))
+	} else if model.CanTransition(migration.Stage, model.MigrationFailed) {
 		_ = o.transition(id, model.MigrationFailed, cause.Error(), migrationProgress(migration.Stage))
 	}
 	migration, _ = o.records.Get(id)
-	if model.CanTransition(migration.Stage, model.MigrationRollingBack) {
-		_ = o.transition(id, model.MigrationRollingBack, "rolling back destination and preserving source", migrationProgress(migration.Stage))
-	}
 	var rollbackErrors []string
 	if reserved && peer != nil {
 		rollbackCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -629,6 +882,7 @@ func (o *Orchestrator) handleCancellation(ctx context.Context, id string, peer P
 		value.FailureCode = "MIGRATION_CANCELLED"
 		value.FailureReason = cause.Error()
 		value.SourcePreserved = true
+		value.Metrics.Downtime = downtime
 		return nil
 	})
 	if committed {

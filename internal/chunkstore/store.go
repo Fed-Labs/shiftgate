@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/klauspost/compress/zstd"
+
 	"shift.dev/shift/internal/model"
 	"shift.dev/shift/internal/securestore"
 )
@@ -25,6 +27,27 @@ const (
 	magic             = "SHFTCHK1"
 	fileFormatVersion = uint16(1)
 	maxEncodedChunk   = 96 << 20
+)
+
+// The zstd codec is package state because its encoder and decoder are
+// expensive to build and safe for concurrent EncodeAll/DecodeAll use.
+// SpeedDefault (level 3) both compresses better and runs faster than the
+// gzip BestSpeed implementation this replaced.
+var (
+	zstdEncoder = sync.OnceValue(func() *zstd.Encoder {
+		encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+		if err != nil {
+			panic("chunkstore: zstd encoder: " + err.Error())
+		}
+		return encoder
+	})
+	zstdDecoder = sync.OnceValue(func() *zstd.Decoder {
+		decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+		if err != nil {
+			panic("chunkstore: zstd decoder: " + err.Error())
+		}
+		return decoder
+	})
 )
 
 type Store struct {
@@ -257,10 +280,7 @@ func (s *Store) putChunk(workloadID string, keyVersion uint32, dataKey []byte, s
 		return model.ChunkRef{}, false, err
 	}
 	plainDigest := sha256.Sum256(plaintext)
-	compressed, err := compress(plaintext)
-	if err != nil {
-		return model.ChunkRef{}, false, err
-	}
+	compressed := compress(plaintext)
 	aad := chunkAAD(workloadID, address, keyVersion, int64(len(plaintext)))
 	nonce, ciphertext, err := securestore.Encrypt(dataKey, workloadID, "checkpoint-chunk", compressed, aad)
 	if err != nil {
@@ -279,7 +299,7 @@ func (s *Store) putChunk(workloadID string, keyVersion uint32, dataKey []byte, s
 		CipherSHA256: hex.EncodeToString(cipherDigest[:]),
 		PlainSHA256:  hex.EncodeToString(plainDigest[:]),
 		Sequence:     sequence,
-		Compression:  "gzip",
+		Compression:  "zstd",
 		Encryption:   "AES-256-GCM",
 	}
 	path, err := s.chunkPath(ref)
@@ -293,8 +313,9 @@ func (s *Store) putChunk(workloadID string, keyVersion uint32, dataKey []byte, s
 			existingRef := ref
 			existingRef.StoredSize = int64(len(existing))
 			existingRef.CipherSHA256 = hex.EncodeToString(existingDigest[:])
-			existingPlaintext, verifyErr := s.readChunk(workloadID, existingRef)
+			existingPlaintext, codec, verifyErr := s.verifyChunk(workloadID, existingRef)
 			if verifyErr == nil && bytes.Equal(existingPlaintext, plaintext) {
+				existingRef.Compression = codec
 				return existingRef, true, nil
 			}
 		}
@@ -355,61 +376,73 @@ func (s *Store) existingRef(workloadID string, reference model.ChunkRef, expecte
 	resolved.StoredSize = int64(len(encoded))
 	digest := sha256.Sum256(encoded)
 	resolved.CipherSHA256 = hex.EncodeToString(digest[:])
-	plaintext, err := s.readChunk(workloadID, resolved)
+	plaintext, codec, err := s.verifyChunk(workloadID, resolved)
 	if err != nil {
 		return model.ChunkRef{}, fmt.Errorf("verify concurrent chunk %s: %w", reference.Address, err)
 	}
 	if !bytes.Equal(plaintext, expected) {
 		return model.ChunkRef{}, fmt.Errorf("content address collision or corrupt existing chunk %s", reference.Address)
 	}
+	resolved.Compression = codec
 	return resolved, nil
 }
 
 func (s *Store) readChunk(workloadID string, ref model.ChunkRef) ([]byte, error) {
+	plaintext, _, err := s.verifyChunk(workloadID, ref)
+	return plaintext, err
+}
+
+// verifyChunk reads and fully verifies a stored chunk and reports which
+// compression codec the stored bytes actually use. A chunk reached through a
+// manifest was labeled by its writer, but a deduplicated chunk found on disk
+// is reached through a ref the current write fabricated — it may predate the
+// zstd switch — so the codec is resolved from the bytes and the caller can
+// label the manifest truthfully.
+func (s *Store) verifyChunk(workloadID string, ref model.ChunkRef) ([]byte, string, error) {
 	path, err := s.chunkPath(ref)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	encoded, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if int64(len(encoded)) != ref.StoredSize || len(encoded) > maxEncodedChunk {
-		return nil, errors.New("invalid encoded chunk size")
+		return nil, "", errors.New("invalid encoded chunk size")
 	}
 	cipherDigest := sha256.Sum256(encoded)
 	if hex.EncodeToString(cipherDigest[:]) != ref.CipherSHA256 {
-		return nil, errors.New("ciphertext digest mismatch")
+		return nil, "", errors.New("ciphertext digest mismatch")
 	}
 	keyVersion, plainSize, nonce, ciphertext, err := decodeChunk(encoded)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if keyVersion != ref.KeyVersion || plainSize != ref.PlainSize {
-		return nil, errors.New("chunk header does not match manifest")
+		return nil, "", errors.New("chunk header does not match manifest")
 	}
 	dataKey, err := s.keys.WorkloadKey(workloadID, keyVersion)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	aad := chunkAAD(workloadID, ref.Address, keyVersion, plainSize)
 	compressed, err := securestore.Decrypt(dataKey, workloadID, "checkpoint-chunk", nonce, ciphertext, aad)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	plaintext, err := decompress(compressed, plainSize)
+	plaintext, codec, err := decompress(compressed, plainSize)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	plainDigest := sha256.Sum256(plaintext)
 	if hex.EncodeToString(plainDigest[:]) != ref.PlainSHA256 {
-		return nil, errors.New("plaintext digest mismatch")
+		return nil, "", errors.New("plaintext digest mismatch")
 	}
 	address, err := securestore.Address(dataKey, workloadID, plaintext)
 	if err != nil || address != ref.Address {
-		return nil, errors.New("content address mismatch")
+		return nil, "", errors.New("content address mismatch")
 	}
-	return plaintext, nil
+	return plaintext, codec, nil
 }
 
 func (s *Store) chunkPath(ref model.ChunkRef) (string, error) {
@@ -479,36 +512,58 @@ func decodeChunk(encoded []byte) (uint32, int64, []byte, []byte, error) {
 	return keyVersion, plainSize, nonce, ciphertext, nil
 }
 
-func compress(plaintext []byte) ([]byte, error) {
-	var output bytes.Buffer
-	writer, err := gzip.NewWriterLevel(&output, gzip.BestSpeed)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := writer.Write(plaintext); err != nil {
-		return nil, err
-	}
-	if err := writer.Close(); err != nil {
-		return nil, err
-	}
-	return output.Bytes(), nil
+// compress shrinks a chunk before encryption (compress-then-encrypt: the
+// AEAD cover is over the compressed bytes). zstd at SpeedDefault both
+// compresses better and runs faster than the gzip BestSpeed codec this
+// replaced.
+func compress(plaintext []byte) []byte {
+	return zstdEncoder().EncodeAll(plaintext, make([]byte, 0, len(plaintext)/2))
 }
 
-func decompress(compressed []byte, expectedSize int64) ([]byte, error) {
-	reader, err := gzip.NewReader(bytes.NewReader(compressed))
-	if err != nil {
-		return nil, err
+// The frame magic identifies which codec a decrypted chunk body uses: gzip
+// (RFC 1952) and zstd (RFC 8878) frames are unambiguous and neither can
+// begin with the other's magic. Chunks written before the zstd switch are
+// gzip, and a deduplicated chunk found on disk carries no manifest naming
+// its codec, so the bytes themselves have to say. Which codec ran is not a
+// security claim — the AEAD tag, plaintext digest, and content address below
+// are what verify a chunk.
+var (
+	gzipFrameMagic = []byte{0x1f, 0x8b}
+	zstdFrameMagic = []byte{0x28, 0xb5, 0x2f, 0xfd}
+)
+
+// decompress reverses compress for either codec the store has ever written,
+// returning the codec it found. The size check runs after decompression so a
+// stream that expands to anything other than the recorded plaintext size is
+// rejected however it got there.
+func decompress(compressed []byte, expectedSize int64) ([]byte, string, error) {
+	if bytes.HasPrefix(compressed, zstdFrameMagic) {
+		plaintext, err := zstdDecoder().DecodeAll(compressed, nil)
+		if err != nil {
+			return nil, "", err
+		}
+		if int64(len(plaintext)) != expectedSize {
+			return nil, "", errors.New("decompressed chunk size mismatch")
+		}
+		return plaintext, "zstd", nil
 	}
-	defer reader.Close()
-	limited := io.LimitReader(reader, expectedSize+1)
-	plaintext, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, err
+	if bytes.HasPrefix(compressed, gzipFrameMagic) {
+		reader, err := gzip.NewReader(bytes.NewReader(compressed))
+		if err != nil {
+			return nil, "", err
+		}
+		defer reader.Close()
+		limited := io.LimitReader(reader, expectedSize+1)
+		plaintext, err := io.ReadAll(limited)
+		if err != nil {
+			return nil, "", err
+		}
+		if int64(len(plaintext)) != expectedSize {
+			return nil, "", errors.New("decompressed chunk size mismatch")
+		}
+		return plaintext, "gzip", nil
 	}
-	if int64(len(plaintext)) != expectedSize {
-		return nil, errors.New("decompressed chunk size mismatch")
-	}
-	return plaintext, nil
+	return nil, "", errors.New("unrecognized chunk compression")
 }
 
 func copyContext(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {

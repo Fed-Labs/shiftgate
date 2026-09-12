@@ -73,21 +73,28 @@ func TestSCIMUserStore(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	organizationID := testOrganization(t, store, "scim")
+	// Emails and external ids are unique per run: lower(email) and external_id
+	// are globally unique in the schema, and these tests share one database
+	// across runs.
+	run, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	first, err := store.SCIMCreateUser(ctx, organizationID, SCIMUser{Email: "scim-one@example.test", DisplayName: "One", ExternalID: "ext-one"}, testAudit(organizationID, "scim.user.create", "one"))
+	first, err := store.SCIMCreateUser(ctx, organizationID, SCIMUser{Email: "scim-one-" + run + "@example.test", DisplayName: "One", ExternalID: "ext-one-" + run}, testAudit(organizationID, "scim.user.create", "one"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !first.Active {
 		t.Fatal("a created user starts active")
 	}
-	second, err := store.SCIMCreateUser(ctx, organizationID, SCIMUser{Email: "scim-two@example.test", DisplayName: "Two", ExternalID: "ext-two"}, testAudit(organizationID, "scim.user.create", "two"))
+	second, err := store.SCIMCreateUser(ctx, organizationID, SCIMUser{Email: "scim-two-" + run + "@example.test", DisplayName: "Two", ExternalID: "ext-two-" + run}, testAudit(organizationID, "scim.user.create", "two"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// A duplicate email or external id is a conflict.
-	if _, err := store.SCIMCreateUser(ctx, organizationID, SCIMUser{Email: "scim-one@example.test", DisplayName: "Other"}, testAudit(organizationID, "scim.user.create", "dup")); err != ErrSCIMConflict {
+	if _, err := store.SCIMCreateUser(ctx, organizationID, SCIMUser{Email: first.Email, DisplayName: "Other"}, testAudit(organizationID, "scim.user.create", "dup")); err != ErrSCIMConflict {
 		t.Fatalf("duplicate email returned %v, want ErrSCIMConflict", err)
 	}
 
@@ -105,13 +112,17 @@ func TestSCIMUserStore(t *testing.T) {
 	}
 
 	// Filters run through the parameterized renderer.
-	filtered, err := store.SCIMUsers(ctx, organizationID, []SCIMClause{{Attribute: "email", Operator: "sw", Value: "scim-one"}})
+	filtered, err := store.SCIMUsers(ctx, organizationID, []SCIMClause{{Attribute: "email", Operator: "sw", Value: "scim-one-" + run}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(filtered) != 1 || filtered[0].ID != first.ID {
 		t.Fatalf("prefix filter returned %+v", filtered)
 	}
+	// The "scim" contains-filter also matches the founding member's email
+	// (dbtest-scim-…): the external-id presence clause is what narrows the
+	// conjunction to provisioned accounts. The listing is scoped to this
+	// run's fresh organization, so other runs' users cannot appear.
 	both, err := store.SCIMUsers(ctx, organizationID, []SCIMClause{{Attribute: "email", Operator: "co", Value: "scim"}, {Attribute: "external_id", Operator: "pr"}})
 	if err != nil {
 		t.Fatal(err)
@@ -121,11 +132,11 @@ func TestSCIMUserStore(t *testing.T) {
 	}
 
 	// A full replacement changes every idP-controlled field.
-	replaced, err := store.SCIMReplaceUser(ctx, organizationID, first.ID, SCIMUser{Email: "renamed@example.test", DisplayName: "Renamed", ExternalID: "ext-one-b", Active: false}, testAudit(organizationID, "scim.user.replace", first.ID))
+	replaced, err := store.SCIMReplaceUser(ctx, organizationID, first.ID, SCIMUser{Email: "renamed-" + run + "@example.test", DisplayName: "Renamed", ExternalID: "ext-one-b-" + run, Active: false}, testAudit(organizationID, "scim.user.replace", first.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replaced.Email != "renamed@example.test" || replaced.Active {
+	if replaced.Email != "renamed-"+run+"@example.test" || replaced.Active {
 		t.Fatalf("replacement returned %+v", replaced)
 	}
 
@@ -177,22 +188,33 @@ func TestFederateSSOLink(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	organizationID := testOrganization(t, store, "sso")
-	if err := store.SetOrganizationSSO(ctx, organizationID, "federated.example.test", true, testAudit(organizationID, "organization.sso", organizationID)); err != nil {
+	// The enforced domain, the federated subjects, and both emails are unique
+	// per run: an organization's email domain, (sso_issuer, sso_subject), and
+	// lower(email) are each globally unique in the schema, and these tests
+	// share one database across runs.
+	run, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain := "federated-" + run + ".example.test"
+	issuer := "https://issuer.example.test"
+	newcomer := "newcomer@" + domain
+	if err := store.SetOrganizationSSO(ctx, organizationID, domain, true, testAudit(organizationID, "organization.sso", organizationID)); err != nil {
 		t.Fatal(err)
 	}
 
 	// The domain is now enforced.
-	enforced, err := store.SSOEnforcedForEmail(ctx, "newcomer@federated.example.test")
+	enforced, err := store.SSOEnforcedForEmail(ctx, newcomer)
 	if err != nil || !enforced {
 		t.Fatalf("enforcement lookup returned %v, %v", enforced, err)
 	}
 
 	// A first login provisions the account.
-	first, err := store.FederateSSOLink(ctx, "https://issuer.example.test", "subject-1", "newcomer@federated.example.test", "New Comer", testAudit(organizationID, "user.sso_login", "x"))
+	first, err := store.FederateSSOLink(ctx, issuer, "subject-"+run+"-1", newcomer, "New Comer", testAudit(organizationID, "user.sso_login", "x"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.SSOIssuer != "https://issuer.example.test" || first.SSOSubject != "subject-1" {
+	if first.SSOIssuer != issuer || first.SSOSubject != "subject-"+run+"-1" {
 		t.Fatalf("linkage did not stick: %+v", first)
 	}
 	if first.PasswordHash != "" {
@@ -206,7 +228,7 @@ func TestFederateSSOLink(t *testing.T) {
 	}
 
 	// The same identity returns the same account.
-	again, err := store.FederateSSOLink(ctx, "https://issuer.example.test", "subject-1", "newcomer@federated.example.test", "New Comer", testAudit(organizationID, "user.sso_login", "x"))
+	again, err := store.FederateSSOLink(ctx, issuer, "subject-"+run+"-1", newcomer, "New Comer", testAudit(organizationID, "user.sso_login", "x"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +237,7 @@ func TestFederateSSOLink(t *testing.T) {
 	}
 
 	// A different subject claiming the same email is refused.
-	if _, err := store.FederateSSOLink(ctx, "https://issuer.example.test", "subject-2", "newcomer@federated.example.test", "Impostor", testAudit(organizationID, "user.sso_login", "x")); err != ErrSSOAccountLinked {
+	if _, err := store.FederateSSOLink(ctx, issuer, "subject-"+run+"-2", newcomer, "Impostor", testAudit(organizationID, "user.sso_login", "x")); err != ErrSSOAccountLinked {
 		t.Fatalf("impostor login returned %v, want ErrSSOAccountLinked", err)
 	}
 
@@ -228,10 +250,10 @@ func TestFederateSSOLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.Register(ctx, passwordUserID, "existing@mixed.example.test", "argon2-hash", "Existing", passwordOrganizationID, "Mixed", AuditInput{ID: "audit-" + passwordUserID, OrganizationID: passwordOrganizationID, ActorUserID: passwordUserID, Action: "user.register", ResourceType: "user", ResourceID: passwordUserID, Metadata: map[string]any{}}); err != nil {
+	if _, _, err := store.Register(ctx, passwordUserID, "existing-"+run+"@mixed.example.test", "argon2-hash", "Existing", passwordOrganizationID, "Mixed", AuditInput{ID: "audit-" + passwordUserID, OrganizationID: passwordOrganizationID, ActorUserID: passwordUserID, Action: "user.register", ResourceType: "user", ResourceID: passwordUserID, Metadata: map[string]any{}}); err != nil {
 		t.Fatal(err)
 	}
-	linked, err := store.FederateSSOLink(ctx, "https://issuer.example.test", "subject-3", "existing@mixed.example.test", "Existing", testAudit(organizationID, "user.sso_login", "x"))
+	linked, err := store.FederateSSOLink(ctx, issuer, "subject-"+run+"-3", "existing-"+run+"@mixed.example.test", "Existing", testAudit(organizationID, "user.sso_login", "x"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +265,7 @@ func TestFederateSSOLink(t *testing.T) {
 	if _, err := store.SCIMSetActive(ctx, organizationID, first.ID, false, testAudit(organizationID, "scim.user.delete", first.ID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.FederateSSOLink(ctx, "https://issuer.example.test", "subject-1", "newcomer@federated.example.test", "New Comer", testAudit(organizationID, "user.sso_login", "x")); err != ErrUserDisabled {
+	if _, err := store.FederateSSOLink(ctx, issuer, "subject-"+run+"-1", newcomer, "New Comer", testAudit(organizationID, "user.sso_login", "x")); err != ErrUserDisabled {
 		t.Fatalf("disabled login returned %v, want ErrUserDisabled", err)
 	}
 }

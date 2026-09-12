@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -54,6 +55,34 @@ type RestoreRecord struct {
 	CreatedAt        time.Time       `json:"created_at"`
 	UpdatedAt        time.Time       `json:"updated_at"`
 	Error            string          `json:"error,omitempty"`
+	// Lazy marks a restore that started its process before the memory image
+	// was fully loaded: a lazy-pages daemon serves the rest through
+	// userfaultfd as the workload touches it. The restore directory is
+	// retained for that daemon, which reads pages from it, and is removed
+	// once the daemon exits — when it has finished serving: every image page
+	// transferred, or the process gone.
+	Lazy bool `json:"lazy,omitempty"`
+	// TimeToFirstExecutionMS measures the CRIU restore call: from its start
+	// to the moment the restored tree is executing. For a lazy restore that
+	// is long before the memory is resident (pages keep streaming); for an
+	// eager one it is the full restore. Both are recorded so the two paths
+	// can be compared honestly.
+	TimeToFirstExecutionMS int64 `json:"time_to_first_execution_ms,omitempty"`
+	// LazyPagesPID is the daemon serving this restore's memory, recorded so
+	// the retained image set can be cleaned up when the daemon is gone.
+	LazyPagesPID int `json:"lazy_pages_pid,omitempty"`
+}
+
+// PrepareOptions carries what a restore caller asks for beyond the checkpoint
+// itself. Zero values mean the defaults: the standard timeout, an eager
+// restore.
+type PrepareOptions struct {
+	Timeout time.Duration
+	// Lazy starts the restored process before its memory image is fully
+	// loaded, serving pages on demand through userfaultfd. It needs a machine
+	// and engine that support it, and it is refused — clearly, up front —
+	// when either does not.
+	Lazy bool
 }
 
 type Restorer struct {
@@ -74,9 +103,24 @@ func OpenRestorer(service *Service) (*Restorer, error) {
 	return restorer, nil
 }
 
-func (r *Restorer) Prepare(parent context.Context, checkpointID string, timeout time.Duration) (record RestoreRecord, err error) {
-	ctx, cancel := commandTimeout(parent, timeout)
+func (r *Restorer) Prepare(parent context.Context, checkpointID string, options PrepareOptions) (record RestoreRecord, err error) {
+	ctx, cancel := commandTimeout(parent, options.Timeout)
 	defer cancel()
+	// A lazy restore's prerequisites are about the machine, not the
+	// checkpoint, so they are checked before anything is staged or extracted:
+	// an unsupported kernel must fail in milliseconds, not after minutes of
+	// materializing an image set it can never serve lazily.
+	var lazyEngine LazyPagesEngine
+	if options.Lazy {
+		capable, ok := r.service.criu.(LazyPagesEngine)
+		if !ok {
+			return RestoreRecord{}, errors.New("this checkpoint engine cannot serve lazy restores")
+		}
+		if checkErr := capable.CheckFeature(ctx, "uffd"); checkErr != nil {
+			return RestoreRecord{}, fmt.Errorf("lazy restore is unavailable: userfaultfd is not supported here: %w", checkErr)
+		}
+		lazyEngine = capable
+	}
 	// A restore rejected before a transaction record exists (incompatible
 	// destination, unreservable ports, missing chunks) still failed; the
 	// in-transaction failures are counted by rollback.
@@ -128,8 +172,7 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, timeout 
 	if !ok {
 		return RestoreRecord{}, errors.New("checkpoint has no filesystem root asset")
 	}
-	processAssets, err := r.processAssetChain(ctx, manifest)
-	if err != nil {
+	if _, err := processChain(ctx, r.service.repository, r.service.chunks, manifest); err != nil {
 		return RestoreRecord{}, err
 	}
 	sessionID, err := model.NewID()
@@ -182,10 +225,8 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, timeout 
 	if err != nil {
 		return record, err
 	}
-	for _, processAsset := range processAssets {
-		if err = extractDirectory(ctx, r.service.chunks, manifest.Workload.ID, processAsset, restoreDirectory); err != nil {
-			return record, err
-		}
+	if err = materializeProcessChain(ctx, r.service.repository, r.service.chunks, manifest, restoreDirectory); err != nil {
+		return record, err
 	}
 	imagesDirectory := filepath.Join(restoreDirectory, "images")
 	if info, statErr := os.Stat(imagesDirectory); statErr != nil || !info.IsDir() {
@@ -251,10 +292,38 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, timeout 
 		r.reapSupersededSource(record)
 	}
 	restoreStarted := time.Now()
+	// A lazy restore's memory server starts before the restore itself: CRIU
+	// connects to the daemon's socket and hands page serving to it. The
+	// daemon reads pages from the image set — faults on demand, the rest
+	// streamed in the background — which is why the restore directory
+	// outlives this transaction: see Commit.
+	var lazyDaemon LazyPagesProcess
+	if options.Lazy {
+		workDirectory := filepath.Join(imagesDirectory, "work")
+		lazyDaemon, err = lazyEngine.StartLazyPages(ctx, imagesDirectory, workDirectory)
+		if err != nil {
+			return record, fmt.Errorf("start lazy-pages: %w", err)
+		}
+		record.Lazy = true
+		record.LazyPagesPID = lazyDaemon.PID()
+		if err = r.records.Put(record.ID, record); err != nil {
+			lazyDaemon.Stop()
+			return record, err
+		}
+		defer func() {
+			// Every failure past this point either killed the restored
+			// process (the daemon follows it out) or never created one (the
+			// daemon would wait forever) — either way it must not linger.
+			if err != nil {
+				lazyDaemon.Stop()
+			}
+		}()
+	}
 	pid, err := r.service.criu.Restore(ctx, RestoreOptions{
 		ImagesDirectory: imagesDirectory,
 		TCPState:        manifest.Engine.TCPState, ShellJob: manifest.Engine.ShellJob,
 		FileLocks: manifest.Engine.FileLocks, ExternalUNIX: true, ManageCgroups: "soft",
+		LazyPages: options.Lazy,
 	})
 	if err != nil {
 		return record, err
@@ -266,6 +335,11 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, timeout 
 	if _, err = r.service.runtime.Resume(manifest.Workload.ID); err != nil {
 		return record, fmt.Errorf("resume restored process: %w", err)
 	}
+	// The tree exists and is executing. For a lazy restore it got here
+	// without its memory being resident — pages fault in from the daemon from
+	// now on — so this moment, not the workload's later readiness, is what
+	// "first execution" means and what the number measures.
+	record.TimeToFirstExecutionMS = time.Since(restoreStarted).Milliseconds()
 	record.PID = pid
 	record.State = RestoreProcessRunning
 	record.UpdatedAt = time.Now().UTC()
@@ -307,35 +381,16 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, timeout 
 	return record, nil
 }
 
-// processAssetChain returns process-state assets oldest-first. A CRIU
-// incremental checkpoint contains only changed image files, so restore must
-// materialize every retained ancestor before applying the newest archive.
-func (r *Restorer) processAssetChain(ctx context.Context, manifest model.CheckpointManifest) ([]model.AssetManifest, error) {
-	return processAssetChain(ctx, r.service.repository, r.service.chunks, manifest)
-}
-
-func processAssetChain(ctx context.Context, repository *Repository, chunks *chunkstore.Store, manifest model.CheckpointManifest) ([]model.AssetManifest, error) {
-	chain := make([]model.AssetManifest, 0, 1)
-	seen := make(map[string]struct{})
-	current := manifest
-	for {
-		if _, exists := seen[current.ID]; exists {
-			return nil, errors.New("checkpoint parent chain contains a cycle")
-		}
-		seen[current.ID] = struct{}{}
+// processChain walks a checkpoint's parent lineage, newest first, validating
+// every member's process-state asset on the way. An incremental checkpoint's
+// image set only carries its own delta, so the ancestors are not optional:
+// restore needs each of their image sets present and intact.
+func processChain(ctx context.Context, repository *Repository, chunks *chunkstore.Store, manifest model.CheckpointManifest) ([]model.CheckpointManifest, error) {
+	chain := []model.CheckpointManifest{manifest}
+	seen := map[string]struct{}{manifest.ID: {}}
+	for current := manifest; current.ParentID != ""; {
 		if len(chain) >= 256 {
 			return nil, errors.New("checkpoint parent chain exceeds 256 entries")
-		}
-		asset, ok := assetByName(current.Assets, "process-state")
-		if !ok {
-			return nil, fmt.Errorf("checkpoint %s has no process-state asset", current.ID)
-		}
-		if err := chunks.ValidateAsset(ctx, manifest.Workload.ID, asset); err != nil {
-			return nil, fmt.Errorf("validate process state %s: %w", current.ID, err)
-		}
-		chain = append(chain, asset)
-		if current.ParentID == "" {
-			break
 		}
 		parent, err := repository.Load(current.ParentID)
 		if err != nil {
@@ -344,12 +399,100 @@ func processAssetChain(ctx context.Context, repository *Repository, chunks *chun
 		if parent.Workload.ID != manifest.Workload.ID {
 			return nil, fmt.Errorf("checkpoint parent %s belongs to workload %s", parent.ID, parent.Workload.ID)
 		}
+		if _, exists := seen[parent.ID]; exists {
+			return nil, errors.New("checkpoint parent chain contains a cycle")
+		}
+		seen[parent.ID] = struct{}{}
+		chain = append(chain, parent)
 		current = parent
 	}
-	for left, right := 0, len(chain)-1; left < right; left, right = left+1, right-1 {
-		chain[left], chain[right] = chain[right], chain[left]
+	for _, member := range chain {
+		final, passes, assetErr := processImageAssets(member)
+		if assetErr != nil {
+			return nil, assetErr
+		}
+		for _, asset := range append([]model.AssetManifest{final}, passes...) {
+			if err := chunks.ValidateAsset(ctx, manifest.Workload.ID, asset); err != nil {
+				return nil, fmt.Errorf("validate process state %s: %w", member.ID, err)
+			}
+		}
 	}
 	return chain, nil
+}
+
+// materializeProcessChain extracts a checkpoint's process image assets and
+// every ancestor's into the nested layout CRIU's parent symlinks describe:
+// the checkpoint's own image set at destination/images, its parent's tree at
+// destination/parent-images/, the grandparent's at
+// destination/parent-images/parent-images/, and so on. A live-migration
+// checkpoint carries its pre-copy passes as sibling assets beside the final
+// image set — they land next to images/ exactly where the parent symlinks
+// point, because CRIU image files collide by name across a chain and each set
+// references unchanged pages in its parent, so the sets must sit in sibling
+// directories, never overlaid into one where the newest file would silently
+// shadow the older file restore still needs.
+func materializeProcessChain(ctx context.Context, repository *Repository, chunks *chunkstore.Store, manifest model.CheckpointManifest, destination string) error {
+	chain, err := processChain(ctx, repository, chunks, manifest)
+	if err != nil {
+		return err
+	}
+	for index, member := range chain {
+		final, passes, assetErr := processImageAssets(member)
+		if assetErr != nil {
+			return assetErr
+		}
+		target := destination
+		for level := 0; level < index; level++ {
+			target = filepath.Join(target, "parent-images")
+		}
+		for _, asset := range append([]model.AssetManifest{final}, passes...) {
+			if err := extractDirectory(ctx, chunks, manifest.Workload.ID, asset, target); err != nil {
+				return fmt.Errorf("extract process state %s: %w", member.ID, err)
+			}
+		}
+	}
+	return nil
+}
+
+// processImageAssets returns a checkpoint's process image assets: the final
+// image set ("process-state") plus each pre-copy pass's
+// ("process-state-precopy-1", ...), ordered by pass. A live-migration
+// checkpoint packages every pre-dump pass as its own asset the moment the
+// pass completes so the pass can be transferred while the workload still
+// runs; the pass numbers must be contiguous from 1, because each pass's
+// images parent the previous pass's — a gap is a chain restore can never
+// resolve.
+func processImageAssets(manifest model.CheckpointManifest) (model.AssetManifest, []model.AssetManifest, error) {
+	final, ok := assetByName(manifest.Assets, "process-state")
+	if !ok {
+		return model.AssetManifest{}, nil, fmt.Errorf("checkpoint %s has no process-state asset", manifest.ID)
+	}
+	byIndex := make(map[int]model.AssetManifest)
+	for _, asset := range manifest.Assets {
+		if asset.Name == "process-state" || !strings.HasPrefix(asset.Name, "process-state-precopy-") {
+			continue
+		}
+		number, parseErr := strconv.Atoi(strings.TrimPrefix(asset.Name, "process-state-precopy-"))
+		if parseErr != nil || number < 1 {
+			return model.AssetManifest{}, nil, fmt.Errorf("checkpoint %s carries a malformed pre-copy asset %q",
+				manifest.ID, asset.Name)
+		}
+		if _, duplicate := byIndex[number]; duplicate {
+			return model.AssetManifest{}, nil, fmt.Errorf("checkpoint %s carries two assets for pre-copy pass %d",
+				manifest.ID, number)
+		}
+		byIndex[number] = asset
+	}
+	passes := make([]model.AssetManifest, 0, len(byIndex))
+	for index := 1; index <= len(byIndex); index++ {
+		asset, present := byIndex[index]
+		if !present {
+			return model.AssetManifest{}, nil, fmt.Errorf("checkpoint %s is missing pre-copy pass %d of %d; the image chain is broken",
+				manifest.ID, index, len(byIndex))
+		}
+		passes = append(passes, asset)
+	}
+	return final, passes, nil
 }
 
 func (r *Restorer) Commit(id string) (RestoreRecord, error) {
@@ -374,7 +517,16 @@ func (r *Restorer) Commit(id string) (RestoreRecord, error) {
 		}
 	}
 	_ = os.RemoveAll(record.StagingRoot)
-	_ = os.RemoveAll(record.RestoreDirectory)
+	// An eager restore has consumed its image set; the directory is derived
+	// state and goes. A lazy restore's daemon is still reading pages from it
+	// — faults on demand, the rest streamed in the background — so the
+	// directory is retained until the daemon exits (once it has served every
+	// image page, or the process is gone) and a watcher removes it then.
+	if record.Lazy {
+		go r.watchRetainedImages(record)
+	} else {
+		_ = os.RemoveAll(record.RestoreDirectory)
+	}
 	record.State = RestoreCommitted
 	record.UpdatedAt = time.Now().UTC()
 	if err := r.records.Put(id, record); err != nil {
@@ -429,7 +581,65 @@ func (r *Restorer) Recover(ctx context.Context) error {
 			}
 		}
 	}
+	// Committed (or validated and left standing) lazy restores retain their
+	// image set for the daemon still serving pages from it. After a restart
+	// nobody is watching those daemons: re-arm the watch for the living ones
+	// and clean up after the dead — a workload that ended while the agent was
+	// down leaves its daemon exited and its directory behind.
+	for _, record := range r.records.List() {
+		if !record.Lazy || (record.State != RestoreCommitted && record.State != RestoreValidated) {
+			continue
+		}
+		if lazyPagesDaemonAlive(record.LazyPagesPID, filepath.Join(record.RestoreDirectory, "images")) {
+			go r.watchRetainedImages(record)
+			continue
+		}
+		if err := os.RemoveAll(record.RestoreDirectory); err != nil {
+			r.logger.Warn("could not remove a dead lazy restore's retained images",
+				"restore_id", record.ID, "path", record.RestoreDirectory, "error", err)
+		}
+	}
 	return nil
+}
+
+// watchRetainedImages removes the image set a lazy restore's daemon still
+// reads once that daemon is gone. The daemon exits when it has finished
+// serving — every image page transferred, or the process gone — so this
+// observes, from outside, the moment the image set stops being needed.
+// Liveness is proven from /proc against the daemon's own command line, so a
+// recycled pid reads as dead and a live daemon is never deleted under.
+func (r *Restorer) watchRetainedImages(record RestoreRecord) {
+	images := filepath.Join(record.RestoreDirectory, "images")
+	for {
+		time.Sleep(lazyPagesWatchInterval)
+		if lazyPagesDaemonAlive(record.LazyPagesPID, images) {
+			continue
+		}
+		if err := os.RemoveAll(record.RestoreDirectory); err != nil {
+			r.logger.Warn("could not remove a lazy restore's retained images",
+				"restore_id", record.ID, "path", record.RestoreDirectory, "error", err)
+		}
+		return
+	}
+}
+
+// stopLazyPages ends a lazy restore's memory server before a rollback removes
+// the image set it reads from. By the time a rollback runs the restored
+// process is going away, so the daemon is exiting on its own; this waits out
+// that exit and forces it if it stalls. The pid is proven to still be this
+// restore's daemon before any signal reaches it.
+func (r *Restorer) stopLazyPages(record RestoreRecord) {
+	if !record.Lazy || record.LazyPagesPID <= 0 {
+		return
+	}
+	images := filepath.Join(record.RestoreDirectory, "images")
+	deadline := time.Now().Add(lazyPagesStopGrace)
+	for lazyPagesDaemonAlive(record.LazyPagesPID, images) && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if lazyPagesDaemonAlive(record.LazyPagesPID, images) {
+		_ = syscall.Kill(record.LazyPagesPID, syscall.SIGKILL)
+	}
 }
 
 func (r *Restorer) rollback(ctx context.Context, record *RestoreRecord, reason string) error {
@@ -503,6 +713,7 @@ func (r *Restorer) rollback(ctx context.Context, record *RestoreRecord, reason s
 		_ = r.service.runtime.MarkRestoreFailed(record.WorkloadID, reason)
 	}
 	_ = os.RemoveAll(record.StagingRoot)
+	r.stopLazyPages(*record)
 	_ = os.RemoveAll(record.RestoreDirectory)
 	record.State = RestoreRolledBack
 	record.UpdatedAt = time.Now().UTC()

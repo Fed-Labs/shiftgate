@@ -35,7 +35,7 @@ export default function MachinesPage() {
                   ["Kernel version", "5.15 or later (6.x recommended)"],
                   ["CRIU", "Version 3.15 or later"],
                   ["Required kernel features", "CONFIG_CHECKPOINT_RESTORE, CONFIG_MEMCG, CONFIG_NAMESPACES"],
-                  ["Agent", "shiftgate-agent (installed automatically)"],
+                  ["Agent", "shift-agent (installed automatically)"],
                   ["Network", "Outbound HTTPS (443) to control plane"],
                 ].map(([key, value]) => (
                   <tr key={key} className="border-border-subtle">

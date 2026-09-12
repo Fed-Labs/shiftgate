@@ -123,7 +123,7 @@ export default function MigrationPage() {
           </p>
           <div className="rounded-lg border border-border bg-bg-elevated p-5">
             <pre className="text-sm">
-              <code className="text-accent">{`shiftgate machine
+              <code className="text-accent">{`shiftgate machines
 # Then start the migration; the VALIDATE stage records the report.`}</code>
             </pre>
             <div className="my-3 h-px bg-border-subtle" />

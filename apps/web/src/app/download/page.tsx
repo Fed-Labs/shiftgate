@@ -5,7 +5,7 @@ import { Container, Section, Card, Badge } from "@/components/ui";
 
 export const metadata: Metadata = {
   title: "Download",
-  description: "Build SHIFTGATE from source for supported Linux x86_64 hosts.",
+  description: "Install SHIFTGATE with one command on Linux x86_64, or build from source.",
 };
 
 export default function DownloadPage() {
@@ -18,10 +18,10 @@ export default function DownloadPage() {
             <div className="relative text-center space-y-4 mb-12">
               <div className="absolute left-1/2 top-0 -z-10 h-[280px] w-[620px] max-w-full -translate-x-1/2 rounded-full bg-accent/10 blur-[120px]" aria-hidden />
               <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">
-                Build from source
+                Install SHIFTGATE
               </h1>
               <p className="text-text-secondary text-lg">
-                Build the CLI and agent on a supported Linux host.
+                One command installs the release. Building from source is one command too.
               </p>
             </div>
 
@@ -43,17 +43,41 @@ export default function DownloadPage() {
               </div>
             </Card>
 
-            {/* Build command */}
+            {/* Install from a release */}
             <div className="space-y-4 mb-10">
-              <h2 className="text-lg font-medium">Build</h2>
+              <h2 className="text-lg font-medium">Install from a release</h2>
               <Card className="overflow-hidden border-accent/20 shadow-[0_30px_100px_-70px_rgba(0,212,170,0.5)]">
                 <pre className="overflow-x-auto rounded-lg border border-border-subtle bg-bg-surface px-4 py-3.5 font-mono text-sm leading-7">
-                  <code>{`git clone <repository-url> shift
-cd shift
-sudo ./install.sh
+                  <code>{`curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh | bash
 shiftgate doctor`}</code>
                 </pre>
               </Card>
+              <p className="text-sm text-text-secondary">
+                Downloads the newest release, verifies its SHA-256, installs CRIU
+                through your package manager when it is missing, and enables the
+                agent as a systemd service with a local-only configuration. No
+                toolchain needed — the CLI runs unprivileged afterward.
+              </p>
+            </div>
+
+            {/* Build from source */}
+            <div className="space-y-4 mb-10">
+              <h2 className="text-lg font-medium">Build from source</h2>
+              <Card>
+                <pre className="overflow-x-auto rounded-lg border border-border-subtle bg-bg-surface px-4 py-3.5 font-mono text-sm leading-7">
+                  <code>{`git clone https://github.com/Fed-Labs/shiftgate.git
+cd shiftgate
+./install.sh
+shiftgate doctor`}</code>
+                </pre>
+              </Card>
+              <p className="text-sm text-text-secondary">
+                The installer installs distribution packages for Go, CRIU, and
+                build tools, builds from local sources, verifies every binary
+                checksum, and installs shiftgate, shift-agent, and shift-control
+                under /usr/local/bin. Add --systemd to install the agent service
+                unit as well.
+              </p>
             </div>
 
             {/* Prerequisites */}
@@ -64,10 +88,12 @@ shiftgate doctor`}</code>
                   <div className="flex items-center justify-between flex-wrap gap-3">
                     <div>
                       <div className="text-sm font-medium">
-                        Go 1.24+, CRIU 4+, GNU tar
+                        Linux x86_64 with checkpoint/restore kernel support
                       </div>
                       <div className="text-xs text-text-muted mt-0.5">
-                        Linux x86_64 with checkpoint/restore kernel support
+                        The release install needs curl and root for the service;
+                        the source install pulls Go 1.24+, CRIU 4+, and build
+                        tools from your package manager itself.
                       </div>
                     </div>
                   </div>

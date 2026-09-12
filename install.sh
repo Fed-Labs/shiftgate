@@ -117,14 +117,9 @@ GO_MINOR="${GO_VERSION#go1.}"
 
 if ! command -v criu >/dev/null 2>&1; then
     log "Installing CRIU"
-    case "$(uname -s)-$(. /etc/os-release 2>/dev/null && print "${ID:-unknown}")" in
-        Linux-debian|Linux-ubuntu) install_package criu ;;
-        Linux-fedora) install_package criu ;;
-        Linux-centos|Linux-rhel) install_package criu ;;
-        Linux-opensuse*|Linux-sles) install_package criu ;;
-        Linux-arch) install_package criu ;;
-        *) install_package criu ;;
-    esac
+    # Every supported distribution ships the package as 'criu';
+    # install_package dispatches on the package manager.
+    install_package criu
 fi
 
 for package in make gcc libc-dev; do
@@ -167,19 +162,53 @@ done <"$HOME/.cache/shift-install/checksums.txt"
 
 log "Installing binaries to $BINDIR"
 as_root mkdir -p "$BINDIR"
-as_root install -m 0755 "$REPO_DIR/bin/shiftgate" "$BINDIR/shiftgate"
-as_root install -m 0755 "$REPO_DIR/bin/shift-agent" "$BINDIR/shift-agent"
-as_root install -m 0755 "$REPO_DIR/bin/shift-control" "$BINDIR/shift-control"
+WORKDIR="$HOME/.cache/shift-install"
+: >"$WORKDIR/installed.txt"
 
+# From here on the script is replacing system state. Any exit that is not a
+# committed install — a failed step under set -e as much as a deliberate
+# die — must leave the machine as it found it: restore what was replaced
+# (.pre-shift), remove what this run added (installed.txt), put back the
+# service unit only if this run replaced it.
 rollback_binaries() {
-    for name in shiftgate shift-agent shift-control; do
-        if [ -e "$BINDIR/$name.pre-shift" ]; then
-            as_root mv "$BINDIR/$name.pre-shift" "$BINDIR/$name"
-        else
-            as_root rm -f "$BINDIR/$name"
-        fi
-    done
+    if [ -f "$WORKDIR/installed.txt" ]; then
+        while read -r name; do
+            if [ -e "$BINDIR/$name.pre-shift" ]; then
+                as_root mv "$BINDIR/$name.pre-shift" "$BINDIR/$name"
+            else
+                as_root rm -f "$BINDIR/$name"
+            fi
+        done <"$WORKDIR/installed.txt"
+    fi
+    rm -f "$WORKDIR/installed.txt"
 }
+
+committed=0
+unit_installed=0
+restore_prior_state() {
+    if [ "$committed" = "1" ]; then
+        return 0
+    fi
+    if [ "$unit_installed" = "1" ]; then
+        if [ -e /etc/systemd/system/shift-agent.service.pre-shift ]; then
+            as_root mv /etc/systemd/system/shift-agent.service.pre-shift /etc/systemd/system/shift-agent.service
+        else
+            as_root rm -f /etc/systemd/system/shift-agent.service
+        fi
+    fi
+    rollback_binaries
+    rm -f "$HOME/.cache/shift-install/checksums.txt"
+    printf '==> aborted before committing; previous installation restored\n' >&2
+}
+trap restore_prior_state EXIT
+
+for name in shiftgate shift-agent shift-control; do
+    if [ -e "$BINDIR/$name" ]; then
+        as_root mv "$BINDIR/$name" "$BINDIR/$name.pre-shift"
+    fi
+    as_root install -m 0755 "$REPO_DIR/bin/$name" "$BINDIR/$name"
+    printf '%s\n' "$name" >>"$WORKDIR/installed.txt"
+done
 
 if [ "$SYSTEMD_UNIT" = "1" ]; then
     log "Installing systemd service configuration"
@@ -203,10 +232,13 @@ if [ "$SYSTEMD_UNIT" = "1" ]; then
         if [ "${config_installed:-0}" = "1" ]; then
             as_root rm -f "$CONFIGDIR/agent.json"
         fi
-        rollback_binaries
         die "remote peer TLS files referenced by the example config are missing"
     fi
+    if [ -e /etc/systemd/system/shift-agent.service ]; then
+        as_root mv /etc/systemd/system/shift-agent.service /etc/systemd/system/shift-agent.service.pre-shift
+    fi
     as_root install -m 0644 "$REPO_DIR/deployments/systemd/shift-agent.service" /etc/systemd/system/shift-agent.service
+    unit_installed=1
     # enable --now starts an inactive unit but never restarts a running one —
     # an upgrade must replace the running agent, or the old binary keeps
     # serving the local API until the next reboot.
@@ -221,15 +253,24 @@ if [ "$SYSTEMD_UNIT" = "1" ]; then
         log "Agent service enabled"
     else
         as_root systemctl disable --failed shift-agent.service >/dev/null 2>&1 || true
-        [ -e /etc/systemd/system/shift-agent.service.pre-shift ] && as_root mv /etc/systemd/system/shift-agent.service.pre-shift /etc/systemd/system/shift-agent.service
-        rollback_binaries
-        die "systemd service activation failed; previous binaries restored"
+        die "systemd service activation failed; previous installation restored"
     fi
 else
     log "Skipping systemd installation (set SHIFT_INSTALL_SERVICE=1 to enable)"
 fi
 
-rm -f "$HOME/.cache/shift-install/checksums.txt"
+rm -f "$HOME/.cache/shift-install/checksums.txt" "$HOME/.cache/shift-install/installed.txt"
+# The install committed: the aside copies it replaced are no longer needed,
+# and the abort trap stands down.
+for name in shiftgate shift-agent shift-control; do
+    if [ -e "$BINDIR/$name.pre-shift" ]; then
+        as_root rm -f "$BINDIR/$name.pre-shift"
+    fi
+done
+if [ -e /etc/systemd/system/shift-agent.service.pre-shift ]; then
+    as_root rm -f /etc/systemd/system/shift-agent.service.pre-shift
+fi
+committed=1
 log "Installation complete"
 printf '%s\n' \
     "  CLI:   $BINDIR/shiftgate" \

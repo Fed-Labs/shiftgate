@@ -26,8 +26,15 @@ func (store *Store) CreateWorkload(ctx context.Context, record WorkloadRecord, a
 		return WorkloadRecord{}, err
 	}
 	defer tx.Rollback(ctx)
+	// An omitted status starts as empty JSON, the column's declared default —
+	// binding a nil RawMessage would send NULL and violate NOT NULL, the same
+	// default UpsertWorkload applies.
+	status := record.Status
+	if len(status) == 0 {
+		status = json.RawMessage(`{}`)
+	}
 	err = tx.QueryRow(ctx, `INSERT INTO workloads(id,organization_id,machine_id,name,spec,status) VALUES($1,$2,NULLIF($3,''),$4,$5,$6) RETURNING created_at,updated_at`,
-		record.ID, record.OrganizationID, record.MachineID, record.Name, record.Spec, record.Status).Scan(&record.CreatedAt, &record.UpdatedAt)
+		record.ID, record.OrganizationID, record.MachineID, record.Name, record.Spec, status).Scan(&record.CreatedAt, &record.UpdatedAt)
 	if err != nil {
 		return WorkloadRecord{}, err
 	}

@@ -94,7 +94,7 @@ while True:
 	}
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadCheckpointed)
 
-	record, err := agentProc.client.Restore(ctx, manifest.ID, 600)
+	record, err := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 600})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -191,7 +191,7 @@ while true; do sleep 60; done
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadCheckpointed)
 	baseline := distinct()
 
-	record, err := agentProc.client.Restore(ctx, manifest.ID, 600)
+	record, err := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 600})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}

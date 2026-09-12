@@ -24,6 +24,7 @@ const (
 	OperationMigration = "migration"
 	OperationRestore   = "restore"
 	OperationFork      = "fork"
+	OperationClone     = "clone"
 )
 
 // Status outcome values.
@@ -77,7 +78,7 @@ func WriteStatus(root string, document StatusDocument) (string, error) {
 		return "", fmt.Errorf("migration status requires an operation id")
 	}
 	switch document.Operation {
-	case OperationMigration, OperationRestore, OperationFork:
+	case OperationMigration, OperationRestore, OperationFork, OperationClone:
 	default:
 		return "", fmt.Errorf("migration status operation %q is not recognized", document.Operation)
 	}

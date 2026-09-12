@@ -85,9 +85,8 @@ func runControlLogin(ctx context.Context, settings options, arguments []string) 
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err.Error())
 	}
-	if settings.controlURL == "" {
-		return usageError("login needs a control plane: pass --control-url or set SHIFT_CONTROL_URL")
-	}
+	// No control-plane check here: an unset --control-url means the platform's
+	// control plane, which is the normal case for a hosted deployment.
 	reader := bufio.NewReader(os.Stdin)
 	if *email == "" {
 		fmt.Fprint(settings.stdout, "Email: ")
@@ -221,6 +220,8 @@ func runControl(ctx context.Context, command string, arguments []string, setting
 		return runControlWhoami(ctx, settings)
 	case "plans":
 		return runControlPlans(ctx, settings)
+	case "storage":
+		return runControlStorage(ctx, settings, arguments)
 	case "fleet":
 		return runFleet(ctx, settings, arguments)
 	case "marketplace", "market":
@@ -269,9 +270,6 @@ func runControlWhoami(ctx context.Context, settings options) error {
 // runControlPlans prints the public plan catalog. Pricing and limits are
 // public by design — the catalog is what the entitlement checks enforce.
 func runControlPlans(ctx context.Context, settings options) error {
-	if settings.controlURL == "" {
-		return usageError("plans needs a control plane: pass --control-url or set SHIFT_CONTROL_URL")
-	}
 	client, err := controlclient.New(settings.controlURL, settings.timeout)
 	if err != nil {
 		return exitError{code: 2, err: err}
@@ -293,6 +291,62 @@ func runControlPlans(ctx context.Context, settings options) error {
 		fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%s\t%s\n", plan.Key, plan.Name, price, plan.MaxMachines, humanBytes(plan.MaxStorageBytes), strings.Join(plan.Features, ", "))
 	}
 	return writer.Flush()
+}
+
+// runControlStorage prints the organization's hosted storage status plus the
+// exact agent configuration lines that enable hosted mirroring — so an
+// operator can copy them straight into an agent's environment.
+func runControlStorage(ctx context.Context, settings options, arguments []string) error {
+	flags := flag.NewFlagSet("storage", flag.ContinueOnError)
+	flags.SetOutput(settings.stderr)
+	organizationID := flags.String("org", "", "organization id (defaults to the session's only organization)")
+	if err := flags.Parse(arguments); err != nil {
+		return usageError(err.Error())
+	}
+	if flags.NArg() > 0 {
+		return usageError("storage takes no positional arguments")
+	}
+	session, err := controlSession(settings)
+	if err != nil {
+		return err
+	}
+	resolved, err := resolveOrganization(ctx, session, *organizationID)
+	if err != nil {
+		return err
+	}
+	status, err := session.Storage(ctx, resolved)
+	if err != nil {
+		return controlOperationError(err)
+	}
+	if settings.jsonOutput {
+		return writeJSON(settings.stdout, status)
+	}
+	fmt.Fprintf(settings.stdout, "Organization %s\n", resolved)
+	if !status.Enabled {
+		fmt.Fprintln(settings.stdout, "Hosted storage: disabled — this control plane does not host checkpoint storage.")
+		fmt.Fprintln(settings.stdout, "Agents keep checkpoints locally; configure an S3 object store on the agent for a cloud copy.")
+		return nil
+	}
+	overQuota := ""
+	if status.OverQuota {
+		overQuota = "  (OVER QUOTA — credential issuance suspended)"
+	}
+	fmt.Fprintf(settings.stdout, "Hosted storage: enabled%s\n", overQuota)
+	fmt.Fprintf(settings.stdout, "  Location:     %s / %s (prefix %s)\n", status.Endpoint, status.Bucket, status.Prefix)
+	fmt.Fprintf(settings.stdout, "  Usage:        %s / %s\n", humanBytes(status.UsedStorageBytes), humanBytes(status.MaxStorageBytes))
+	if status.LastReconciledAt != nil {
+		fmt.Fprintf(settings.stdout, "  Reconciled:   %s\n", status.LastReconciledAt.Local().Format(time.DateTime))
+	}
+	fmt.Fprintln(settings.stdout)
+	fmt.Fprintln(settings.stdout, "Agent setup — add to the agent's environment for hosted mirroring:")
+	fmt.Fprintln(settings.stdout, "  SHIFT_OBJECTSTORE_ENABLED=true")
+	fmt.Fprintln(settings.stdout, "  SHIFT_OBJECTSTORE_BACKEND=control-plane")
+	fmt.Fprintf(settings.stdout, "  SHIFT_CONTROL_ORGANIZATION_ID=%s\n", resolved)
+	fmt.Fprintln(settings.stdout, "  SHIFT_CONTROL_MACHINE_ID=<this machine's id>")
+	fmt.Fprintln(settings.stdout, "  SHIFT_CONTROL_API_KEY=<machines-scope api key>")
+	fmt.Fprintln(settings.stdout, "Agents fetch short-lived scoped credentials from the control plane; no storage secrets are configured on the agent.")
+	fmt.Fprintln(settings.stdout, "(No SHIFT_CONTROL_URL needed — unset, agents talk to the platform endpoint.)")
+	return nil
 }
 
 // runFleet routes the fleet subcommands: the registry the control plane keeps

@@ -11,6 +11,9 @@ The repository contains three runnable programs:
 - `shiftgate`: local and fleet command-line client. Named after the gate it opens — the bare name `shift` is a POSIX shell builtin, so a binary called `shift` can never be typed.
 - `shift-control`: authenticated fleet metadata and orchestration API backed by PostgreSQL.
 
+Two clients ship alongside them: the web dashboard in `apps/web/` (Next.js) and
+the Tauri desktop app in `apps/desktop/`.
+
 The primary supported target is Linux x86_64. Other operating systems are represented by
 interfaces only and are not reported as supported.
 
@@ -41,7 +44,11 @@ shiftgate restore CHECKPOINT_ID                              # bring it back
 The agent answers on `/run/shift/agent.sock`; CLI commands find it there by
 default. A second machine with its own install is a migration target:
 `shiftgate migrate demo --to https://host:8443` (see below for the peer TLS that
-a remote listener requires).
+a remote listener requires). That second machine can also hold a warm standby:
+`shiftgate workload failover demo --to https://standby:8443` replicates every
+scheduled checkpoint to it, and it restores automatically when the source is
+provably dead — unreachable and silent on the control plane — or on
+`shiftgate standby trigger`. See [the CLI reference](docs/cli.md).
 
 ### From a repository checkout
 
@@ -50,10 +57,10 @@ Prerequisites: Go 1.24+, CRIU 4+, GNU tar, and Linux with checkpoint/restore ena
 ```bash
 make build
 sudo ./bin/shift-agent --state-dir /var/lib/shift --listen unix:///run/shift/agent.sock
-./bin/shiftgatedoctor
-./bin/shiftgateworkload create demo --path "$PWD" -- /usr/bin/python3 -m http.server 8080
-./bin/shiftgateworkload start demo
-./bin/shiftgatecheckpoint create demo
+./bin/shiftgate doctor
+./bin/shiftgate workload create demo --path "$PWD" -- /usr/bin/python3 -m http.server 8080
+./bin/shiftgate workload start demo
+./bin/shiftgate checkpoint create demo
 ```
 
 Optional checkpoint mirroring can use local disk or an S3-compatible store. Configure the
@@ -63,8 +70,17 @@ ciphertext and the encrypted manifest envelope are uploaded; workload keys remai
 state. If a checkpoint is saved locally but mirroring fails, retry it with:
 
 ```bash
-./bin/shiftgatecheckpoint mirror CHECKPOINT_ID
+./bin/shiftgate checkpoint mirror CHECKPOINT_ID
 ```
+
+A hosted-control-plane deployment can also host checkpoint storage for its
+organizations: agents set `SHIFT_OBJECTSTORE_BACKEND=control-plane` and fetch
+short-lived, organization-scoped credentials from the control plane with the
+machines-scope API key they already carry — no storage secrets on the agent.
+Usage is metered from the bucket itself and the plan quota (10 GB / 500 GB /
+2 TB) is enforced fail-closed: over quota, credential issuance stops and new
+checkpoints report the quota failure while local checkpointing continues.
+See [the deployment guide](docs/deployment.md#hosting-checkpoint-storage-platform-side-mirroring).
 
 For an unprivileged local evaluation, use a writable socket and state directory. Process
 launch and inventory work normally; CRIU will accurately report missing kernel capabilities
@@ -80,6 +96,11 @@ export SHIFT_PASSWORD_PEPPER="$(openssl rand -hex 32)"
 docker compose -f deployments/docker/compose.yml up --build
 ```
 
+The web dashboard runs against it with `cd apps/web && npm install && cp
+.env.example .env && npm run dev` — the control plane must list the
+dashboard's origin in `SHIFT_ALLOWED_ORIGINS` or the browser blocks every
+call (`SHIFT_ALLOWED_ORIGINS=http://localhost:3000`).
+
 The API contract is [OpenAPI](api/openapi/shift.yaml); the service stores metadata and
 authorization state only. Agents continue to exchange encrypted checkpoint chunks directly.
 
@@ -87,6 +108,8 @@ To make CLI-managed hosts visible in the web dashboard, register the machine in 
 plane, create an API key with the `machines` scope, and configure the optional reporter:
 
 ```bash
+# Optional: unset means the platform's control plane. Set it only when this
+# dashboard runs on a private control plane.
 export SHIFT_CONTROL_URL="http://127.0.0.1:8090"
 export SHIFT_CONTROL_ORGANIZATION_ID="ORGANIZATION_ID"
 export SHIFT_CONTROL_MACHINE_ID="machine-source"
@@ -101,7 +124,7 @@ create or dispatch CLI workload operations.
 ```bash
 mkdir -p ./data
 ./bin/shift-agent --state-dir ./data --listen unix://./data/agent.sock
-./bin/shiftgate--agent unix://./data/agent.sock doctor
+./bin/shiftgate --agent unix://./data/agent.sock doctor
 ```
 
 The same `shiftgate` binary manages a control-plane session and the fleet. Login stores the
@@ -109,10 +132,10 @@ session under `~/.config/shift/cli-session.json` (0600) keyed to the control pla
 the password is prompted with echo disabled and never accepted as a flag:
 
 ```bash
-./bin/shiftgate--control-url http://127.0.0.1:8090 login --email operator@example.com
-./bin/shiftgatemachines                 # fleet view while a control plane is configured
-./bin/shiftgatefleet entitlement
-./bin/shiftgatemarketplace inventory
+./bin/shiftgate login --email operator@example.com   # the platform endpoint by default
+./bin/shiftgate machines                 # fleet view while SHIFT_CONTROL_URL is set
+./bin/shiftgate fleet entitlement
+./bin/shiftgate marketplace inventory
 ```
 
 See [the CLI documentation](docs/cli.md) for the fleet, marketplace, and update commands.
@@ -127,7 +150,8 @@ See [the CLI documentation](docs/cli.md) for the fleet, marketplace, and update 
   rejected or surfaced as a limitation.
 - Remote agent listeners require mutual TLS unless explicitly started in development mode.
 
-See [Architecture](docs/architecture.md), [Security](docs/security.md), [Operations](docs/operations.md),
+See [Quickstart](docs/quickstart.md) for the fast path from install to a live
+migration, then [Architecture](docs/architecture.md), [Security](docs/security.md), [Operations](docs/operations.md),
 [Installation](docs/installation.md), [Deployment](docs/deployment.md), [API](docs/api.md), [CLI](docs/cli.md),
 [Release Process](docs/release.md), [Troubleshooting](docs/troubleshooting.md), and
 [Limitations](docs/limitations.md) for the complete contracts and deployment model.

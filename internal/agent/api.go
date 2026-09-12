@@ -45,6 +45,50 @@ type stopRequest struct {
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
 }
 
+type policyRequest struct {
+	// IntervalSeconds of zero or less disables periodic checkpointing; any
+	// positive value installs (or replaces) the schedule.
+	IntervalSeconds int `json:"interval_seconds"`
+	KeepLast        int `json:"keep_last,omitempty"`
+}
+
+type failoverRequest struct {
+	// Off clears the policy: the replicator withdraws the duty from the
+	// standby on its next pass and stops pushing new checkpoints. Anything
+	// else installs (or replaces) a policy naming that standby.
+	Off       bool   `json:"off,omitempty"`
+	AgentURL  string `json:"agent_url,omitempty"`
+	MachineID string `json:"machine_id,omitempty"`
+	KeepLast  int    `json:"keep_last,omitempty"`
+}
+
+type standbyTriggerRequest struct {
+	// CheckpointID optionally restores a specific replicated checkpoint; the
+	// default is the duty's newest.
+	CheckpointID string `json:"checkpoint_id,omitempty"`
+	// Lazy starts the failed-over process before its memory is fully loaded,
+	// serving pages on demand — the fastest possible recovery, opt-in because
+	// a half-served workload dies if its lazy-pages daemon does. The
+	// automatic path never asks for this; only an operator can.
+	Lazy bool `json:"lazy,omitempty"`
+}
+
+type standbyTriggerResponse struct {
+	Duty model.StandbyDuty `json:"duty"`
+	// SourceReachable is what the pre-trigger probe observed: "yes", "no", or
+	// "unknown" (no URL on the duty, or the probe itself could not run).
+	SourceReachable string `json:"source_reachable"`
+	Warning         string `json:"warning,omitempty"`
+}
+
+type standbyListResponse struct {
+	Duties []model.StandbyDuty `json:"duties"`
+	// AutomaticFailover reports whether this agent can confirm a source's
+	// death on its own — a control plane is configured. When false, armed
+	// duties never fail over automatically: only an explicit trigger acts.
+	AutomaticFailover bool `json:"automatic_failover"`
+}
+
 type checkpointRequest struct {
 	WorkloadID     string               `json:"workload_id"`
 	Kind           model.CheckpointKind `json:"kind,omitempty"`
@@ -56,6 +100,10 @@ type checkpointRequest struct {
 
 type restoreRequest struct {
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// Lazy starts the restored process before its memory is fully loaded,
+	// serving pages on demand through userfaultfd. Opt-in: an eager restore
+	// is the predictable default.
+	Lazy bool `json:"lazy,omitempty"`
 }
 
 type forkRequest struct {
@@ -66,10 +114,18 @@ type forkRequest struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
+type cloneRequest struct {
+	Count          int    `json:"count,omitempty"`
+	NamePrefix     string `json:"name_prefix,omitempty"`
+	Parallel       int    `json:"parallel,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+}
+
 type migrateRequest struct {
 	WorkloadID     string              `json:"workload_id"`
 	Destination    model.Destination   `json:"destination"`
 	Mode           model.MigrationMode `json:"mode,omitempty"`
+	PreCopyPasses  int                 `json:"pre_copy_passes,omitempty"`
 	TimeoutSeconds int                 `json:"timeout_seconds,omitempty"`
 }
 
@@ -88,6 +144,8 @@ func (s *Service) localHandler() http.Handler {
 	mux.HandleFunc("POST /v1/workloads/{id}/pause", s.handleWorkloadPause)
 	mux.HandleFunc("POST /v1/workloads/{id}/resume", s.handleWorkloadResume)
 	mux.HandleFunc("POST /v1/workloads/{id}/stop", s.handleWorkloadStop)
+	mux.HandleFunc("POST /v1/workloads/{id}/policy", s.handleWorkloadPolicy)
+	mux.HandleFunc("POST /v1/workloads/{id}/failover", s.handleWorkloadFailover)
 	mux.HandleFunc("GET /v1/workloads/{id}/logs", s.handleWorkloadLogs)
 	mux.HandleFunc("GET /v1/checkpoints", s.handleCheckpointList)
 	mux.HandleFunc("POST /v1/checkpoints", s.handleCheckpointCreate)
@@ -100,10 +158,18 @@ func (s *Service) localHandler() http.Handler {
 	mux.HandleFunc("POST /v1/checkpoints/{id}/fork", s.handleCheckpointFork)
 	mux.HandleFunc("GET /v1/forks", s.handleForkList)
 	mux.HandleFunc("GET /v1/forks/{id}", s.handleForkGet)
+	mux.HandleFunc("POST /v1/checkpoints/{id}/clone", s.handleCheckpointClone)
+	mux.HandleFunc("GET /v1/clones", s.handleCloneList)
+	mux.HandleFunc("GET /v1/clones/{id}", s.handleCloneGet)
+	mux.HandleFunc("POST /v1/clones/{id}/rollback", s.handleCloneRollback)
 	mux.HandleFunc("GET /v1/migrations", s.handleMigrationList)
 	mux.HandleFunc("POST /v1/migrations", s.handleMigrationCreate)
+	mux.HandleFunc("POST /v1/migrations/preflight", s.handleMigrationPreflight)
 	mux.HandleFunc("GET /v1/migrations/{id}", s.handleMigrationGet)
 	mux.HandleFunc("POST /v1/migrations/{id}/cancel", s.handleMigrationCancel)
+	mux.HandleFunc("GET /v1/standby", s.handleStandbyList)
+	mux.HandleFunc("POST /v1/standby/{workload}/trigger", s.handleStandbyTrigger)
+	mux.HandleFunc("GET /v1/failover", s.handleFailoverList)
 	mux.HandleFunc("GET /v1/updates", s.handleUpdateStatus)
 	mux.HandleFunc("POST /v1/updates/check", s.handleUpdateCheck)
 	mux.HandleFunc("POST /v1/updates/apply", s.handleUpdateApply)
@@ -284,6 +350,61 @@ func (s *Service) handleWorkloadResume(writer http.ResponseWriter, request *http
 	s.workloadAction(writer, request, func(id string) (model.Workload, error) { return s.runtime.Resume(id) })
 }
 
+// handleWorkloadPolicy installs, replaces, or clears a workload's periodic
+// checkpoint policy. The change takes effect on the scheduler's next pass
+// and persists across agent restarts.
+func (s *Service) handleWorkloadPolicy(writer http.ResponseWriter, request *http.Request) {
+	workload, ok := s.authorizedWorkload(writer, request, request.PathValue("id"))
+	if !ok {
+		return
+	}
+	var input policyRequest
+	if !decodeAPIJSON(writer, request, &input) {
+		return
+	}
+	var policy *model.CheckpointPolicySpec
+	if input.IntervalSeconds > 0 {
+		policy = &model.CheckpointPolicySpec{IntervalSeconds: input.IntervalSeconds, KeepLast: input.KeepLast}
+	}
+	updated, err := s.runtime.SetCheckpointPolicy(workload.Spec.ID, policy)
+	if err != nil {
+		writeAPIError(writer, http.StatusUnprocessableEntity, "POLICY_INVALID", err.Error())
+		return
+	}
+	writeAPIJSON(writer, http.StatusOK, updated)
+}
+
+// handleWorkloadFailover installs or clears a workload's warm-standby policy.
+// Installing one requires a checkpoint policy to exist first — the runtime
+// setter enforces the pair, because replication carries the checkpoints a
+// schedule produces and without one nothing would ever reach the standby.
+func (s *Service) handleWorkloadFailover(writer http.ResponseWriter, request *http.Request) {
+	workload, ok := s.authorizedWorkload(writer, request, request.PathValue("id"))
+	if !ok {
+		return
+	}
+	var input failoverRequest
+	if !decodeAPIJSON(writer, request, &input) {
+		return
+	}
+	var policy *model.FailoverPolicySpec
+	if !input.Off {
+		if input.AgentURL == "" {
+			writeAPIError(writer, http.StatusBadRequest, "FAILOVER_POLICY_INVALID", "agent_url is required unless off is true")
+			return
+		}
+		policy = &model.FailoverPolicySpec{
+			AgentURL: input.AgentURL, MachineID: input.MachineID, KeepLast: input.KeepLast,
+		}
+	}
+	updated, err := s.runtime.SetFailoverPolicy(workload.Spec.ID, policy)
+	if err != nil {
+		writeAPIError(writer, http.StatusUnprocessableEntity, "FAILOVER_POLICY_INVALID", err.Error())
+		return
+	}
+	writeAPIJSON(writer, http.StatusOK, updated)
+}
+
 func (s *Service) handleWorkloadStop(writer http.ResponseWriter, request *http.Request) {
 	workload, ok := s.authorizedWorkload(writer, request, request.PathValue("id"))
 	if !ok {
@@ -424,7 +545,10 @@ func (s *Service) handleCheckpointRestore(writer http.ResponseWriter, request *h
 	if request.ContentLength != 0 && !decodeAPIJSON(writer, request, &input) {
 		return
 	}
-	record, err := s.restorer.Prepare(request.Context(), manifest.ID, time.Duration(input.TimeoutSeconds)*time.Second)
+	record, err := s.restorer.Prepare(request.Context(), manifest.ID, checkpoint.PrepareOptions{
+		Timeout: time.Duration(input.TimeoutSeconds) * time.Second,
+		Lazy:    input.Lazy,
+	})
 	if err != nil {
 		writeAPIError(writer, http.StatusUnprocessableEntity, "RESTORE_FAILED", err.Error())
 		return
@@ -535,6 +659,78 @@ func (s *Service) handleForkGet(writer http.ResponseWriter, request *http.Reques
 	writeAPIJSON(writer, http.StatusOK, record)
 }
 
+// handleCheckpointClone derives a set of independent running workloads from
+// one checkpoint, all on this machine. The caller must be authorized for the
+// checkpointed workload; every clone inherits its UID, so no privilege is
+// gained by cloning.
+func (s *Service) handleCheckpointClone(writer http.ResponseWriter, request *http.Request) {
+	manifest, err := s.checkpoints.Load(request.PathValue("id"))
+	if err != nil {
+		writeAPIError(writer, http.StatusNotFound, "CHECKPOINT_NOT_FOUND", err.Error())
+		return
+	}
+	if !s.authorizeUID(writer, request, manifest.Workload.UID) {
+		return
+	}
+	var input cloneRequest
+	if request.ContentLength != 0 && !decodeAPIJSON(writer, request, &input) {
+		return
+	}
+	record, err := s.cloner.Clone(request.Context(), manifest.ID, checkpoint.CloneOptions{
+		Count: input.Count, NamePrefix: input.NamePrefix, Parallel: input.Parallel,
+		Timeout: time.Duration(input.TimeoutSeconds) * time.Second,
+	})
+	if err != nil {
+		writeAPIError(writer, http.StatusUnprocessableEntity, "CLONE_FAILED", err.Error())
+		return
+	}
+	writeAPIJSON(writer, http.StatusCreated, record)
+}
+
+func (s *Service) handleCloneList(writer http.ResponseWriter, request *http.Request) {
+	caller, _ := s.caller(request)
+	values := s.cloner.List()
+	filtered := values[:0]
+	for _, value := range values {
+		if caller.UID == 0 || s.workloadOwnedBy(value.SourceWorkloadID, caller.UID) {
+			filtered = append(filtered, value)
+		}
+	}
+	writeAPIJSON(writer, http.StatusOK, filtered)
+}
+
+func (s *Service) handleCloneGet(writer http.ResponseWriter, request *http.Request) {
+	record, err := s.cloner.Get(request.PathValue("id"))
+	if err != nil {
+		writeAPIError(writer, http.StatusNotFound, "CLONE_NOT_FOUND", err.Error())
+		return
+	}
+	if _, ok := s.authorizedWorkload(writer, request, record.SourceWorkloadID); !ok {
+		return
+	}
+	writeAPIJSON(writer, http.StatusOK, record)
+}
+
+// handleCloneRollback reverses an uncommitted clone set. Committed sets are
+// fleets of ordinary workloads and are refused here — teardown is an explicit
+// workload delete, never a side effect.
+func (s *Service) handleCloneRollback(writer http.ResponseWriter, request *http.Request) {
+	record, err := s.cloner.Get(request.PathValue("id"))
+	if err != nil {
+		writeAPIError(writer, http.StatusNotFound, "CLONE_NOT_FOUND", err.Error())
+		return
+	}
+	if _, ok := s.authorizedWorkload(writer, request, record.SourceWorkloadID); !ok {
+		return
+	}
+	reversed, err := s.cloner.Rollback(request.Context(), record.ID, "operator requested rollback")
+	if err != nil {
+		writeAPIError(writer, http.StatusUnprocessableEntity, "CLONE_ROLLBACK_FAILED", err.Error())
+		return
+	}
+	writeAPIJSON(writer, http.StatusOK, reversed)
+}
+
 func (s *Service) handleMigrationList(writer http.ResponseWriter, request *http.Request) {
 	caller, _ := s.caller(request)
 	values := s.migrations.List()
@@ -558,13 +754,53 @@ func (s *Service) handleMigrationCreate(writer http.ResponseWriter, request *htt
 	}
 	result, err := s.migrations.Create(request.Context(), migration.CreateRequest{
 		WorkloadID: workload.Spec.ID, Destination: input.Destination, Mode: input.Mode,
-		Timeout: time.Duration(input.TimeoutSeconds) * time.Second,
+		PreCopyPasses: input.PreCopyPasses,
+		Timeout:       time.Duration(input.TimeoutSeconds) * time.Second,
 	})
 	if err != nil {
 		writeAPIError(writer, http.StatusBadRequest, "MIGRATION_CREATE_FAILED", err.Error())
 		return
 	}
 	writeAPIJSON(writer, http.StatusAccepted, result)
+}
+
+// handleMigrationPreflight runs a migration's discover and validate stages
+// without creating a migration: the destination is reached over the peer
+// channel, the same compatibility check runs on the same inputs, and the
+// report comes back for the operator to read. Nothing is frozen or moved.
+func (s *Service) handleMigrationPreflight(writer http.ResponseWriter, request *http.Request) {
+	var input migrateRequest
+	if !decodeAPIJSON(writer, request, &input) {
+		return
+	}
+	workload, ok := s.authorizedWorkload(writer, request, input.WorkloadID)
+	if !ok {
+		return
+	}
+	timeout := time.Duration(input.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), timeout)
+	defer cancel()
+	result, err := s.migrations.Preflight(ctx, migration.CreateRequest{
+		WorkloadID: workload.Spec.ID, Destination: input.Destination, Mode: input.Mode,
+		PreCopyPasses: input.PreCopyPasses, Timeout: timeout,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, migration.ErrDestinationUnreachable):
+			writeAPIError(writer, http.StatusBadGateway, "DESTINATION_UNREACHABLE", err.Error())
+		case errors.Is(err, migration.ErrDestinationIsSource):
+			writeAPIError(writer, http.StatusUnprocessableEntity, "DESTINATION_IS_SOURCE", err.Error())
+		case errors.Is(err, migration.ErrDestinationIdentityMismatch):
+			writeAPIError(writer, http.StatusUnprocessableEntity, "DESTINATION_IDENTITY_MISMATCH", err.Error())
+		default:
+			writeAPIError(writer, http.StatusUnprocessableEntity, "MIGRATION_PREFLIGHT_FAILED", err.Error())
+		}
+		return
+	}
+	writeAPIJSON(writer, http.StatusOK, result)
 }
 
 func (s *Service) handleMigrationGet(writer http.ResponseWriter, request *http.Request) {
@@ -593,6 +829,83 @@ func (s *Service) handleMigrationCancel(writer http.ResponseWriter, request *htt
 		return
 	}
 	writeAPIJSON(writer, http.StatusAccepted, map[string]string{"status": "cancellation_requested"})
+}
+
+// handleStandbyList lists this agent's standby duties — the workloads whose
+// state it holds and watches — and whether it can confirm a source's death on
+// its own. Root sees every duty; other callers see only duties for their own
+// workloads, the same ownership rule every other local resource follows.
+func (s *Service) handleStandbyList(writer http.ResponseWriter, request *http.Request) {
+	caller, _ := s.caller(request)
+	duties := s.standby.Duties()
+	filtered := duties[:0]
+	for _, duty := range duties {
+		if caller.UID == 0 || duty.WorkloadUID == int(caller.UID) {
+			filtered = append(filtered, duty)
+		}
+	}
+	writeAPIJSON(writer, http.StatusOK, standbyListResponse{Duties: filtered, AutomaticFailover: s.standby.automaticFailover()})
+}
+
+// handleFailoverList lists the replication ledger: what this source pushed to
+// which standby, and how the last attempt went — the source-side counterpart
+// of the standby's duty list.
+func (s *Service) handleFailoverList(writer http.ResponseWriter, request *http.Request) {
+	caller, _ := s.caller(request)
+	entries := s.replicator.Entries()
+	filtered := entries[:0]
+	for _, entry := range entries {
+		if caller.UID == 0 || s.workloadOwnedBy(entry.WorkloadID, caller.UID) {
+			filtered = append(filtered, entry)
+		}
+	}
+	writeAPIJSON(writer, http.StatusOK, filtered)
+}
+
+// handleStandbyTrigger commands an explicit failover. No death confirmation
+// runs first — the command is the confirmation — but the source is probed
+// when its URL is known, and a source that still answers lands in the
+// response as a warning: two live copies then exist, and only the operator
+// can resolve that. The failed-over duty comes back so the caller sees what
+// ran, from what checkpoint, under which restore id.
+func (s *Service) handleStandbyTrigger(writer http.ResponseWriter, request *http.Request) {
+	duty, err := s.standby.Duty(request.PathValue("workload"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, persistence.ErrNotFound) {
+			status = http.StatusNotFound
+		}
+		writeAPIError(writer, status, "STANDBY_DUTY_NOT_FOUND", err.Error())
+		return
+	}
+	if !s.authorizeUID(writer, request, duty.WorkloadUID) {
+		return
+	}
+	var input standbyTriggerRequest
+	if request.ContentLength != 0 && !decodeAPIJSON(writer, request, &input) {
+		return
+	}
+	response := standbyTriggerResponse{SourceReachable: "unknown"}
+	if duty.SourceAgentURL != "" {
+		if alive, probeErr := s.standby.probeSource(request.Context(), duty.SourceAgentURL); probeErr == nil {
+			response.SourceReachable = "no"
+			if alive {
+				response.SourceReachable = "yes"
+				response.Warning = "the source answered its peer listener; this workload now has two live copies — stop one manually"
+			}
+		}
+	}
+	updated, err := s.standby.Trigger(request.Context(), duty.WorkloadID, input.CheckpointID, input.Lazy, "operator commanded failover")
+	if err != nil {
+		status, code := http.StatusConflict, "FAILOVER_FAILED"
+		if errors.Is(err, persistence.ErrNotFound) {
+			status, code = http.StatusNotFound, "STANDBY_DUTY_NOT_FOUND"
+		}
+		writeAPIError(writer, status, code, err.Error())
+		return
+	}
+	response.Duty = updated
+	writeAPIJSON(writer, http.StatusOK, response)
 }
 
 func (s *Service) authorizedWorkload(writer http.ResponseWriter, request *http.Request, id string) (model.Workload, bool) {

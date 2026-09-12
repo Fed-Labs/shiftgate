@@ -21,10 +21,39 @@ of the doctor checks.
 - `criu --version` — the binary must exist on the agent's PATH. On
   Debian/Ubuntu: `apt install criu`.
 - `sudo criu check` — reports the kernel capabilities CRIU needs. On
-  containers and some VMs, missing capabilities (e.g. `CHECKPOINT_RESTORE`,
-  `POSBARB`) cannot be fixed from userspace; the agent will never fake a
-  checkpoint there, and that is the honest answer.
+  containers and some VMs, a missing capability (`CAP_SYS_ADMIN` or
+  `CAP_CHECKPOINT_RESTORE` — `criu check` names it) cannot be fixed from
+  userspace; the agent will never fake a checkpoint there, and that is the
+  honest answer.
 - Run the agent as root. CRIU dump/restore requires it.
+
+## CRIU is healthy on the host but FAILs under the systemd agent
+
+`shiftgate doctor` shows the reason inline. When it names netlink — `Unable to
+create a netlink socket: Address family not supported by protocol` /
+`Could not initialize kernel features detection` — the unit's seccomp filter
+(`RestrictAddressFamilies`) is missing `AF_NETLINK`, which CRIU needs to
+enumerate network state. The shipped unit allows it since v0.1.4; reinstall
+the current release (`curl -fsSL …/install.sh | bash` restarts the service on
+upgrade) or add `AF_NETLINK` to `RestrictAddressFamilies` in
+`/etc/systemd/system/shift-agent.service` and `systemctl daemon-reload &&
+systemctl restart shift-agent`.
+
+## `shift` types nothing; the CLI is `shiftgate`
+
+`shift` is a POSIX shell builtin (it shifts positional parameters), so a
+binary by that name can never be typed — that is why the CLI is called
+`shiftgate`. A v0.1.0 install left a `/usr/local/bin/shift` that no shell
+ever ran; the current installer removes it. Run `shiftgate` (the binary is
+`shiftgate`, not `shift`).
+
+## Dashboard login fails with "Failed to fetch"
+
+The browser blocked the call: the control plane serves no CORS header for the
+dashboard's origin. Set `SHIFT_ALLOWED_ORIGINS` to the exact origin the
+dashboard is served from (`http://localhost:3000` in development,
+`https://app.example.com` in production) and restart `shift-control`. The
+CLI and agents are unaffected either way — they send no `Origin` header.
 
 ## Migration fails with DESTINATION_UNREACHABLE
 
@@ -123,6 +152,29 @@ shiftgate update status
 `pending_restart` means exactly that; it swaps at the next safe point.
 `shiftgate update rollback` undoes a completed swap; the undone version is
 blocked from reinstalling until `shiftgate update unblock VERSION`.
+
+## Checkpoint create fails with "mirror failed" (hosted storage)
+
+With `SHIFT_OBJECTSTORE_BACKEND=control-plane`, two failure shapes exist:
+
+- **`hosted storage credentials not yet available`** — the agent has not
+  completed its first credential fetch yet (it fetches at startup, then at
+  half each credential's lifetime). If it persists, check that the
+  control-plane reporter settings are present and the API key carries the
+  `machines` scope; then check the agent log for the exact fetch error
+  (a 401 names a bad key; a connection error names the control URL).
+- **`organization checkpoint storage quota is exceeded`** — the
+  organization is over its plan limit and the control plane is refusing to
+  issue credentials (403 `STORAGE_QUOTA_EXCEEDED`). Usage is metered from
+  the bucket, so start with the dashboard's Storage page (or
+  `shiftgate control storage`) — if the reconciled number looks wrong,
+  force a recount with `POST /v1/organizations/{org}/storage/reconcile`.
+  Mirroring resumes once usage is genuinely below the limit or the plan is
+  upgraded; local checkpointing is never suspended by a quota.
+
+A control plane that does not host storage answers the credential route with
+`STORAGE_NOT_CONFIGURED` — the agent's backend should be `s3` or `local`
+there, not `control-plane`.
 
 ## Where the facts live
 

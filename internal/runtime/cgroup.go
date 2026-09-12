@@ -19,8 +19,24 @@ type CgroupManager struct {
 	enabled  bool
 }
 
-func NewCgroupManager(required bool) (*CgroupManager, error) {
-	manager := &CgroupManager{root: "/sys/fs/cgroup/shift", required: required}
+// DefaultCgroupRoot is where workload cgroups live unless the agent is
+// configured otherwise. It is a per-agent resource: two agents on one machine
+// must not share it, or the workload a migration restores on one of them
+// lands in the cgroup the other is about to tear down — the shared root is
+// why a removal that should be instant meets EBUSY instead.
+const DefaultCgroupRoot = "/sys/fs/cgroup/shift"
+
+// ErrCgroupOccupied reports that a cgroup directory could not be removed
+// because it still holds processes that are not this workload's dying
+// remnants — another agent's tree in a shared root, or a straggler no retry
+// would outlive. The directory is deliberately left in place.
+var ErrCgroupOccupied = errors.New("cgroup still holds processes; left in place")
+
+func NewCgroupManager(required bool, root string) (*CgroupManager, error) {
+	if root == "" {
+		root = DefaultCgroupRoot
+	}
+	manager := &CgroupManager{root: root, required: required}
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
 		if required {
 			return nil, errors.New("cgroup v2 is required but not mounted")
@@ -230,7 +246,7 @@ func (m *CgroupManager) ReapFrozenSource(key string) error {
 	if err := writeControl(parked, "cgroup.kill", "1"); err != nil {
 		return err
 	}
-	return removeCgroupDir(parked)
+	return m.removeCgroupDir(parked)
 }
 
 // readProcs lists the process ids attached to a cgroup. A missing cgroup
@@ -283,20 +299,30 @@ func (m *CgroupManager) Remove(workloadID string) error {
 	if !m.enabled {
 		return nil
 	}
-	return removeCgroupDir(m.path(workloadID))
+	return m.removeCgroupDir(m.path(workloadID))
 }
 
 // removeCgroupDir removes a cgroup directory, retrying briefly while the
 // kernel still lists dying processes in it: a killed tree releases its
-// membership asynchronously, so an immediate removal can race EBUSY.
-func removeCgroupDir(path string) error {
-	deadline := time.Now().Add(2 * time.Second)
+// membership asynchronously, so an immediate removal can race EBUSY. Members
+// that persist past that window are not dying remnants — they are processes
+// that belong to someone else (a second agent on the machine restoring the
+// same workload id into a shared root) or a straggler no bounded retry would
+// outlive — and the directory is left standing under ErrCgroupOccupied:
+// removing another tenant's cgroup would be destruction, not cleanup.
+func (m *CgroupManager) removeCgroupDir(path string) error {
+	deadline := time.Now().Add(500 * time.Millisecond)
 	for {
 		err := os.Remove(path)
 		if err == nil || errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		if !errors.Is(err, syscall.EBUSY) || time.Now().After(deadline) {
+			if errors.Is(err, syscall.EBUSY) {
+				if procs, readErr := m.readProcs(path); readErr == nil && len(procs) > 0 {
+					return fmt.Errorf("%w (%s)", ErrCgroupOccupied, path)
+				}
+			}
 			return err
 		}
 		time.Sleep(20 * time.Millisecond)

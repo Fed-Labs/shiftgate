@@ -22,6 +22,7 @@ import (
 
 	"shift.dev/shift/internal/config"
 	"shift.dev/shift/internal/database"
+	"shift.dev/shift/internal/model"
 	"shift.dev/shift/internal/oidc"
 )
 
@@ -77,6 +78,7 @@ type fakeIdentityProvider struct {
 	issuer   string
 	clientID string
 	secret   string
+	domain   string
 	email    string
 	subject  string
 	verified bool
@@ -92,9 +94,22 @@ func newFakeIdentityProvider(t *testing.T) *fakeIdentityProvider {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The federated identity is unique per instance: these tests share one
+	// database, and lower(email), (sso_issuer, sso_subject), and an
+	// organization's enforced email domain are each globally unique — a fixed
+	// email, subject, or domain would collide with earlier runs (the account
+	// is already linked to a different identity; the domain is already
+	// claimed; the domain answers "required" for another run's logins). The
+	// domain matching is exact, so a never-seen domain cannot be poisoned by
+	// a stale enforcement claim.
+	identity, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain := "sso-" + identity + ".test"
 	idp := &fakeIdentityProvider{
 		key: key, clientID: "shift-control", secret: "issuer-secret",
-		email: "person@example.test", subject: "user-42", verified: true,
+		domain: domain, email: "person-" + identity + "@" + domain, subject: "user-" + identity, verified: true,
 		codes: map[string]fakeIssuedCode{},
 	}
 	mux := http.NewServeMux()
@@ -282,7 +297,15 @@ func openSSOTestServer(t *testing.T, sso bool) (*httptest.Server, string, string
 	httpServer := httptest.NewServer(server.Handler())
 	t.Cleanup(httpServer.Close)
 
-	register := RegisterRequest{Email: "sso-" + time.Now().UTC().Format("20060102150405.000000000") + "@example.test", Password: "correct horse battery staple", DisplayName: "SSO User", Organization: "SSO Organization"}
+	// The organization's founding account registers with a password, so its
+	// email must not sit on a domain any organization enforces — earlier runs
+	// left their claims behind in this shared database, and one of them
+	// enforces example.test. A per-instance domain can never be claimed.
+	registrant, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := RegisterRequest{Email: "admin-" + registrant + "@org-" + registrant + ".test", Password: "correct horse battery staple", DisplayName: "SSO User", Organization: "SSO Organization"}
 	var registration struct {
 		User         User          `json:"user"`
 		Organization Organization  `json:"organization"`
@@ -437,11 +460,13 @@ func TestSSOEnforcement(t *testing.T) {
 	// The enforcement surface is honest before it is configured on.
 	getJSON(t, client, organizationPath+"/sso", http.StatusOK, &SetOrganizationSSORequest{Enforced: false, EmailDomain: ""}, authHeader)
 
-	// Enforce the fake issuer's domain.
-	requestJSON(t, client, http.MethodPut, organizationPath+"/sso", SetOrganizationSSORequest{Enforced: true, EmailDomain: "example.test"}, http.StatusOK, &SetOrganizationSSORequest{}, authHeader)
+	// Enforce the fake issuer's domain — the fixture's own, never a fixed
+	// literal, because a claimed domain is globally unique and earlier runs
+	// have claimed theirs.
+	requestJSON(t, client, http.MethodPut, organizationPath+"/sso", SetOrganizationSSORequest{Enforced: true, EmailDomain: idp.domain}, http.StatusOK, &SetOrganizationSSORequest{}, authHeader)
 	var state SetOrganizationSSORequest
 	getJSON(t, client, organizationPath+"/sso", http.StatusOK, &state, authHeader)
-	if !state.Enforced || state.EmailDomain != "example.test" {
+	if !state.Enforced || state.EmailDomain != idp.domain {
 		t.Fatalf("enforcement did not stick: %+v", state)
 	}
 
@@ -457,7 +482,7 @@ func TestSSOEnforcement(t *testing.T) {
 	// Password login and self-service registration for the domain are
 	// refused before any credential is checked.
 	expectStatus(t, client, http.MethodPost, httpServer.URL+"/v1/auth/login", http.StatusForbidden, "", LoginRequest{Email: idp.email, Password: "whatever the password is"})
-	expectStatus(t, client, http.MethodPost, httpServer.URL+"/v1/auth/register", http.StatusForbidden, "", RegisterRequest{Email: "newcomer@example.test", Password: "correct horse battery staple", DisplayName: "Newcomer"})
+	expectStatus(t, client, http.MethodPost, httpServer.URL+"/v1/auth/register", http.StatusForbidden, "", RegisterRequest{Email: "newcomer@" + idp.domain, Password: "correct horse battery staple", DisplayName: "Newcomer"})
 
 	// A federated login lands in the enforcing organization as a viewer.
 	user, tokens := ssoLogin(t, httpServer, idp)
@@ -543,10 +568,15 @@ func TestSCIMProvisioning(t *testing.T) {
 	getJSON(t, client, httpServer.URL+"/v1/scim/v2/ResourceTypes", http.StatusOK, &map[string]any{}, scimAuth)
 	getJSON(t, client, httpServer.URL+"/v1/scim/v2/Schemas", http.StatusOK, &map[string]any{}, scimAuth)
 
-	// Create.
+	// Create. The external id is globally unique in the schema and these
+	// tests share one database across runs, so it carries a per-run token.
+	externalRun, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
 	email := "provisioned-" + time.Now().UTC().Format("20060102150405.000000000") + "@scim.example.test"
 	var user scimUserSummary
-	requestJSON(t, client, http.MethodPost, usersPath, map[string]any{"userName": email, "displayName": "Provisioned Person", "externalId": "ext-1"}, http.StatusCreated, &user, scimAuth)
+	requestJSON(t, client, http.MethodPost, usersPath, map[string]any{"userName": email, "displayName": "Provisioned Person", "externalId": "ext-" + externalRun + "-1"}, http.StatusCreated, &user, scimAuth)
 	if user.ID == "" || user.UserName != email || !user.Active {
 		t.Fatalf("created user is wrong: %+v", user)
 	}
@@ -574,8 +604,8 @@ func TestSCIMProvisioning(t *testing.T) {
 	getJSON(t, client, usersPath+"?filter="+url.QueryEscape(`password eq "hunter2"`), http.StatusBadRequest, &map[string]any{}, scimAuth)
 
 	// A full replacement rewrites the idP-controlled fields.
-	requestJSON(t, client, http.MethodPut, usersPath+"/"+user.ID, map[string]any{"userName": email, "displayName": "Renamed Person", "externalId": "ext-2", "active": true}, http.StatusOK, &user, scimAuth)
-	if user.DisplayName != "Renamed Person" || user.ExternalID != "ext-2" {
+	requestJSON(t, client, http.MethodPut, usersPath+"/"+user.ID, map[string]any{"userName": email, "displayName": "Renamed Person", "externalId": "ext-" + externalRun + "-2", "active": true}, http.StatusOK, &user, scimAuth)
+	if user.DisplayName != "Renamed Person" || user.ExternalID != "ext-"+externalRun+"-2" {
 		t.Fatalf("replacement did not take: %+v", user)
 	}
 

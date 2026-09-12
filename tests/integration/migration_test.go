@@ -6,9 +6,11 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,6 +134,9 @@ func TestE2EMigrationUnreachableDestination(t *testing.T) {
 
 	migration := waitForMigrationTerminal(t, source.client, created.ID)
 	if migration.Stage != model.MigrationRolledBack {
+		for _, event := range migration.Events {
+			t.Logf("event %d %s %s %s", event.Sequence, event.Timestamp.Format("15:04:05.000"), event.Stage, event.Message)
+		}
 		t.Fatalf("migration to a dead destination ended in %s (%s: %s), want ROLLED_BACK",
 			migration.Stage, migration.FailureCode, migration.FailureReason)
 	}
@@ -149,6 +154,101 @@ func TestE2EMigrationUnreachableDestination(t *testing.T) {
 		t.Fatal("resumed workload has no live process")
 	}
 	waitUntil(t, 60*time.Second, "source counter to keep counting after rollback", func() (bool, string) {
+		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
+	})
+}
+
+// TestE2EMigrationDryRun exercises `migrate --dry-run` over real peer TLS: a
+// healthy destination comes back compatible with both machines and the
+// network plan named, a wrong machine id is refused, the source itself is
+// refused as a destination, a dead port is unreachable — and none of it
+// creates a migration record or interrupts the workload.
+func TestE2EMigrationDryRun(t *testing.T) {
+	requireE2E(t)
+	source := startAgent(t, "dryrun-source")
+	destination := startAgent(t, "dryrun-destination")
+
+	root := t.TempDir()
+	script := filepath.Join(root, "run.sh")
+	if err := os.WriteFile(script, []byte(counterScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workload := createWorkload(t, source.client, "stays-put", root, script)
+	logPath := filepath.Join(root, "progress.log")
+	waitUntil(t, 30*time.Second, "counter to make progress", func() (bool, string) {
+		return fileLineCount(t, logPath) >= 2, fmt.Sprintf("lines=%d", fileLineCount(t, logPath))
+	})
+	baseline := fileLineCount(t, logPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	result, err := source.client.PreflightMigration(ctx, agentclient.MigrationCreateRequest{
+		WorkloadID: workload.Spec.ID,
+		Destination: model.Destination{
+			MachineID: destination.machineID(t),
+			AgentURL:  destination.peerURL(),
+		},
+		Mode: model.MigrationCold,
+	})
+	if err != nil {
+		t.Fatalf("dry run against the live destination: %v", err)
+	}
+	if !result.Report.Compatible {
+		t.Fatalf("two agents on the same machine must be compatible, got %+v", result.Report.Issues)
+	}
+	if result.Destination.MachineID != destination.machineID(t) {
+		t.Fatalf("dry run resolved destination %s", result.Destination.MachineID)
+	}
+	if result.SourceMachine.MachineID != source.machineID(t) {
+		t.Fatalf("dry run reported source %s", result.SourceMachine.MachineID)
+	}
+	if result.Network.Summary == "" {
+		t.Fatal("the dry run must include the network plan the migration would apply")
+	}
+
+	// A machine id that is not the destination's is refused before anything
+	// else moves — the same refusal a real migration would get.
+	var api *agentclient.APIError
+	_, err = source.client.PreflightMigration(ctx, agentclient.MigrationCreateRequest{
+		WorkloadID: workload.Spec.ID,
+		Destination: model.Destination{
+			MachineID: "not-this-machine",
+			AgentURL:  destination.peerURL(),
+		},
+	})
+	if !errors.As(err, &api) || api.Code != "DESTINATION_IDENTITY_MISMATCH" {
+		t.Fatalf("a mismatched machine id must fail with DESTINATION_IDENTITY_MISMATCH, got %v", err)
+	}
+	_, err = source.client.PreflightMigration(ctx, agentclient.MigrationCreateRequest{
+		WorkloadID:  workload.Spec.ID,
+		Destination: model.Destination{AgentURL: source.peerURL()},
+	})
+	if !errors.As(err, &api) || api.Code != "DESTINATION_IS_SOURCE" {
+		t.Fatalf("migrating to the source must fail with DESTINATION_IS_SOURCE, got %v", err)
+	}
+	deadPort, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = source.client.PreflightMigration(ctx, agentclient.MigrationCreateRequest{
+		WorkloadID:  workload.Spec.ID,
+		Destination: model.Destination{AgentURL: fmt.Sprintf("https://127.0.0.1:%d", deadPort)},
+	})
+	if !errors.As(err, &api) || api.Code != "DESTINATION_UNREACHABLE" {
+		t.Fatalf("a dead destination must fail with DESTINATION_UNREACHABLE, got %v", err)
+	}
+
+	// The dry run must leave nothing behind: no migration records, and the
+	// workload never stopped counting.
+	migrations, err := source.client.Migrations(ctx)
+	if err != nil {
+		t.Fatalf("list migrations: %v", err)
+	}
+	if len(migrations) != 0 {
+		t.Fatalf("a dry run must not create migration records, got %d", len(migrations))
+	}
+	waitForWorkload(t, source.client, workload.Spec.ID, model.WorkloadRunning)
+	waitUntil(t, 30*time.Second, "counter to keep advancing through the dry run", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
 }
@@ -237,6 +337,107 @@ func TestE2EMigrationDestinationDiesMidTransfer(t *testing.T) {
 	})
 }
 
+// TestE2ELiveMigrationDestinationDiesDuringPreCopy: the destination agent is
+// killed while a pre-copy pass is still uploading — before the freeze. The
+// migration must fail and preserve a source that was never stopped: the
+// passes run while the workload is live, so the failure costs it nothing,
+// and the record states that plainly as zero downtime.
+func TestE2ELiveMigrationDestinationDiesDuringPreCopy(t *testing.T) {
+	requireE2E(t)
+	if !interpreterAvailable("python3") {
+		t.Skip("python3 is not on PATH")
+	}
+	source := startAgent(t, "live-die-source")
+	destination := startAgent(t, "live-die-destination")
+
+	// A random heap keeps pass 1's upload incompressible — a real transfer,
+	// not a compression shortcut. The kill below is timed by watching for the
+	// pass event, not by racing the upload's duration, so the heap stays
+	// small enough that the migration's honest worst-case reservation (the
+	// heap sized once per pass plus the final delta) fits the destination's
+	// free storage even on a nearly full disk.
+	root := t.TempDir()
+	script := filepath.Join(root, "state.py")
+	if err := os.WriteFile(script, []byte(`import os, time
+blocks = [os.urandom(131072) for _ in range(384)]
+log = open("progress.log", "a", 1)
+n = 0
+while True:
+    n += 1
+    log.write("%d\n" % n)
+    time.sleep(1)
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	workload := createWorkload(t, source.client, "live-die", root, "python3", script)
+	logPath := filepath.Join(root, "progress.log")
+	waitUntil(t, 60*time.Second, "heap workload to make progress", func() (bool, string) {
+		return fileLineCount(t, logPath) >= 2, fmt.Sprintf("lines=%d", fileLineCount(t, logPath))
+	})
+	baseline := fileLineCount(t, logPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	created, err := source.client.CreateMigration(ctx, agentclient.MigrationCreateRequest{
+		WorkloadID: workload.Spec.ID,
+		Destination: model.Destination{
+			MachineID: destination.machineID(t),
+			AgentURL:  destination.peerURL(),
+		},
+		Mode:           model.MigrationLive,
+		PreCopyPasses:  4,
+		TimeoutSeconds: 240,
+	})
+	if err != nil {
+		t.Fatalf("create migration: %v", err)
+	}
+
+	// Kill the destination once a pre-copy pass is provably uploading.
+	killDeadline := time.Now().Add(2 * time.Minute)
+	killed := false
+	for time.Now().Before(killDeadline) {
+		migration, err := source.client.Migration(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("read migration: %v", err)
+		}
+		if migrationTerminal(migration.Stage) {
+			t.Fatalf("migration reached %s before a pre-copy pass could be caught; the heap uploaded too fast", migration.Stage)
+		}
+		for _, event := range migration.Events {
+			if strings.Contains(event.Message, "transferring pre-copy pass") {
+				destination.stop(t)
+				killed = true
+				break
+			}
+		}
+		if killed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !killed {
+		t.Fatal("never observed a pre-copy pass transfer")
+	}
+
+	migration := waitForMigrationTerminal(t, source.client, created.ID)
+	if migration.Stage == model.MigrationCompleted {
+		t.Fatal("migration completed despite the destination dying mid-pass")
+	}
+	if !migration.SourcePreserved {
+		t.Fatal("failed migration did not preserve the source")
+	}
+	// The workload was never frozen — passes run while it is live and the
+	// failure happened before Finalize — so the record's downtime is zero,
+	// not the whole wall clock of the failed attempt.
+	if migration.Metrics.Downtime != 0 {
+		t.Fatalf("a migration that never froze its workload must report zero downtime, got %s", migration.Metrics.Downtime)
+	}
+	waitForWorkload(t, source.client, workload.Spec.ID, model.WorkloadRunning)
+	waitUntil(t, 120*time.Second, "source counter to keep counting after the destination died mid-pass", func() (bool, string) {
+		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
+	})
+}
+
 // TestE2EAgentRestartResume: machine disconnect, machine restart. A workload
 // is checkpointed, the whole agent dies, a new agent process boots over the
 // same state directory, and the checkpoint restores — the application
@@ -282,7 +483,7 @@ func TestE2EAgentRestartResume(t *testing.T) {
 
 	// The checkpoint survived the restart and is visible through the new
 	// process; restoring it resumes the counter past the baseline.
-	record, err := second.client.Restore(ctx, manifest.ID, 300)
+	record, err := second.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 300})
 	if err != nil {
 		t.Fatalf("restore after restart: %v", err)
 	}
@@ -293,4 +494,102 @@ func TestE2EAgentRestartResume(t *testing.T) {
 	waitUntil(t, 90*time.Second, "resumed counter to pass the pre-restart baseline", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+}
+
+// TestE2ELiveMigrationIterativePreCopy: a live migration whose pre-copy loop
+// runs up to three passes while the workload keeps running, each pass's
+// images transferring to the destination the moment the pass completes — the
+// interleaving spec §10 demands — so the freeze at the end carries only the
+// final delta. The restore on the destination is the proof that the whole
+// pass chain arrived complete; the metrics prove the passes moved while the
+// workload was live and the frozen window carried only part of the bytes.
+func TestE2ELiveMigrationIterativePreCopy(t *testing.T) {
+	requireE2E(t)
+	source := startAgent(t, "live-precopy-source")
+	destination := startAgent(t, "live-precopy-destination")
+
+	root := t.TempDir()
+	script := filepath.Join(root, "run.sh")
+	if err := os.WriteFile(script, []byte(counterScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workload := createWorkload(t, source.client, "live-precopy", root, script)
+	logPath := filepath.Join(root, "progress.log")
+	waitUntil(t, 30*time.Second, "counter to make progress", func() (bool, string) {
+		return fileLineCount(t, logPath) >= 2, fmt.Sprintf("lines=%d", fileLineCount(t, logPath))
+	})
+	baseline := fileLineCount(t, logPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	created, err := source.client.CreateMigration(ctx, agentclient.MigrationCreateRequest{
+		WorkloadID: workload.Spec.ID,
+		Destination: model.Destination{
+			MachineID: destination.machineID(t),
+			AgentURL:  destination.peerURL(),
+		},
+		Mode:           model.MigrationLive,
+		PreCopyPasses:  3,
+		TimeoutSeconds: 240,
+	})
+	if err != nil {
+		t.Fatalf("create migration: %v", err)
+	}
+
+	migration := waitForMigrationTerminal(t, source.client, created.ID)
+	if migration.Stage != model.MigrationCompleted {
+		t.Fatalf("live migration ended in %s (%s: %s)", migration.Stage, migration.FailureCode, migration.FailureReason)
+	}
+	// The checkpoint that carried the workload across must record the
+	// pre-copy loop — the passes that ran, not the cap that was asked for.
+	manifest, err := source.client.Checkpoint(ctx, migration.CheckpointID)
+	if err != nil {
+		t.Fatalf("load migration checkpoint: %v", err)
+	}
+	if !manifest.Engine.PreCopy || manifest.Engine.PreCopyPasses < 1 || manifest.Engine.PreCopyPasses > 3 {
+		t.Fatalf("live checkpoint did not record its pre-copy passes: %+v", manifest.Engine)
+	}
+	// The passes ran as their own packaged assets, beside the final image set
+	// and the filesystem root.
+	passAssets := 0
+	for _, asset := range manifest.Assets {
+		if strings.HasPrefix(asset.Name, "process-state-precopy-") {
+			passAssets++
+		}
+	}
+	if passAssets != manifest.Engine.PreCopyPasses {
+		t.Fatalf("manifest carries %d pass assets but the engine recorded %d passes", passAssets, manifest.Engine.PreCopyPasses)
+	}
+	// The interleaving itself, in the migration's own metrics: bytes moved
+	// during the passes — while the workload kept running — and more bytes
+	// still had to travel inside the frozen window for the final delta and
+	// the filesystem root.
+	if migration.Metrics.PreCopyTransferredBytes <= 0 {
+		t.Fatalf("pre-copy passes transferred nothing before the freeze: %+v", migration.Metrics)
+	}
+	if migration.Metrics.TransferredBytes <= migration.Metrics.PreCopyTransferredBytes {
+		t.Fatalf("the frozen window carried nothing beyond the passes: %+v", migration.Metrics)
+	}
+	if migration.Metrics.TotalStateBytes <= 0 {
+		t.Fatalf("live migration recorded no state bytes: %+v", migration.Metrics)
+	}
+
+	// The destination runs the workload and the counter continued — the
+	// merged multi-pass image set restored complete state.
+	destinationWorkload := waitForWorkload(t, destination.client, workload.Spec.ID, model.WorkloadRunning)
+	if destinationWorkload.Process == nil {
+		t.Fatal("destination workload has no live process")
+	}
+	waitUntil(t, 90*time.Second, "migrated counter to keep counting on the destination", func() (bool, string) {
+		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
+	})
+
+	// The source is stopped and clean.
+	sourceWorkload, err := source.client.Workload(ctx, workload.Spec.ID)
+	if err != nil {
+		t.Fatalf("read source workload: %v", err)
+	}
+	if sourceWorkload.Status != model.WorkloadStopped {
+		t.Fatalf("source workload is %s after live migration, want stopped", sourceWorkload.Status)
+	}
 }
