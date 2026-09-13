@@ -1,3 +1,4 @@
+<img width="364" height="269" alt="ShiftGate" />
 # SHIFT
 
 SHIFT is a Linux-first computation mobility platform. It captures a managed workload with
