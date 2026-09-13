@@ -222,8 +222,33 @@ func (store *Store) Ping(ctx context.Context) error {
 // order, each inside one transaction recorded in schema_migrations. A failing
 // migration rolls back and aborts startup — the control plane refuses to run
 // against a schema it does not know.
+// migrationLockKey identifies the schema-migration advisory lock. Two
+// processes migrating one database at once — go test runs package binaries
+// in parallel and several packages run database-backed suites against the
+// same test database — would each see "not applied" before either commits,
+// then race the apply into catalog collisions. The lock serializes
+// migrators; the one that arrives second finds every migration applied and
+// returns without touching the schema.
+const migrationLockKey int64 = 0x7368696674 // "shift"
+
 func (store *Store) Migrate(ctx context.Context) error {
-	if _, err := store.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+	// A session-level advisory lock needs one dedicated connection: taking
+	// and releasing it over separate pool round-trips would try to unlock
+	// from a session that never locked. The unlock is deferred (LIFO) so it
+	// runs before the connection returns to the pool, on a context of its
+	// own — a canceled caller must not leave the lock held on a pooled
+	// session, where it would outlive this call and block the next
+	// migrator on this process.
+	conn, err := store.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey) }()
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
 		return err
 	}
 	entries, err := fs.ReadDir(schemamigrations.Files, "migrations")
@@ -236,7 +261,7 @@ func (store *Store) Migrate(ctx context.Context) error {
 			continue
 		}
 		var applied bool
-		if err := store.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE name=$1)`, entry.Name()).Scan(&applied); err != nil {
+		if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE name=$1)`, entry.Name()).Scan(&applied); err != nil {
 			return err
 		}
 		if applied {
@@ -246,7 +271,7 @@ func (store *Store) Migrate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
+		tx, err := conn.BeginTx(ctx, pgx.TxOptions{})
 		if err != nil {
 			return err
 		}
