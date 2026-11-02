@@ -161,8 +161,8 @@ func firstExistingFile(paths ...string) string {
 }
 
 // defaultListen resolves the relay's listen address: the explicit environment
-// first, then the platform-as-a-service PORT convention (Heroku-style —
-// the platform's edge proxy is the TLS terminator), then the built-in
+// first, then the platform-as-a-service PORT convention (Heroku-style — the
+// platform's edge proxy is the TLS terminator), then the built-in
 // all-interfaces default.
 func defaultListen() string {
 	if value := os.Getenv("SHIFT_RELAY_LISTEN"); value != "" {

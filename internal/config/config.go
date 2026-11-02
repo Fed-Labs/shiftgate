@@ -1214,8 +1214,8 @@ func LoadControlPlaneUnvalidated(path string) (ControlPlane, error) {
 	if value := os.Getenv("SHIFT_CONTROL_LISTEN"); value != "" {
 		configuration.Listen = value
 	} else if port := os.Getenv("PORT"); port != "" && configuration.Listen == DefaultControlPlane().Listen {
-		// Platform-as-a-service convention (Heroku-style platforms): when the
-		// platform supplies PORT and neither the config file nor
+	// Platform-as-a-service convention (Heroku-style platforms): when the
+	// platform supplies PORT and neither the config file nor
 		// SHIFT_CONTROL_LISTEN chose a listener, bind the platform port on all
 		// interfaces — the platform's edge proxy is the TLS terminator. The
 		// loopback default is unchanged everywhere else.

@@ -9,7 +9,7 @@ COPY apps/web ./apps/web
 # NEXT_PUBLIC_API_URL is inlined into the client bundle at build time and
 # apps/web/next.config.ts fails the build without it; the deployment
 # environment passes both as build arguments (the build environment injects
-# as build args). The site URL keeps metadataBase, robots, and the sitemap
+# them as build args). The site URL keeps metadataBase, robots, and the sitemap
 # pointed at the canonical origin.
 ARG NEXT_PUBLIC_API_URL
 ARG NEXT_PUBLIC_SITE_URL

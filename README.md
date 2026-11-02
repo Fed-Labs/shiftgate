@@ -157,9 +157,6 @@ Usage is metered from the bucket itself and the plan quota (10 GiB free /
 enforced fail-closed: over quota, credential issuance stops and new
 checkpoints report the quota failure while local checkpointing continues.
 See [the deployment guide](docs/deployment.md#hosting-checkpoint-storage-platform-side-mirroring).
-The same hosted stack (control plane, PostgreSQL, dashboard, optional relay
-and checkpoint storage) deploys from
-
 
 For an unprivileged local evaluation, use a writable socket and state directory. Process
 launch and inventory work normally; CRIU will accurately report missing kernel capabilities
