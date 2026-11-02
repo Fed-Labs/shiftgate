@@ -4,6 +4,11 @@
 .DS_Store
 bin/
 /dist/
+# stray binaries from `go build ./cmd/...` at the repo root
+/shift
+/shift-agent
+/shift-control
+/shift-gc
 coverage/
 tmp/
 data/
@@ -19,3 +24,13 @@ target/
 # Local end-to-end verification stacks (live credentials, agent state, object data)
 .e2e-storage/
 .e2e-hosted/
+
+# stray binaries from go build (same class as /shift above)
+/shift-release
+/shift-relay
+/shiftgate
+
+# local agent-tooling state
+.claude/
+.shift/
+CLAUDE.md
