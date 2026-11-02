@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:16-alpine
+    mem_limit: 512m
+    cpus: 1.0
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-shift}
       POSTGRES_USER: ${POSTGRES_USER:-shift}
@@ -12,16 +14,21 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    restart: unless-stopped
 
   control:
     build:
       context: ../..
       dockerfile: deployments/docker/Dockerfile.control
+    mem_limit: 512m
+    cpus: 1.0
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      SHIFT_DATABASE_URL: postgres://${POSTGRES_USER:-shift}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-shift}?sslmode=disable
+      # Production docs require sslmode=verify-full; the local compose default
+      # keeps plaintext transport only for the single-host stack.
+      SHIFT_DATABASE_URL: postgres://${POSTGRES_USER:-shift}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-shift}?sslmode=${SHIFT_DB_SSLMODE:-disable}
       SHIFT_TOKEN_PEPPER: ${SHIFT_TOKEN_PEPPER:?set SHIFT_TOKEN_PEPPER}
       SHIFT_PASSWORD_PEPPER: ${SHIFT_PASSWORD_PEPPER:?set SHIFT_PASSWORD_PEPPER}
       SHIFT_CONTROL_LISTEN: 0.0.0.0:8090
@@ -29,18 +36,31 @@ services:
       # entry the dashboard cannot authenticate (the browser blocks it), while
       # the CLI and agents are unaffected.
       SHIFT_ALLOWED_ORIGINS: ${SHIFT_ALLOWED_ORIGINS:-}
+      # Optional /metrics scrape bearer token (>= 16 chars when set); with the
+      # loopback bind above, an empty token leaves /metrics open on localhost.
+      SHIFT_METRICS_TOKEN: ${SHIFT_METRICS_TOKEN:-}
       # Platform-hosted checkpoint storage. Opt in with `--profile storage`
       # (which starts minio below) and SHIFT_STORAGE_ENABLED=true. The MinIO
       # credentials must match the minio service's root user and password.
+      # No fallback credentials: set SHIFT_STORAGE_ACCESS_KEY_ID /
+      # SHIFT_STORAGE_SECRET_ACCESS_KEY to real values before enabling the
+      # storage profile (deployments/docker/.env.example). MinIO refuses to
+      # start on empty root credentials, so a misconfigured storage profile
+      # fails fast instead of shipping a publicly known object-store password.
       SHIFT_STORAGE_ENABLED: ${SHIFT_STORAGE_ENABLED:-false}
       SHIFT_STORAGE_ENDPOINT: http://minio:9000
       SHIFT_STORAGE_PUBLIC_ENDPOINT: ${SHIFT_STORAGE_PUBLIC_ENDPOINT:-http://minio:9000}
       SHIFT_STORAGE_REGION: ${SHIFT_STORAGE_REGION:-us-east-1}
       SHIFT_STORAGE_BUCKET: ${SHIFT_STORAGE_BUCKET:-shift-checkpoints}
-      SHIFT_STORAGE_ACCESS_KEY_ID: ${SHIFT_STORAGE_ACCESS_KEY_ID:-shift-storage}
-      SHIFT_STORAGE_SECRET_ACCESS_KEY: ${SHIFT_STORAGE_SECRET_ACCESS_KEY:-shift-storage-secret}
+      SHIFT_STORAGE_ACCESS_KEY_ID: ${SHIFT_STORAGE_ACCESS_KEY_ID:-}
+      SHIFT_STORAGE_SECRET_ACCESS_KEY: ${SHIFT_STORAGE_SECRET_ACCESS_KEY:-}
     ports:
-      - "${SHIFT_CONTROL_PORT:-8090}:8090"
+      # Loopback by default: this stack speaks plaintext HTTP and must not
+      # face a shared network (docs/installation.md "Do not expose the
+      # development HTTP listener directly to the public internet"). Publish
+      # wider only behind a TLS reverse proxy.
+      - "127.0.0.1:${SHIFT_CONTROL_PORT:-8090}:8090"
+    restart: unless-stopped
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -49,27 +69,42 @@ services:
   # Platform-hosted checkpoint storage: one MinIO instance, one bucket, one
   # prefix per organization. Agents never see the root credential — the
   # control plane brokers short-lived scoped credentials instead.
+  #
+  # Images: Docker Hub's minio/minio and minio/mc repositories no longer
+  # exist, so the profile pins the Bitnami legacy archive's MinIO builds —
+  # real MinIO server/mc binaries on Docker Hub, tags verified pullable
+  # (docker pull, 2026-10-14). The MinIO server listens on 9000 with its
+  # console on 9001; the data directory is the image's own (writable by the
+  # image's non-root user), so the volume mounts there.
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+    mem_limit: 512m
+    cpus: 1.0
     profiles: [storage]
-    command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${SHIFT_STORAGE_ACCESS_KEY_ID:-shift-storage}
-      MINIO_ROOT_PASSWORD: ${SHIFT_STORAGE_SECRET_ACCESS_KEY:-shift-storage-secret}
+      MINIO_ROOT_USER: ${SHIFT_STORAGE_ACCESS_KEY_ID:-}
+      MINIO_ROOT_PASSWORD: ${SHIFT_STORAGE_SECRET_ACCESS_KEY:-}
+      MINIO_DATA_DIR: /bitnami/minio/data
+      MINIO_API_PORT_NUMBER: "9000"
+      MINIO_CONSOLE_PORT_NUMBER: "9001"
     volumes:
-      - shift-minio:/data
+      - shift-minio:/bitnami/minio/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 12
     read_only: true
+    tmpfs:
+      - /tmp
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
 
   minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: bitnamilegacy/minio-client:2025.7.21-debian-12-r3
+    mem_limit: 128m
+    cpus: 0.5
     profiles: [storage]
     depends_on:
       minio:
@@ -81,12 +116,31 @@ services:
         mc alias set shift http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" &&
         mc mb --ignore-existing "shift/$${SHIFT_STORAGE_BUCKET}"
     environment:
-      MINIO_ROOT_USER: ${SHIFT_STORAGE_ACCESS_KEY_ID:-shift-storage}
-      MINIO_ROOT_PASSWORD: ${SHIFT_STORAGE_SECRET_ACCESS_KEY:-shift-storage-secret}
+      # mc keeps its alias config under $HOME; the image runs unprivileged
+      # with an unwritable $HOME, so point it at tmp.
+      HOME: /tmp
+      MINIO_ROOT_USER: ${SHIFT_STORAGE_ACCESS_KEY_ID:-}
+      MINIO_ROOT_PASSWORD: ${SHIFT_STORAGE_SECRET_ACCESS_KEY:-}
       SHIFT_STORAGE_BUCKET: ${SHIFT_STORAGE_BUCKET:-shift-checkpoints}
     security_opt:
       - no-new-privileges:true
 
+  # Evaluation agent: local Unix socket only. A remote peer listener over TCP
+  # requires mutual TLS (certificate, key, and client CA) — the agent refuses
+  # to start a plain remote listener, and publishing one without mTLS would
+  # expose the migration API (checkpoint payloads) to the network. To accept
+  # migrations from other machines, mount TLS material and a config:
+  #
+  #   volumes:
+  #     - ./agent-tls:/etc/shift/tls:ro
+  #     - ./agent.json:/etc/shift/agent.json:ro   # 0600; sets remote_listen
+  #                                              # + the tls block (see
+  #                                              # deployments/systemd/agent.json.example)
+  #   command: ["--config", "/etc/shift/agent.json"]
+  #   ports: ["${SHIFT_AGENT_PORT:-8443}:8443"]
+  #
+  # Reach the socket-only agent with the CLI inside the container:
+  #   docker compose --profile agent exec agent shiftgate doctor
   agent:
     build:
       context: ../..
@@ -97,19 +151,17 @@ services:
       - /var/lib/shift
       - --listen
       - unix:///run/shift/agent.sock
-      - --remote-listen
-      - tcp://0.0.0.0:8443
     volumes:
       - shift-agent-state:/var/lib/shift
       - shift-agent-run:/run/shift
-    ports:
-      - "${SHIFT_AGENT_PORT:-8443}:8443"
     security_opt:
       - no-new-privileges:true
     cap_add:
       - SYS_ADMIN
       - SYS_PTRACE
       - NET_ADMIN
+    mem_limit: 2g
+    cpus: 2.0
     restart: unless-stopped
 
 volumes:

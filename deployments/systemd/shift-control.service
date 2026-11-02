@@ -3,9 +3,20 @@ Description=SHIFT fleet control plane
 Documentation=https://github.com/Fed-Labs/shiftgate
 After=network-online.target postgresql.service
 Wants=network-online.target
+# A unit that fails on every start must reach the failed state instead of
+# restarting forever: with RestartSec=5s the default start-limit window
+# (10s / burst 5) is never reached, so tune the window to match.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
+# Provision before enabling (docs/deployment.md):
+#   useradd --system --home-dir /var/lib/shift --shell /usr/sbin/nologin shift
+#   install -m 0600 -o root -g root control.env  /etc/shift/control.env
+#   install -m 0600 -o shift -g shift control.json /etc/shift/control.json
+# Both files must not be readable by group or other (the loader refuses any
+# other mode); control.json carries no secrets you did not put there.
 EnvironmentFile=/etc/shift/control.env
 ExecStart=/usr/local/bin/shift-control --config /etc/shift/control.json
 Restart=on-failure

@@ -1,0 +1,7 @@
+[
+  {
+    "id": "fd1e0c746347ebdfa2c975207740ceb67e1177fbe72e7ba344b5bb03c7d935cf",
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAJHLTf1hBNtbPvVb2/WNNF/6Sf+WMn+lF2PEaAL2VIe8=\n-----END PUBLIC KEY-----\n",
+    "comment": "PLACEHOLDER — not a trust anchor. This entry exists so the file shape is reviewable before the key ceremony; no private key for it has ever existed. Replace it with the ceremony's public key (docs/release.md, 'Key ceremony') as a deliberate commit. Entries whose comment contains PLACEHOLDER are refused by `shift-release verify`."
+  }
+]

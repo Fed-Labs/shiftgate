@@ -1,4 +1,4 @@
-FROM golang:1.24-bookworm AS build
+FROM golang:1.25-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -7,11 +7,14 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/shift-agent ./cmd/
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates criu tar iproute2 procps \
+    && apt-get install -y --no-install-recommends ca-certificates criu curl tar iproute2 procps \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home-dir /var/lib/shift --create-home --shell /usr/sbin/nologin shift
 COPY --from=build /out/shift-agent /usr/local/bin/shift-agent
 RUN mkdir -p /var/lib/shift /run/shift && chown -R shift:shift /var/lib/shift /run/shift
 VOLUME ["/var/lib/shift"]
 EXPOSE 8443
+# The agent's only plaintext HTTP surface is its local Unix socket; health is
+# read through it the same way the CLI reaches the agent.
+HEALTHCHECK --interval=20s --timeout=5s --retries=3 CMD curl -fsS --unix-socket /run/shift/agent.sock http://localhost/v1/health || exit 1
 ENTRYPOINT ["/usr/local/bin/shift-agent"]

@@ -1,0 +1,36 @@
+[Unit]
+Description=SHIFT migration relay
+Documentation=https://github.com/Fed-Labs/shiftgate
+After=network-online.target
+Wants=network-online.target
+# A unit that fails on every start must reach the failed state instead of
+# restarting forever: with RestartSec=5s the default start-limit window
+# (10s / burst 5) is never reached, so tune the window to match.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Provision before enabling (docs/relay.md, docs/deployment.md):
+#   useradd --system --home-dir /var/lib/shift --shell /usr/sbin/nologin shift
+#   install -m 0600 -o root -g root relay.env /etc/shift/relay.env
+# The relay refuses to start without its full authorization surface: a
+# durable leg store (SHIFT_DATABASE_URL), the machine client CA
+# (SHIFT_RELAY_CLIENT_CA), and a ticket audience (SHIFT_RELAY_AUDIENCE) —
+# see deployments/systemd/relay.env.example and docs/relay.md.
+EnvironmentFile=/etc/shift/relay.env
+ExecStart=/usr/local/bin/shift-relay --listen ${SHIFT_RELAY_LISTEN} --cert ${SHIFT_RELAY_CERT} --key ${SHIFT_RELAY_KEY} --client-ca ${SHIFT_RELAY_CLIENT_CA}
+Restart=on-failure
+RestartSec=5s
+User=shift
+Group=shift
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

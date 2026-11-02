@@ -1,0 +1,265 @@
+# compose.solo.yml — the $0 solo deployment (plan 4 BR-14).
+#
+# One box: postgres + control (+ minio for hosted storage on the `storage`
+# profile) + caddy for TLS + prometheus + gotify for alerts + a pgbackup
+# sidecar that dumps postgres nightly and pushes the artifact to an
+# S3-compatible free tier via rclone. `cloudflared` is optional (tunnel
+# profile) for operators without inbound port 443.
+#
+# Posture: 1 replica (honest single-host posture; two replicas arrive with
+# revenue, see docs/deployment.md §Solo), `restart: unless-stopped` everywhere
+# that should survive a reboot, volumes named and documented below. Image tags
+# match the verified pulls in compose.yml; re-pin to digests at release time
+# (docs/release.md, GHCR mirror step) so registry churn cannot break us.
+#
+# Volumes:
+#   shift-postgres      postgres data directory
+#   shift-minio         hosted checkpoint object data
+#   shift-caddy-data    TLS certificates (Let's Encrypt account state)
+#   shift-caddy-config  Caddy runtime config
+#   shift-prometheus    TSDB
+#   shift-backups       pg_dump artifacts before upload
+#
+# Usage:
+#   export POSTGRES_PASSWORD=... SHIFT_TOKEN_PEPPER=... SHIFT_PASSWORD_PEPPER=...
+#   export SHIFT_DOMAIN=shift.example.com GOTIFY_ADMIN_PASSWORD=...
+#   docker compose -f deployments/docker/compose.solo.yml up -d
+#   docker compose -f deployments/docker/compose.solo.yml --profile storage up -d   # + minio
+#   docker compose -f deployments/docker/compose.solo.yml --profile tunnel up -d    # + cloudflared
+#
+# Always required (the services refuse to start without them):
+#   POSTGRES_PASSWORD, SHIFT_TOKEN_PEPPER, SHIFT_PASSWORD_PEPPER,
+#   SHIFT_DOMAIN (the public hostname caddy serves), GOTIFY_ADMIN_PASSWORD.
+# Storage profile additionally requires:
+#   SHIFT_STORAGE_ACCESS_KEY_ID, SHIFT_STORAGE_SECRET_ACCESS_KEY (minio root
+#   credentials — never leave well-known defaults; the object store holds
+#   checkpoint data).
+# Tunnel profile additionally requires:
+#   CLOUDFLARE_TUNNEL_TOKEN. Compose interpolates profile-gated services too,
+#   so the token is optional here and cloudflared itself refuses to start
+#   without it.
+
+services:
+  # Production requires TLS material provisioned at ./postgres-tls. The
+  # certificate must contain DNS SAN `postgres`; keep server.key mode 0600.
+  postgres:
+    image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/run/postgres-tls/server.crt
+      - -c
+      - ssl_key_file=/run/postgres-tls/server.key
+      - -c
+      - ssl_ca_file=/run/postgres-tls/ca.crt
+    mem_limit: 512m
+    cpus: 1.0
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-shift}
+      POSTGRES_USER: ${POSTGRES_USER:-shift}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - shift-postgres:/var/lib/postgresql/data
+      - ./postgres-tls:/run/postgres-tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  control:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.control
+    mem_limit: 512m
+    cpus: 1.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./postgres-tls:/run/postgres-tls:ro
+    environment:
+      # Production DB transport is always certificate- and hostname-verified.
+      # Mount the CA bundle at ./postgres-tls/ca.crt; development uses
+      # compose.yml instead, whose explicit disable is intentionally local-only.
+      SHIFT_DATABASE_URL: postgres://${POSTGRES_USER:-shift}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-shift}?sslmode=verify-full&sslrootcert=/run/postgres-tls/ca.crt
+
+      SHIFT_TOKEN_PEPPER: ${SHIFT_TOKEN_PEPPER:?set SHIFT_TOKEN_PEPPER}
+      SHIFT_PASSWORD_PEPPER: ${SHIFT_PASSWORD_PEPPER:?set SHIFT_PASSWORD_PEPPER}
+      SHIFT_CONTROL_LISTEN: 0.0.0.0:8090
+      SHIFT_ALLOWED_ORIGINS: ${SHIFT_ALLOWED_ORIGINS:-}
+      SHIFT_STORAGE_ENABLED: ${SHIFT_STORAGE_ENABLED:-false}
+      SHIFT_STORAGE_ENDPOINT: http://minio:9000
+      SHIFT_STORAGE_PUBLIC_ENDPOINT: ${SHIFT_STORAGE_PUBLIC_ENDPOINT:-http://minio:9000}
+      SHIFT_STORAGE_REGION: ${SHIFT_STORAGE_REGION:-us-east-1}
+      SHIFT_STORAGE_BUCKET: ${SHIFT_STORAGE_BUCKET:-shift-checkpoints}
+      # No fallback: minio refuses to start with empty root credentials, so
+      # enabling the storage profile without real ones fails fast instead of
+      # shipping a publicly known object-store password.
+      SHIFT_STORAGE_ACCESS_KEY_ID: ${SHIFT_STORAGE_ACCESS_KEY_ID:-}
+      SHIFT_STORAGE_SECRET_ACCESS_KEY: ${SHIFT_STORAGE_SECRET_ACCESS_KEY:-}
+      SHIFT_CHECKOUT_COUPONS: ${SHIFT_CHECKOUT_COUPONS:-}
+      SHIFT_METRICS_TOKEN: ${SHIFT_METRICS_TOKEN:-}
+    ports:
+      - "127.0.0.1:${SHIFT_CONTROL_PORT:-8090}:8090"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  minio:
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+    mem_limit: 512m
+    cpus: 1.0
+    profiles: [storage]
+    environment:
+      MINIO_ROOT_USER: ${SHIFT_STORAGE_ACCESS_KEY_ID:-}
+      MINIO_ROOT_PASSWORD: ${SHIFT_STORAGE_SECRET_ACCESS_KEY:-}
+      MINIO_DATA_DIR: /bitnami/minio/data
+      MINIO_API_PORT_NUMBER: "9000"
+      MINIO_CONSOLE_PORT_NUMBER: "9001"
+    volumes:
+      - shift-minio:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  minio-init:
+    image: bitnamilegacy/minio-client:2025.7.21-debian-12-r3
+    mem_limit: 128m
+    cpus: 0.5
+    profiles: [storage]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set shift http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" &&
+        mc mb --ignore-existing "shift/$${SHIFT_STORAGE_BUCKET}"
+    environment:
+      HOME: /tmp
+      MINIO_ROOT_USER: ${SHIFT_STORAGE_ACCESS_KEY_ID:-}
+      MINIO_ROOT_PASSWORD: ${SHIFT_STORAGE_SECRET_ACCESS_KEY:-}
+      SHIFT_STORAGE_BUCKET: ${SHIFT_STORAGE_BUCKET:-shift-checkpoints}
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2-alpine
+    mem_limit: 128m
+    cpus: 0.5
+    depends_on:
+      - control
+    environment:
+      SHIFT_DOMAIN: ${SHIFT_DOMAIN:?set SHIFT_DOMAIN (the public hostname)}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - shift-caddy-data:/data
+      - shift-caddy-config:/config
+      - ./Caddyfile.solo:/etc/caddy/Caddyfile:ro
+      - ./postgres-tls:/run/postgres-tls:ro
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    mem_limit: 512m
+    cpus: 1.0
+    volumes:
+      - shift-prometheus:/prometheus
+      - ../monitoring/prometheus-scrape.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/alerts.yaml:/etc/prometheus/alerts.yaml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+
+  gotify:
+    image: gotify/server:2-alpine
+    mem_limit: 128m
+    cpus: 0.5
+    environment:
+      GOTIFY_DEFAULTUSER_NAME: ${GOTIFY_ADMIN_USER:-admin}
+      GOTIFY_DEFAULTUSER_PASS: ${GOTIFY_ADMIN_PASSWORD:?set GOTIFY_ADMIN_PASSWORD}
+    volumes:
+      - shift-gotify:/app/data
+    ports:
+      - "127.0.0.1:8088:80"
+    restart: unless-stopped
+
+  # Nightly pg_dump into the backups volume, then rclone upload to the
+  # operator's S3/B2-compatible free tier. The rclone remote is configured
+  # via RCLONE_* env (see docs/deployment.md §Solo restore drill): no
+  # credential is committed here. A failed upload leaves the dump in the
+  # volume and the container exits non-zero so Prometheus/gotify notice.
+  pgbackup:
+    # Build from postgres and copy rclone from its pinned upstream image;
+    # the sidecar therefore contains both pg_dump and the upload client.
+    build:
+      context: .
+      dockerfile: Dockerfile.pgbackup
+    mem_limit: 256m
+    cpus: 0.5
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGSSLMODE: verify-full
+      PGSSLROOTCERT: /run/postgres-tls/ca.crt
+      POSTGRES_USER: ${POSTGRES_USER:-shift}
+      POSTGRES_DB: ${POSTGRES_DB:-shift}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_REMOTE_REQUIRED: ${BACKUP_REMOTE_REQUIRED:-true}
+      RCLONE_REMOTE: ${RCLONE_REMOTE:-}
+      RCLONE_CONFIG: /run/rclone/rclone.conf
+    volumes:
+      - shift-backups:/backups
+      - ./pgbackup-solo.sh:/usr/local/bin/pgbackup-solo.sh:ro
+      - ./postgres-tls:/run/postgres-tls:ro
+      - ${RCLONE_CONFIG_FILE:-./rclone.conf}:/run/rclone/rclone.conf:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/pgbackup-solo.sh"]
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:2025.6.1
+    mem_limit: 128m
+    cpus: 0.5
+    profiles: [tunnel]
+    command: tunnel run
+    environment:
+      # Optional at interpolation time (compose reads the whole file even
+      # without --profile tunnel); cloudflared exits with a clear error when
+      # the tunnel profile is used without the token.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+
+volumes:
+  shift-postgres:
+  shift-minio:
+  shift-caddy-data:
+  shift-caddy-config:
+  shift-prometheus:
+  shift-gotify:
+  shift-backups:

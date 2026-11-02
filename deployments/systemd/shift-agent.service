@@ -3,6 +3,11 @@ Description=SHIFT privileged workload mobility agent
 Documentation=https://github.com/Fed-Labs/shiftgate
 After=local-fs.target network-online.target
 Wants=network-online.target
+# A unit that fails on every start must reach the failed state instead of
+# restarting forever: with RestartSec=5s the default start-limit window
+# (10s / burst 5) is never reached, so tune the window to match.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple

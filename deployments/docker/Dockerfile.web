@@ -1,0 +1,36 @@
+# Licensed under the Elastic License 2.0 (source-available). See LICENSE-ELv2 at the repository root.
+# This image builds the ELv2 web dashboard; do not offer it as a managed service.
+FROM node:22-bookworm-slim AS build
+WORKDIR /src
+COPY apps/web/package.json apps/web/package-lock.json ./apps/web/
+RUN npm ci --prefix apps/web
+COPY api ./api
+COPY apps/web ./apps/web
+# NEXT_PUBLIC_API_URL is inlined into the client bundle at build time and
+# apps/web/next.config.ts fails the build without it; the deployment
+# environment passes both as build arguments (the build environment injects
+# as build args). The site URL keeps metadataBase, robots, and the sitemap
+# pointed at the canonical origin.
+ARG NEXT_PUBLIC_API_URL
+ARG NEXT_PUBLIC_SITE_URL
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
+    NEXT_PUBLIC_SITE_URL=$NEXT_PUBLIC_SITE_URL \
+    NEXT_TELEMETRY_DISABLED=1
+WORKDIR /src/apps/web
+RUN npm run build
+
+FROM node:22-bookworm-slim
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    HOSTNAME=0.0.0.0
+WORKDIR /app
+# The standalone output is flat here (the web app is its own workspace root):
+# server.js plus the traced node_modules and .next, with public/ and the
+# hashed static assets copied in beside it as the Next output requires.
+COPY --from=build --chown=node:node /src/apps/web/.next/standalone ./
+COPY --from=build --chown=node:node /src/apps/web/.next/static ./.next/static
+COPY --from=build --chown=node:node /src/apps/web/public ./public
+USER node
+EXPOSE 3000
+# server.js honors the platform's PORT and HOSTNAME.
+CMD ["node", "server.js"]

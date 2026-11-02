@@ -1,0 +1,163 @@
+# SHIFT control-plane alerting rules.
+# Load into Prometheus with rule_files, or import into your alert manager of
+# choice. Every alert maps to an operator action documented in README.md next
+# to this file. Thresholds assume the default 2-replica Helm deployment and a
+# 1-minute scrape interval; tune them to your traffic.
+groups:
+  - name: shift-control-plane
+    rules:
+      - alert: ShiftControlPlaneDown
+        expr: up{job="shift-control"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "A SHIFT control-plane replica is not scrapeable"
+          description: "Check pod status and the /health endpoint; kubelet liveness uses /health and must never be rate limited."
+
+      - alert: ShiftControlPlaneNotReady
+        # Series produced by the blackbox probe job in prometheus-scrape.yml
+        # (module shift_control_ready, blackbox.yml): the probe fails on a
+        # failed schema migration or an unreachable database, and passes a
+        # deploy-time pending migration. Without the probe job this alert is
+        # correctly silent — see README.md, "Required exporters".
+        expr: probe_success{job="shift-control",healthcheck="ready"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "A SHIFT control-plane replica reports not ready"
+          description: "Distinguish DATABASE_UNAVAILABLE from SCHEMA_MIGRATION_* in the /ready body. A pending schema migration is expected during deploys; a failed one needs the migration runbook."
+
+      - alert: ShiftSchemaMigrationFailed
+        expr: shift_schema_migration_failed{job="shift-control"} == 1
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Schema migration failed on a control-plane replica"
+          description: "The replica serves with the old schema; see the log line 'schema migration failed' and the migrations runbook before retrying."
+
+      - alert: ShiftHighServerErrRate
+        expr: sum(rate(shift_http_responses_total{job="shift-control",status=~"5.."}[5m])) / sum(rate(shift_http_requests_total{job="shift-control"}[5m])) > 0.02
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "More than 2% of control-plane requests are 5xx"
+          description: "Correlate with shift_db_pool_* gauges and database saturation. Error bodies carry only request ids; find causes in the structured logs."
+
+      - alert: ShiftRequestLatencyHigh
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(shift_http_request_duration_seconds_bucket{job="shift-control"}[5m]))) > 2
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p99 control-plane request latency above 2s"
+          description: "Check pool acquire waits (shift_db_pool_acquire_seconds_total) and unpaginated client queries (raise client limits, not the server cap)."
+
+      - alert: ShiftDatabasePoolSaturated
+        expr: shift_db_pool_total_conns{job="shift-control"} >= shift_db_pool_max_conns{job="shift-control"}
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "The control plane is holding every database connection"
+          description: "Raise SHIFT_DB_MAX_CONNS cautiously or find the slow queries; the pool is the primary 5xx amplifier."
+
+      - alert: ShiftMigrationQueueBacklog
+        expr: shift_migration_queue_depth{job="shift-control"} > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Managed migration jobs are queuing"
+          description: "Queue depth is nonzero for 15 minutes: workers cannot keep up. Raise migration_worker_concurrency or check agent reachability (local socket or remote dispatch)."
+
+      - alert: ShiftMigrationQueueStalled
+        expr: shift_migration_oldest_queued_seconds{job="shift-control"} > 900
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "A managed migration has waited over 15 minutes"
+          description: "The oldest queued job is stale: no worker is claiming. Verify worker logs and lease rows in migration_jobs."
+
+
+  - name: shift-agents
+    rules:
+      - alert: ShiftMachinePresenceStale
+        expr: max by (instance) (shift_machine_presence_lag_seconds) > 120
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "An agent has not reported presence for over two minutes"
+          description: "The fleet view marks such machines offline after two minutes; this alert catches a host dying between heartbeats."
+
+      - alert: ShiftChunkStoreDiskLow
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint=~"/var/lib/shift|/srv/shift"} / node_filesystem_size_bytes{mountpoint=~"/var/lib/shift|/srv/shift"}) < 0.15
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Agent chunk-store volume under 15% free"
+          description: "Run an online GC sweep (guard-serialized) or the offline maintenance runbook in README.md. Disk exhaustion stops checkpoints and restores on that host."
+
+      - alert: ShiftTransferThroughputLow
+        expr: |
+          histogram_quantile(0.5, sum by (le, direction) (rate(shift_transfer_throughput_bytes_per_second_bucket[10m]))) < 4194304
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Median chunk-transfer throughput below 4 MiB/s"
+          description: "Sustained low throughput usually means a degraded relay or WAN link; correlate with migration duration and downtime series."
+
+      - alert: ShiftEntitlementDriftRows
+        expr: shift_entitlement_drift_rows > 0
+        for: 6h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Stripe↔entitlement drift detected (KPI-10 must be 0)"
+          description: "A subscribed org's plan/status no longer matches Stripe truth. The daily reconciliation job (plan 4 BR-12) should converge these automatically; investigate billing.reconciled audit events if the count persists."
+
+      - alert: ShiftWebhookBacklog
+        expr: shift_webhook_backlog_events > 0
+        for: 24h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Stripe webhook backlog older than 24h (KPI-12 must be 0)"
+          description: "Entitlement sync is lagging: stripe_events rows remain unprocessed. The reconciliation worker re-drives them; a persistent backlog means the worker cannot reach Stripe or the apply path is failing."
+
+  - name: shift-backup-dr
+    rules:
+      - alert: ShiftBackupFailed
+        # Series written by scripts/backup-verify.sh into the node_exporter
+        # textfile collector directory (SHIFT_BACKUP_TEXTFILE_DIR). Without
+        # that collector this alert is correctly silent — see README.md,
+        # "Required exporters".
+        expr: shift_backup_last_run_success == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "The backup drill (scripts/backup-verify.sh) last run failed"
+          description: "The run did not complete its extraction + shift-verify + database checks. Rerun scripts/backup-verify.sh by hand; its output names the leg that broke. Until it passes, the newest backup is unverified — do not treat it as a recovery artifact."
+
+      - alert: ShiftBackupStale
+        # Daily drill expected (docs/backup-drill.md); 48h gives one missed
+        # window before paging. absent() covers a host that never wired the
+        # drill at all — the launch checklist requires a restore-tested
+        # backup, so "no data" is a real failure state, not a false alarm.
+        expr: (time() - shift_backup_last_success_timestamp_seconds > 172800) or absent(shift_backup_last_success_timestamp_seconds)
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: "No successful backup drill in the last 48 hours"
+          description: "scripts/backup-verify.sh must run at least daily alongside the backup job. Absent series: the drill never reported — wire the textfile collector (README.md, 'Required exporters'). Stale series: the drill stopped running (cron/job failure) or this Prometheus watches a host that no longer produces backups. A silently failing pg_dump or stale backup directory raises exactly this alert."

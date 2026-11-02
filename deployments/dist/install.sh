@@ -3,12 +3,13 @@
 #
 #   curl -fsSL <release-url>/install.sh | bash
 #
-# Downloads the release tarball, verifies its SHA-256, installs the three
-# binaries, installs CRIU when the distro offers it, writes a local-only
-# agent configuration, and enables the systemd service. A local-only agent
-# (no remote_listen) needs no TLS material; peers are added later by
-# editing /etc/shift/agent.json — docs/installation.md describes the TLS
-# files a remote listener requires.
+# Downloads the release tarball, verifies its SHA-256, installs the release
+# binaries (CLI, agent, control plane, plus the GC/verify/relay tools when
+# the tarball carries them), installs CRIU when the distro offers it, writes
+# a local-only agent configuration, and enables the systemd service. A
+# local-only agent (no remote_listen) needs no TLS material; peers are added
+# later by editing /etc/shift/agent.json — docs/installation.md describes the
+# TLS files a remote listener requires.
 #
 # Options (flags or environment):
 #   --url URL        release base URL (default: SHIFT_RELEASE_URL or the
@@ -105,8 +106,68 @@ fi
 BINDIR="$PREFIX/bin"
 log "Installing binaries to $BINDIR"
 as_root mkdir -p "$BINDIR"
+
+# From here on the script replaces system state. Any exit that is not a
+# committed install — a failed step under set -e as much as a deliberate
+# die — must leave the machine as it found it: restore what was replaced
+# (.pre-shift), remove what this run added (installed.txt). The same
+# aside/rollback contract as the checkout installer (install.sh), so both
+# entry points end in the same state or none at all.
+: >"$WORKDIR/installed.txt"
+rollback_binaries() {
+    if [ -f "$WORKDIR/installed.txt" ]; then
+        while read -r name; do
+            if [ -e "$BINDIR/$name.pre-shift" ]; then
+                as_root mv "$BINDIR/$name.pre-shift" "$BINDIR/$name"
+            else
+                as_root rm -f "$BINDIR/$name"
+            fi
+        done <"$WORKDIR/installed.txt"
+    fi
+    rm -f "$WORKDIR/installed.txt"
+}
+
+committed=0
+unit_installed=0
+restore_prior_state() {
+    if [ "$committed" = "1" ]; then
+        return 0
+    fi
+    if [ "$unit_installed" = "1" ]; then
+        if [ -e /etc/systemd/system/shift-agent.service.pre-shift ]; then
+            as_root mv /etc/systemd/system/shift-agent.service.pre-shift /etc/systemd/system/shift-agent.service
+        else
+            as_root rm -f /etc/systemd/system/shift-agent.service
+        fi
+    fi
+    rollback_binaries
+    if [ "$committed" != "1" ]; then
+        printf '==> aborted before committing; previous installation restored\n' >&2
+    fi
+    rm -rf "$WORKDIR"
+}
+trap restore_prior_state EXIT
+
 for name in shiftgate shift-agent shift-control; do
+    [ -f "$WORKDIR/extract/$name" ] || die "release tarball is missing the $name binary"
+    if [ -e "$BINDIR/$name" ]; then
+        as_root mv "$BINDIR/$name" "$BINDIR/$name.pre-shift"
+    fi
     as_root install -m 0755 "$WORKDIR/extract/$name" "$BINDIR/$name"
+    printf '%s\n' "$name" >>"$WORKDIR/installed.txt"
+done
+# The maintenance tools ship alongside the core three; older tarballs
+# predate them, so install each only when present. shift-gc reclaims chunk
+# store disk, shift-verify runs the backup-restore drill, shift-relay serves
+# relay-mediated migrations (see docs/relay.md).
+for name in shift-gc shift-verify shift-relay; do
+    if [ -f "$WORKDIR/extract/$name" ]; then
+        if [ -e "$BINDIR/$name" ]; then
+            as_root mv "$BINDIR/$name" "$BINDIR/$name.pre-shift"
+        fi
+        as_root install -m 0755 "$WORKDIR/extract/$name" "$BINDIR/$name"
+        printf '%s\n' "$name" >>"$WORKDIR/installed.txt"
+    fi
 done
 
 # The CLI was named `shift` up to v0.1.0 — a name every POSIX shell shadows
@@ -114,7 +175,7 @@ done
 # copy when it is ours, so `which shift` stops hiding the problem.
 if [ -x "$BINDIR/shift" ] && [ ! -e "$BINDIR/shift.pre-shiftgate" ]; then
     if "$BINDIR/shift" version 2>/dev/null | head -1 | grep -q '^SHIFT'; then
-        log "Removing the old 'shift' CLI (v0.1.0 shadowed by the shell builtin); it is 'shiftgate' now"
+        log "Renaming the old 'shift' CLI aside to 'shift.pre-shiftgate' (v0.1.0 shadowed by the shell builtin); it is 'shiftgate' now"
         as_root mv "$BINDIR/shift" "$BINDIR/shift.pre-shiftgate"
     fi
 fi
@@ -160,7 +221,7 @@ fi
 
 if [ "$WANT_SERVICE" = "1" ]; then
     log "Installing the agent as a systemd service"
-    [ -d /run/systemd/system ] || die "--systemd requires a running systemd system"
+    [ -d /run/systemd/system ] || die "the systemd service requires a running systemd system"
     as_root mkdir -p /etc/shift /var/lib/shift /run/shift
     as_root chmod 0750 /var/lib/shift
 
@@ -173,6 +234,18 @@ if [ "$WANT_SERVICE" = "1" ]; then
     else
         log "WARNING: could not create group 'shift'; only root can reach the agent socket"
         log "         create it manually (groupadd --system shift) and restart shift-agent"
+    fi
+    # The shift-control / shift-relay units run as user 'shift'
+    # (deployments/systemd/*.service). Create it here so the documented unit
+    # install path never starts with a nonexistent user.
+    if getent passwd shift >/dev/null 2>&1; then
+        log "User 'shift' already exists"
+    elif as_root useradd --system --home-dir /var/lib/shift --shell /usr/sbin/nologin shift >/dev/null 2>&1 \
+        || as_root adduser --system --group --home /var/lib/shift --no-create-home --shell /usr/sbin/nologin shift >/dev/null 2>&1; then
+        log "Created system user 'shift' (for shift-control / shift-relay services)"
+    else
+        log "WARNING: could not create user 'shift'; create it before enabling shift-control/shift-relay:"
+        log "         useradd --system --home-dir /var/lib/shift --shell /usr/sbin/nologin shift"
     fi
     install_user="${SUDO_USER:-$(id -un 2>/dev/null || true)}"
     if [ -n "$install_user" ] && [ "$install_user" != "root" ]; then
@@ -195,7 +268,26 @@ if [ "$WANT_SERVICE" = "1" ]; then
   "log_level": "info"
 }
 EOF
-        as_root install -m 0640 "$WORKDIR/agent.json" /etc/shift/agent.json
+        # Mode 0600 is not optional: the agent's loader refuses any config
+        # readable by group or other (chmod 600), so anything else crash-loops.
+        as_root install -m 0600 "$WORKDIR/agent.json" /etc/shift/agent.json
+        as_root chown root:root /etc/shift/agent.json
+    fi
+    # TLS is only required when the config actually references it: a
+    # remote_listen deployment names certificate/key/CA paths, and every
+    # one of them must exist before the agent may start.
+    missing_tls=""
+    if grep -q '"remote_listen"' /etc/shift/agent.json 2>/dev/null; then
+        for tls_path in $(sed -n 's/.*"\(certificate_file\|private_key_file\|client_ca_file\|peer_ca_file\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\2/p' /etc/shift/agent.json); do
+            [ -f "$tls_path" ] || missing_tls="$missing_tls $tls_path"
+        done
+    fi
+    if [ -n "$missing_tls" ]; then
+        die "the agent config references remote-peer TLS files that are missing:$missing_tls
+       Either install certificates at those paths (see docs/installation.md,
+       'Accepting migrations from other machines') or remove remote_listen and
+       the tls block from /etc/shift/agent.json for a local-only agent — the
+       local Unix socket API needs no TLS material."
     fi
     # The unit is embedded because this installer runs with no repository
     # checkout — keep it in sync with deployments/systemd/shift-agent.service.
@@ -205,6 +297,11 @@ Description=SHIFT privileged workload mobility agent
 Documentation=https://github.com/Fed-Labs/shiftgate
 After=local-fs.target network-online.target
 Wants=network-online.target
+# A unit that fails on every start must reach the failed state instead of
+# restarting forever: with RestartSec=5s the default start-limit window
+# (10s / burst 5) is never reached, so tune the window to match.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -234,7 +331,11 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+    if [ -e /etc/systemd/system/shift-agent.service ]; then
+        as_root mv /etc/systemd/system/shift-agent.service /etc/systemd/system/shift-agent.service.pre-shift
+    fi
     as_root install -m 0644 "$WORKDIR/shift-agent.service" /etc/systemd/system/shift-agent.service
+    unit_installed=1
     as_root systemctl daemon-reload
     # enable --now starts an inactive unit but never restarts a running one —
     # an upgrade must replace the running agent, or the old binary keeps
@@ -254,6 +355,22 @@ EOF
     fi
 fi
 
+# The install committed: the aside copies are no longer needed. Clear them
+# first, then drop the rollback marker and stand the abort trap down in one
+# step, so no abort can observe a state where the markers are gone but the
+# aside copies still exist.
+for name in shiftgate shift-agent shift-control shift-gc shift-verify shift-relay; do
+    if [ -e "$BINDIR/$name.pre-shift" ]; then
+        as_root rm -f "$BINDIR/$name.pre-shift"
+    fi
+done
+if [ -e /etc/systemd/system/shift-agent.service.pre-shift ]; then
+    as_root rm -f /etc/systemd/system/shift-agent.service.pre-shift
+fi
+rm -f "$WORKDIR/installed.txt"
+committed=1
+log "Installation complete"
+
 if [ "${ADDED_TO_GROUP:-0}" = "1" ]; then
     relogin_note="You were added to the 'shift' group — log out and back in once"
     relogin_note="$relogin_note (or run 'newgrp shift') so 'shiftgate' can reach the agent."
@@ -268,10 +385,11 @@ printf '%s\n' \
     "" \
     "Next steps:" \
     "  shiftgate doctor                                # verify the machine can checkpoint" \
+    "  mkdir -p ~/demo" \
     "  shiftgate workload create demo --path ~/demo -- python3 -m http.server 8080" \
     "  shiftgate workload start demo" \
-    "  shiftgate checkpoint create demo                # freeze to an encrypted snapshot" \
-    "  shiftgate checkpoint list                       # find the snapshot id" \
+    "  shiftgate checkpoint create demo                # take an encrypted checkpoint" \
+    "  shiftgate checkpoint list                       # find the checkpoint id" \
     "  shiftgate restore CHECKPOINT_ID                 # bring it back" \
     ""
 

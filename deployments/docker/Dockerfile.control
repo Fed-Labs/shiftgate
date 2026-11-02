@@ -1,11 +1,20 @@
-FROM golang:1.24-bookworm AS build
+# Licensed under the Elastic License 2.0 (source-available). See LICENSE-ELv2 at the repository root.
+# This image builds the ELv2 shift-control binary; do not offer it as a managed service.
+FROM golang:1.25-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/shift-control ./cmd/shift-control
 
+FROM busybox:1.37 AS healthcheck
+
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/shift-control /shift-control
+COPY --from=healthcheck /bin/wget /wget
 EXPOSE 8090
+# A wedged control plane must be restarted by the runtime, not only by
+# external probes; the health endpoint is unauthenticated on purpose and the
+# container publishes only the API port.
+HEALTHCHECK --interval=20s --timeout=5s --retries=3 CMD ["/wget", "-qO-", "http://127.0.0.1:8090/health"]
 ENTRYPOINT ["/shift-control"]

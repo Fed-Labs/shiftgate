@@ -1,0 +1,356 @@
+# Release pipeline for SHIFT.
+#
+# Tag-triggered (v*): lint, format, and test everything first (the same
+# gates the ci workflow runs — a red commit must not publish), generate the
+# SBOM and the release tarball, then generate the release document FROM
+# those build outputs (per-binary SHA-256 + metadata for every shipped
+# binary: agent, cli, control, gc, verify, relay) and sign it in the
+# protected `release` environment. The verify job is a mandatory gate: it
+# re-verifies the feed with the same code an installer runs AND re-derives
+# every signed digest from the shipped bytes (build outputs and the release
+# tarball), and asserts the binaries self-report exactly the tagged version,
+# so a release that cannot be verified — or whose bytes drifted from its
+# signed digests — never leaves the pipeline. The publish job only then
+# creates the GitHub Release installers fetch.
+#
+# Trust anchors: `deployments/release-keys.json` is the pinned key ring
+# (produced by the key ceremony documented in docs/release.md). Production
+# releases fail closed until the ceremony has provisioned a real key in the
+# protected `release` environment; CI's dev-key round trip remains in ci.yml
+# only and is never publishable.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # The release path gates on the same checks the ci workflow runs: a red
+    # commit (format, vet, lint, tests) must never publish, even though the
+    # tag push does not wait on the ci workflow's own runs.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: shift-test
+          POSTGRES_DB: shift_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SHIFT_TEST_DATABASE_URL: postgres://postgres:shift-test@localhost:5432/shift_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Format
+        run: |
+          files=$(gofmt -l $(find cmd internal tests database -name '*.go' -type f))
+          if [ -n "$files" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$files"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
+        with:
+          version: v2.13.2
+      - name: Require tag and source versions to match
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          source_version=$(awk '/const Version/ {print $4}' internal/config/config.go | tr -d '"')
+          test "$tag_version" = "$source_version" || {
+            echo "tag $tag_version does not match internal/config.Version $source_version; update the release source version before tagging" >&2
+            exit 1
+          }
+      - name: Build
+        run: make build
+      - name: Test
+        run: go test ./... -count=1
+      - name: SBOM
+        run: go run ./cmd/shift-release sbom --root . --out sbom.json
+      - name: SBOM checksum
+        run: sha256sum sbom.json > sbom.json.sha256
+      - name: Release tarball
+        run: make dist
+      - name: Upload build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shift-build
+          path: |
+            bin/
+             dist/
+             sbom.json
+             sbom.json.sha256
+
+
+  e2e:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Install CRIU
+        run: |
+          sudo add-apt-repository -y ppa:criu/ppa
+          sudo apt-get update
+          sudo apt-get install -y criu
+          criu --version
+      - name: End-to-end suite
+        run: |
+          set -o pipefail
+          GO=$(which go)
+          sudo env SHIFT_TEST_E2E=1 PATH="$PATH" HOME="$HOME" "$GO" test ./tests/integration/ -run TestE2E -v -count=1 -timeout 30m 2>&1 | tee /tmp/e2e.log
+          passes=$(grep -c '^--- PASS' /tmp/e2e.log || true)
+          test "$passes" -gt 0 || { echo "no end-to-end test actually ran" >&2; exit 1; }
+
+  stress:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Install CRIU
+        run: |
+          sudo add-apt-repository -y ppa:criu/ppa
+          sudo apt-get update
+          sudo apt-get install -y criu
+          criu --version
+      - name: Stress suite
+        run: |
+          set -o pipefail
+          GO=$(which go)
+          sudo env SHIFT_TEST_E2E=1 SHIFT_TEST_STRESS=1 SHIFT_TEST_STRESS_BYTES=268435456 PATH="$PATH" HOME="$HOME" "$GO" test ./tests/integration/ -run TestStress -v -count=1 -timeout 45m 2>&1 | tee /tmp/stress.log
+          passes=$(grep -c '^--- PASS' /tmp/stress.log || true)
+          test "$passes" -gt 0 || { echo "no stress test actually ran" >&2; exit 1; }
+
+  production-evidence:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Support matrix probe
+        run: |
+          set +e
+          go run ./cmd/shift-verify support-probe --matrix docs/support-matrix.json --json >/tmp/support-evidence.json
+          status=$?
+          test "$status" -eq 0 || test "$status" -eq 3 || test "$status" -eq 4 || exit "$status"
+      - name: Adapter tests
+        run: |
+          (cd integrations/slurm && go test ./...)
+          (cd integrations/kubernetes && go test ./...)
+
+  sign:
+    needs: [build, e2e, stress, production-evidence]
+    # The protected environment gates who can release: its required reviewers
+    # are the only humans whose approval lets the signing key be used.
+    environment: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Download build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shift-build
+      - name: Generate release document from the build outputs
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          go run ./cmd/shift-release document \
+            --version "$version" \
+            --channel stable \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" \
+            --artifact agent=bin/shift-agent \
+            --artifact cli=bin/shiftgate \
+            --artifact control=bin/shift-control \
+            --artifact gc=bin/shift-gc \
+            --artifact verify=bin/shift-verify \
+            --artifact relay=bin/shift-relay \
+            --out release-document.json
+      - name: Require production signing key and trust anchor
+        env:
+          SHIFT_RELEASE_SIGNING_KEY: ${{ secrets.SHIFT_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$SHIFT_RELEASE_SIGNING_KEY" || {
+            echo "SHIFT_RELEASE_SIGNING_KEY is required for production releases; refusing ephemeral signing" >&2
+            exit 1
+          }
+          test "$(go run ./cmd/shift-release keys-status --keys deployments/release-keys.json)" = configured || {
+            echo "deployments/release-keys.json is not configured with a real production trust anchor; run the key ceremony before tagging" >&2
+            exit 1
+          }
+          printf '%s\n' "$SHIFT_RELEASE_SIGNING_KEY" > /tmp/release-key.pem
+          go run ./cmd/shift-release sign \
+            --key /tmp/release-key.pem \
+            --release release-document.json \
+            --out signed-release.json
+          go run ./cmd/shift-release feed \
+            --channel stable \
+            --out feed.json \
+            signed-release.json
+          rm -f /tmp/release-key.pem /tmp/release-key.pub
+      - name: Upload signed release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shift-signed-release
+          path: |
+            signed-release.json
+            feed.json
+            release-document.json
+            sbom.json
+            sbom.json.sha256
+          if-no-files-found: error
+
+
+  verify:
+    needs: [sign, e2e, stress, production-evidence]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Download build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shift-build
+      - name: Download signed release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shift-signed-release
+      - name: Assert the binaries self-report the tagged version
+        # The signed document takes its version from the tag while the
+        # binaries answer with internal/config.Version; the update system
+        # hard-refuses a binary whose version disagrees with the document,
+        # so a forgotten version bump must fail here, not strand the fleet.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # shiftgate, shift-agent, and shift-control answer with the version
+          # they were built with; the update system hard-refuses a mismatch.
+          # (shift-gc / shift-verify / shift-relay expose no version surface.)
+          for binary in bin/shiftgate bin/shift-agent bin/shift-control; do
+            reported=$("$binary" --version 2>/dev/null || "$binary" version 2>/dev/null || true)
+            echo "$binary reports: $reported"
+            case "$reported" in
+              *"$version"*) ;;
+              *)
+                echo "$binary does not report version $version (got: $reported); bump internal/config.Version or fix the tag" >&2
+                exit 1
+                ;;
+            esac
+          done
+          test "$(awk '{print $2}' dist/shiftgate-linux-amd64.txt)" = "$version" \
+            || { echo "dist/shiftgate-linux-amd64.txt disagrees with the tag" >&2; exit 1; }
+      - name: Verify signatures and bind digests to the shipped bytes
+        # Mandatory gate: the feed is validated with the exact verification
+        # path installers use, against the trusted keys pinned in the repo,
+        # and every signed artifact digest — every one of the six shipped
+        # binaries — is re-derived from the build outputs and the release
+        # tarball (including the tarball's .sha256 sidecar). Once the key
+        # ceremony has configured real keys, any failure here fails closed
+        # and stops the release.
+        run: |
+          status=$(go run ./cmd/shift-release keys-status --keys deployments/release-keys.json)
+          test "$status" = "configured" || {
+            echo "release keys are not configured; refusing to publish unverified bytes" >&2
+            exit 1
+          }
+          echo "Verifying against the pinned trust anchor deployments/release-keys.json"
+          keys=deployments/release-keys.json
+          go run ./cmd/shift-release verify \
+            --feed feed.json \
+
+            --keys "$keys" \
+            --artifacts bin \
+            --tarball dist/shiftgate-linux-amd64.tar.gz
+          # Belt and braces: the shipped tarball must contain exactly the six
+          # documented binaries, each byte-identical to its build output.
+          mkdir -p /tmp/tarball-check
+          tar -xzf dist/shiftgate-linux-amd64.tar.gz -C /tmp/tarball-check
+          for name in shiftgate shift-agent shift-control shift-gc shift-verify shift-relay; do
+            [ -f "/tmp/tarball-check/$name" ] || { echo "tarball is missing $name" >&2; exit 1; }
+            cmp -s "/tmp/tarball-check/$name" "bin/$name" \
+              || { echo "tarball member $name differs from the build output" >&2; exit 1; }
+          done
+          members=$(find /tmp/tarball-check -type f | wc -l)
+          [ "$members" -eq 6 ] || { echo "tarball carries $members files, expected exactly 6" >&2; exit 1; }
+          echo "all six shipped binaries are signed and bound to the tarball"
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shift-build
+      - name: Download signed release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shift-signed-release
+      - name: Publish GitHub Release
+        # The release carries everything the one-command installer fetches
+        # (tarball + .sha256 sidecar + install.sh + the install.sh.sha256
+        # sidecar the bootstrap verifies) plus the SBOM, the signed release
+        # document, the feed, and every binary the signed artifact URLs
+        # point at.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp deployments/dist/install.sh install.sh
+          sha256sum install.sh > install.sh.sha256
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "SHIFT ${GITHUB_REF_NAME}" \
+            --notes "Signed release feed: feed.json (verification: shift-release verify). Install (verified): curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh.sha256 && sha256sum -c install.sh.sha256 && sh install.sh" \
+            dist/shiftgate-linux-amd64.tar.gz \
+            dist/shiftgate-linux-amd64.tar.gz.sha256 \
+            dist/shiftgate-linux-amd64.txt \
+            install.sh \
+            install.sh.sha256 \
+            sbom.json \
+            sbom.json.sha256 \
+            release-document.json \
+            signed-release.json \
+
+            feed.json \
+            bin/shiftgate \
+            bin/shift-agent \
+            bin/shift-control \
+            bin/shift-gc \
+            bin/shift-verify \
+            bin/shift-relay

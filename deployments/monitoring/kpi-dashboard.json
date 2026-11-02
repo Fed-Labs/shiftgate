@@ -1,0 +1,95 @@
+{
+  "title": "SHIFT KPI Dashboard",
+  "uid": "shift-kpi",
+  "tags": ["shift", "kpi"],
+  "timezone": "utc",
+  "refresh": "1h",
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "KPI-1/2  MRR (gross, self-serve)",
+      "type": "stat",
+      "datasource": { "type": "postgres", "uid": "${DS_SHIFT}" },
+      "targets": [{
+        "rawSql": "SELECT 1 AS time, COALESCE(SUM(CASE plan WHEN 'pro' THEN 29.00 WHEN 'business' THEN 99.00 * GREATEST(seats,1) ELSE 0 END), 0) AS mrr_usd FROM entitlements WHERE status = 'active'",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 2,
+      "title": "KPI-3  Hosted-storage COGS ($/mo at $0.020/GB)",
+      "type": "stat",
+      "datasource": { "type": "postgres", "uid": "${DS_SHIFT}" },
+      "targets": [{
+        "rawSql": "SELECT 1 AS time, ROUND(SUM(used_storage_bytes) / 1073741824.0 * 0.020, 2) AS usd_per_month FROM entitlements",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "KPI-4/5  Transfer 30d by channel (GB) — fair-use watch",
+      "type": "barchart",
+      "datasource": { "type": "postgres", "uid": "${DS_SHIFT}" },
+      "targets": [{
+        "rawSql": "SELECT COALESCE(metadata->>'channel','?') AS channel, ROUND(SUM(quantity)/1073741824.0, 2) AS gb_30d FROM usage_records WHERE kind = 'transfer_bytes' AND period_start >= (now()::date - 30) GROUP BY 1 ORDER BY 2 DESC",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 4,
+      "title": "KPI-6  Migration health 7d",
+      "type": "table",
+      "datasource": { "type": "postgres", "uid": "${DS_SHIFT}" },
+      "targets": [{
+        "rawSql": "SELECT mode, status, COUNT(*) AS jobs, ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY mode), 1) AS pct FROM migration_jobs WHERE created_at >= now() - interval '7 days' GROUP BY mode, status ORDER BY mode, status",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 5,
+      "title": "KPI-10  Entitlement drift (MUST be 0)",
+      "type": "stat",
+      "datasource": { "type": "postgres", "uid": "${DS_SHIFT}" },
+      "targets": [{
+        "rawSql": "SELECT 1 AS time, COUNT(*) AS drift_rows FROM entitlements WHERE stripe_subscription_id <> '' AND (status <> 'active' OR plan = 'free')",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 6,
+      "title": "KPI-12  Webhook backlog > 24h (MUST be 0)",
+      "type": "stat",
+      "datasource": { "type": "postgres", "uid": "${DS_SHIFT}" },
+      "targets": [{
+        "rawSql": "SELECT 1 AS time, COUNT(*) AS backlog FROM stripe_events WHERE processed_at IS NULL AND received_at < now() - interval '24 hours'",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 7,
+      "title": "KPI-11  Top-10 org COGS ($/mo)",
+      "type": "table",
+      "datasource": { "type": "postgres", "uid": "${DS_SHIFT}" },
+      "targets": [{
+        "rawSql": "SELECT e.organization_id, e.plan, ROUND(e.used_storage_bytes/1073741824.0, 2) AS gb, ROUND(COALESCE(t.bytes30,0)/1073741824.0, 2) AS transfer_gb_30d FROM entitlements e LEFT JOIN (SELECT organization_id, SUM(quantity) AS bytes30 FROM usage_records WHERE kind='transfer_bytes' AND period_start >= (now()::date - 30) GROUP BY 1) t USING (organization_id) ORDER BY (e.used_storage_bytes + COALESCE(t.bytes30,0)) DESC LIMIT 10",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 8,
+      "title": "KPI-13  Storage growth (daily GB)",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "${DS_SHIFT}" },
+      "targets": [{
+        "rawSql": "SELECT period_start AS time, ROUND(SUM(quantity)/1073741824.0, 2) AS gb FROM usage_records WHERE kind = 'checkpoint_storage' GROUP BY 1 ORDER BY 1",
+        "format": "time_series"
+      }]
+    }
+  ],
+  "templating": {
+    "list": [
+      { "name": "DS_SHIFT", "type": "datasource", "query": "postgres", "label": "SHIFT database" }
+    ]
+  }
+}

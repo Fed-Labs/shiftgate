@@ -1,0 +1,43 @@
+# Build-context hygiene for the deployment images. Their build context is the
+# repository root (see deployments/docker/compose.yml), so everything below
+# must keep local state, secrets, other worktrees, and unreadable directories
+# out of the context — a root-owned e2e directory otherwise fails the build
+# with "permission denied" before a single instruction runs.
+#
+# The same file is mirrored as Dockerfile.<name>.dockerignore next to each
+# Dockerfile so builds work no matter which ignore-file mechanism the builder
+# honors; keep them in sync. apps/web stays in the context because
+# Dockerfile.web builds the dashboard from the repo root (its sync-openapi
+# step reads api/openapi/shift.yaml); the desktop client is the only part of
+# apps/ the images never need.
+
+.git
+.github
+.claude
+.kilo
+
+.shift
+.e2e-hosted
+.e2e-storage
+shift
+bin
+dist
+coverage
+coverage.out
+tmp
+data
+apps/desktop
+docs
+tests
+integrations
+scripts
+node_modules
+**/node_modules
+**/.next
+*.log
+**/*.log
+.env
+.env.*
+**/.env
+**/.env.*
+**/.DS_Store

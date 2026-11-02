@@ -1,0 +1,29 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "shift.fullname" . }}-control
+  labels:
+    {{- include "shift.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "shift.name" . }}-control
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Same-namespace clients (agents, ingress controller, jobs).
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8090
+    # Monitoring scrapes only.
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.metrics.namespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 8090
+{{- end }}

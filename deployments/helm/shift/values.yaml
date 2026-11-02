@@ -1,17 +1,87 @@
 image:
+  # Built and pushed to GHCR by .github/workflows/images.yml on every v* tag
+  # (shift-control, shift-agent, shift-relay). Override the repository for
+  # a private mirror; an empty tag falls back to the chart's appVersion.
   repository: ghcr.io/fed-labs/shift-control
-  tag: "0.1.0"
+  # Production should override this with the immutable digest emitted by the
+  # image release workflow. A tag is retained only for developer ergonomics.
+  tag: ""
+  digest: ""
   pullPolicy: IfNotPresent
 service:
   type: ClusterIP
   port: 8090
 control:
   listen: 0.0.0.0:8090
-  databaseURL: ""
+  # The database URL (with its password) is never a plain value in the
+  # Deployment: it is read from a Secret, like the peppers below. Create the
+  # secret with the DSN under the configured key before installing.
+  databaseURLSecret: shift-secrets
+  databaseURLKey: database-url
   tokenPepperSecret: shift-secrets
   tokenPepperKey: token-pepper
   passwordPepperSecret: shift-secrets
   passwordPepperKey: password-pepper
-resources: {}
+  # Optional scrape token for /metrics (SHIFT_METRICS_TOKEN). When set,
+  # Prometheus must present it as a bearer token — the chart's ServiceMonitor
+  # wires bearerTokenSecret from this secret automatically; when empty,
+  # /metrics is open to whatever the NetworkPolicy admits.
+  metricsTokenSecret: ""
+  metricsTokenKey: metrics-token
+  # trustedProxies lists the TLS reverse proxy CIDRs whose X-Forwarded-For
+  # headers are honored for rate limiting and audit rows. Behind an ingress,
+  # set this to the proxy/pod CIDR or every client shares one rate bucket.
+  trustedProxies: []
+  # Bounded concurrent managed migrations per replica, and whether the worker
+  # may dispatch through a machine's remote agent URL when no co-located Unix
+  # socket is configured. The chart defaults to false (fail closed): managed
+  # jobs then dispatch only through a co-located local_agent_url, matching
+  # the contract docs/deployment.md documents. Setting true lets the control
+  # plane command machines over their public peer listener — a deliberate,
+  # security-relevant widening (shift-control defaults to false as well;
+  # keep false unless you have a reason).
+  migrationWorkerConcurrency: 4
+  allowRemoteAgentDispatch: false
+  # Browser origins the web dashboard may call the API from
+  # (SHIFT_ALLOWED_ORIGINS, comma-separated). Without an entry the browser
+  # blocks dashboard calls against this control plane.
+  allowedOrigins: []
+  # Extra environment variables for the control container, as a Kubernetes
+  # env list — the escape hatch for knobs without a dedicated value (Stripe,
+  # OIDC, storage, tracing, session TTLs, ...):
+  #   extraEnv:
+  #     - name: SHIFT_OTLP_ENDPOINT
+  #       value: https://otel.example.test
+  extraEnv: []
+metrics:
+  # Namespace label of the Prometheus scrape pool admitted by the NetworkPolicy.
+  # Only used when networkPolicy.enabled is true.
+  namespaceSelector:
+    kubernetes.io/metadata.name: monitoring
+# Resource defaults keep the control plane evictable-proof: empty resources
+# mean no eviction protection and an OOM with no recourse.
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+autoscaling:
+  # HA-safe default: two replicas even when HPA is disabled. Production can
+  # enable HPA after setting resource requests and observing queue latency.
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 75
+networkPolicy:
+  # Restricts the control-plane port to same-namespace clients and the
+  # monitoring namespace's scrapes. 0.0.0.0 binds are only safe behind this.
+  enabled: true
 serviceMonitor:
+  # Enable when Prometheus Operator is installed; otherwise use the shipped
+  # deployments/monitoring/prometheus-scrape.yml example.
   enabled: false

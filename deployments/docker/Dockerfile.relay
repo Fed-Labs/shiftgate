@@ -1,0 +1,16 @@
+# Licensed under the Elastic License 2.0 (source-available). See LICENSE-ELv2 at the repository root.
+# This image builds the ELv2 shift-relay binary; do not offer it as a managed service.
+FROM golang:1.25-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/shift-relay ./cmd/shift-relay
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/shift-relay /shift-relay
+EXPOSE 9443
+# The relay forwards ticketed, time-boxed transfer legs; it holds no state
+# and no workload keys. TLS material and the ticket signing secret come from
+# the deployment environment (see docs/relay.md).
+ENTRYPOINT ["/shift-relay"]

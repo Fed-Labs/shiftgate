@@ -1,9 +1,0 @@
-.git
-.gitignore
-bin
-coverage
-tmp
-data
-apps/desktop/node_modules
-node_modules
-*.log

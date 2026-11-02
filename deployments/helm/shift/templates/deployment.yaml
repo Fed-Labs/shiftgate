@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "shift.labels" . | nindent 4 }}
 spec:
-  replicas: 2
+  replicas: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.minReplicas }}{{ else }}2{{ end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "shift.name" . }}-control
@@ -16,18 +16,32 @@ spec:
         app.kubernetes.io/name: {{ include "shift.name" . }}-control
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
+      # Spread replicas across nodes/zones when the scheduler has topology
+      # labels; a single-node cluster remains schedulable.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "shift.name" . }}-control
+              app.kubernetes.io/instance: {{ .Release.Name }}
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       containers:
+
         - name: control
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ include "shift.image" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--listen", "{{ .Values.control.listen }}"]
           env:
             - name: SHIFT_DATABASE_URL
-              value: {{ required "control.databaseURL is required" .Values.control.databaseURL | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.control.databaseURLSecret }}
+                  key: {{ .Values.control.databaseURLKey }}
             - name: SHIFT_TOKEN_PEPPER
               valueFrom:
                 secretKeyRef:
@@ -38,9 +52,31 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.control.passwordPepperSecret }}
                   key: {{ .Values.control.passwordPepperKey }}
+            {{- if .Values.control.metricsTokenSecret }}
+            - name: SHIFT_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.control.metricsTokenSecret }}
+                  key: {{ .Values.control.metricsTokenKey }}
+            {{- end }}
+            {{- if .Values.control.trustedProxies }}
+            - name: SHIFT_TRUSTED_PROXIES
+              value: {{ join "," .Values.control.trustedProxies | quote }}
+            {{- end }}
+            {{- if .Values.control.allowedOrigins }}
+            - name: SHIFT_ALLOWED_ORIGINS
+              value: {{ join "," .Values.control.allowedOrigins | quote }}
+            {{- end }}
+            - name: SHIFT_MIGRATION_WORKER_CONCURRENCY
+              value: {{ .Values.control.migrationWorkerConcurrency | quote }}
+            - name: SHIFT_ALLOW_REMOTE_AGENT_DISPATCH
+              value: {{ .Values.control.allowRemoteAgentDispatch | quote }}
+            {{- with .Values.control.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
-              containerPort: 8090
+              containerPort: {{ include "shift.listenPort" . | int }}
           readinessProbe:
             httpGet: { path: /ready, port: http }
             periodSeconds: 10

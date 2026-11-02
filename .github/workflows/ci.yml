@@ -1,12 +1,23 @@
 # CI for SHIFT.
 #
-# Five lanes:
-#   1. check   — build, vet, gofmt, golangci-lint on every push/PR.
-#   2. test    — unit tests (PostgreSQL service for control-plane tests).
-#   3. e2e     — real CRIU end-to-end suite, root, ubuntu-24.04 only.
-#   4. stress  — the heavyweight scenarios (memory, process flood, latency,
-#                source death, disk exhaustion, OOM).
-#   5. desktop — frontend type-check/bundle and the Rust transport tests.
+# Nine jobs:
+#   1. check               — build, vet, gofmt, golangci-lint on every push/PR.
+#   2. test                — unit tests with a coverage gate (PostgreSQL
+#                            service for control-plane tests) plus the
+#                            OpenAPI-vs-registered-routes contract check.
+#   3. e2e                 — real CRIU end-to-end suite, root, ubuntu-24.04 only.
+#   4. stress              — the heavyweight scenarios (memory, process flood,
+#                            latency, source death, disk exhaustion, OOM).
+#   5. web                 — frontend lint, type-check, production build.
+#   6. production-evidence — support-matrix probe + adapter tests.
+#   7. desktop             — frontend type-check/bundle and the Rust transport
+#                            tests.
+#   8. release-tooling     — dist artifacts, release-document sign→verify
+#                            round trip with digest binding, installer syntax,
+#                            compose/helm rendering.
+#   9. pinned-images       — pulls every third-party image the compose and
+#                            chart files pin, so a deleted tag fails CI rather
+#                            than a production deploy.
 #
 # The e2e and stress lanes are the suites that gate any "production-ready"
 # claim; the spec forbids making that claim without these cases having
@@ -27,10 +38,10 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
           cache: true
       - name: Build
         run: go build ./...
@@ -38,14 +49,14 @@ jobs:
         run: go vet ./...
       - name: Format
         run: |
-          files=$(gofmt -l $(find cmd internal tests -name '*.go' -type f))
+          files=$(gofmt -l $(find cmd internal tests database -name '*.go' -type f))
           if [ -n "$files" ]; then
             echo "gofmt found unformatted files:"
             echo "$files"
             exit 1
           fi
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
         with:
           # Pinned: "latest" once meant the config's v2 schema and the
           # binary's expectations could drift apart under us.
@@ -69,15 +80,33 @@ jobs:
     env:
       SHIFT_TEST_DATABASE_URL: postgres://postgres:shift-test@localhost:5432/shift_test?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
           cache: true
       - name: Unit tests
-        run: go test ./... -count=1
+        run: go test ./... -count=1 -coverprofile=coverage.out
+      - name: Coverage gate
+        # A floor, not a target: coverage may only grow. The threshold sits
+        # under the measured total so legitimate refactors cannot trip it,
+        # but deleting tests or gating them away fails the build. It runs in
+        # the Postgres-backed lane, so database-backed tests count.
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print substr($3, 1, length($3)-1)}')
+          echo "total coverage: ${total}%"
+          floor=40
+          if [ "$(awk -v a="$total" -v b="$floor" 'BEGIN {print (a<b) ? 1 : 0}')" = "1" ]; then
+            echo "coverage ${total}% is below the ${floor}% gate"
+            exit 1
+          fi
+      - name: OpenAPI contract check
+        # Spec-vs-route drift (an undocumented endpoint, or a documented one
+        # nobody serves) fails the build. See docs/api.md: the spec is the
+        # published contract.
+        run: bash .github/scripts/check-api-contract.sh
       - name: Race tests
-        run: go test -race ./internal/... -count=1
+        run: go test -race ./cmd/... ./internal/... -count=1
 
   e2e:
     # The real-workload suite: real agents, real CRIU, real migrations. It
@@ -87,16 +116,16 @@ jobs:
     # environment explicit.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
           cache: true
       - name: Install CRIU
         run: |
           # Ubuntu 24.04 dropped the criu package from its archive, so the
           # distro source cannot provide it; the CRIU project's own PPA
-          # publishes current builds for noble (criu 4.2.x).
+          # publishes current builds for noble (criu 4.3.x, verified 2026-10).
           sudo add-apt-repository -y ppa:criu/ppa
           sudo apt-get update
           sudo apt-get install -y criu
@@ -125,10 +154,10 @@ jobs:
     # is required for the stress-coverage claims in docs/limitations.md.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
           cache: true
       - name: Install CRIU
         run: |
@@ -159,25 +188,65 @@ jobs:
   web:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
       - name: Lint
         run: |
-          npm --prefix apps/web install
+          npm --prefix apps/web ci
           npm --prefix apps/web run lint
+      - name: Content promises gate
+        # Fails on marketing/docs copy the product does not back (and on
+        # generated-type drift the sync script cannot reconcile silently).
+        run: npm --prefix apps/web run test:content
       - name: Type-check and production build
         run: npm --prefix apps/web run build
+
+  production-evidence:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Support matrix probe
+        run: |
+          set +e
+          go run ./cmd/shift-verify support-probe --matrix docs/support-matrix.json --json | tee /tmp/support-evidence.json
+          status=${PIPESTATUS[0]}
+          # Exit contract (cmd/shift-verify): 0 ok, 2 usage/malformed,
+          # 3 not-certified, 4 unsupported. The runner may lack CRIU
+          # capabilities, so 3/4 are honest verdicts and stay green — but
+          # any other status (a crash, an OOM kill, an unexpected code) must
+          # fail the lane instead of shipping whatever empty evidence landed.
+          if [ "$status" -ne 0 ] && [ "$status" -ne 3 ] && [ "$status" -ne 4 ]; then
+            echo "support probe exited with unexpected status $status" >&2
+            exit "$status"
+          fi
+      - name: Adapter tests
+        run: |
+          (cd integrations/slurm && go test ./...)
+          (cd integrations/kubernetes && go test ./...)
+      - name: Upload evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shift-production-evidence
+          path: /tmp/support-evidence.json
 
   desktop:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned action ref and pinned toolchain: @stable floats on upstream,
+      # so desktop builds would change behavior with no repo change.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # pinned
+        with:
+          toolchain: 1.99.1
       # Tauri v2 on Linux links against webkit2gtk-4.1 and its friends; the
       # stock runner image ships none of them, and cargo test compiles the
       # whole shell crate — not just the std-only transport tests.
@@ -193,9 +262,145 @@ jobs:
             librsvg2-dev
       - name: Frontend type-check and bundle
         run: |
-          npm --prefix apps/desktop install
+          npm --prefix apps/desktop ci
           npm --prefix apps/desktop run build
       - name: Transport tests
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
       - name: Rust shell builds
         run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+  release-tooling:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Release artifacts
+        run: make dist
+      - name: Release document sign/verify round trip
+        # The release pipeline's document → sign → feed → verify sequence
+        # with a generated dev key, including digest binding to the build
+        # outputs and the release tarball. The document records every
+        # shipped binary — agent, cli, control, gc, verify, relay — so
+        # verify binds a digest to all six, and the negative cases prove a
+        # tampered member (signed or tool) and a tampered tarball are all
+        # refused. The document version matches the binaries' self-reported
+        # version (internal/config.Version), the way release.yml enforces it.
+        run: |
+          set -euo pipefail
+          umask 077
+          version=$(awk '/const Version/ {print $4}' internal/config/config.go | tr -d '"')
+          go run ./cmd/shift-release keygen --private-key /tmp/rel.key --public-key /tmp/rel.pub --comment "ci round trip"
+          go run ./cmd/shift-release trusted-key --public-key /tmp/rel.pub --comment "ci round trip" > /tmp/ci-keys.json
+          go run ./cmd/shift-release document --version "$version" --channel stable \
+            --base-url https://releases.example/ci \
+            --artifact agent=bin/shift-agent \
+            --artifact cli=bin/shiftgate \
+            --artifact control=bin/shift-control \
+            --artifact gc=bin/shift-gc \
+            --artifact verify=bin/shift-verify \
+            --artifact relay=bin/shift-relay \
+            --out /tmp/release-document.json
+          go run ./cmd/shift-release sign --key /tmp/rel.key --release /tmp/release-document.json --out /tmp/signed.json
+          go run ./cmd/shift-release feed --channel stable --out /tmp/feed.json /tmp/signed.json
+          go run ./cmd/shift-release verify --feed /tmp/feed.json --keys /tmp/ci-keys.json \
+            --artifacts bin --tarball dist/shiftgate-linux-amd64.tar.gz
+          # Every shipped binary's digest must appear in the signed document;
+          # an unbound member ships unsigned and must never be silent.
+          for member in shiftgate shift-agent shift-control shift-gc shift-verify shift-relay; do
+            digest=$(sha256sum "bin/$member" | awk '{print $1}')
+            grep -q "$digest" /tmp/release-document.json \
+              || { echo "$member digest missing from the signed release document" >&2; exit 1; }
+          done
+          cp bin/shift-agent /tmp/shift-agent.orig
+          cp bin/shift-control /tmp/shift-control.orig
+          echo tampered >> bin/shift-agent
+          if go run ./cmd/shift-release verify --feed /tmp/feed.json --keys /tmp/ci-keys.json \
+            --artifacts bin --tarball dist/shiftgate-linux-amd64.tar.gz; then
+            echo "digest binding accepted tampered signed build output" >&2
+            exit 1
+          fi
+          mv /tmp/shift-agent.orig bin/shift-agent
+          echo tampered >> bin/shift-control
+          if go run ./cmd/shift-release verify --feed /tmp/feed.json --keys /tmp/ci-keys.json \
+            --artifacts bin --tarball dist/shiftgate-linux-amd64.tar.gz; then
+            echo "digest binding accepted tampered tool binary" >&2
+            exit 1
+          fi
+          mv /tmp/shift-control.orig bin/shift-control
+          printf x >> dist/shiftgate-linux-amd64.tar.gz
+          if go run ./cmd/shift-release verify --feed /tmp/feed.json --keys /tmp/ci-keys.json \
+            --artifacts bin --tarball dist/shiftgate-linux-amd64.tar.gz; then
+            echo "verify accepted a tarball that does not match its sidecar" >&2
+            exit 1
+          fi
+      - name: Installer syntax
+        run: |
+          sh -n install.sh
+          sh -n deployments/dist/install.sh
+      - name: License split check
+        run: bash scripts/check-licenses.sh
+      - name: Compose files render
+        # Both shipped stacks, every profile: interpolation happens before
+        # profile filtering, so a required-var typo in a profile nobody here
+        # enables would otherwise ship unrendered.
+        run: |
+          POSTGRES_PASSWORD=ci docker compose -f deployments/docker/compose.yml --profile storage --profile agent config -q
+          POSTGRES_PASSWORD=ci SHIFT_TOKEN_PEPPER=ci-pepper-0123456789-0123456789-01 \
+            SHIFT_PASSWORD_PEPPER=ci-pepper-0123456789-0123456789-02 \
+            SHIFT_DOMAIN=ci.example.test GOTIFY_ADMIN_PASSWORD=ci \
+            RCLONE_CONFIG_FILE=/dev/null \
+            docker compose -f deployments/docker/compose.solo.yml --profile storage --profile tunnel config -q
+      - name: Helm chart renders
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v3.16.4
+      - name: Helm template
+        run: |
+          helm template shift deployments/helm/shift > /dev/null
+          helm template shift deployments/helm/shift \
+            --set serviceMonitor.enabled=true \
+            --set control.metricsTokenSecret=shift-secrets \
+            | grep -q 'bearerTokenSecret'
+
+  pinned-images:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Pull every third-party pinned image
+        # Pullability check, not a content pin: the compose files name
+        # version tags (some of them floating, e.g. postgres:16-alpine), so
+        # this lane proves the tags still resolve — a tag that vanishes from
+        # its registry fails here, not at deploy time. Content stability
+        # requires digest pins, which docs/release.md schedules for the
+        # release-time GHCR mirror step; until then a retagged image can
+        # change what a deploy runs.
+        # Self-built ghcr.io/fed-labs images are excluded — they are
+        # published by the images workflow on the release tag.
+        run: |
+          set -euo pipefail
+          images=$(grep -hE '^[[:space:]]+image:' deployments/docker/*.yml \
+            | sed 's/.*image:[[:space:]]*//' | tr -d '"' | sort -u \
+            | grep -v '^ghcr.io/fed-labs/' || true)
+          if [ -z "$images" ]; then
+            echo "no third-party images are pinned; the smoke job has nothing to check" >&2
+            exit 1
+          fi
+          for image in $images; do
+            echo "pulling $image"
+            docker pull "$image"
+          done
+      - name: Chart default image is produced by our images workflow
+        run: |
+          repository=$(awk '/^image:/ {found=1} found && /repository:/ {print $2; exit}' deployments/helm/shift/values.yaml)
+          case "$repository" in
+            ghcr.io/fed-labs/*)
+              echo "chart image $repository is published by .github/workflows/images.yml on the release tag"
+              ;;
+            *)
+              echo "chart pins a third-party image ($repository); add it to this smoke job" >&2
+              exit 1
+              ;;
+          esac

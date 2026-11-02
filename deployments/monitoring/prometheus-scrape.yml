@@ -1,0 +1,57 @@
+# Example Prometheus scrape configuration for the SHIFT monitoring bundle.
+# Merge these jobs into your Prometheus configuration (adapt the service
+# addresses to your deployment); alerts.yaml assumes the series they produce.
+#
+# Required exporters for the shipped alerts:
+#   - the control plane's own /metrics (job="shift-control")
+#   - node_exporter         — ShiftChunkStoreDiskLow (node_filesystem_*)
+#   - node_exporter textfile collector (SHIFT_BACKUP_TEXTFILE_DIR, written by
+#     scripts/backup-verify.sh) — ShiftBackupFailed / ShiftBackupStale
+#   - blackbox-exporter with blackbox.yml from this directory —
+#     ShiftControlPlaneNotReady (probe_success{healthcheck="ready"})
+
+scrape_configs:
+  # The control plane's own metrics. When control.metricsTokenSecret is set
+  # (Helm) or metrics_token is configured, /metrics requires this bearer
+  # token; delete the authorization block for an open endpoint.
+  - job_name: shift-control
+    metrics_path: /metrics
+    # Replace this placeholder from a secret manager; never commit a real
+    # bearer token. If the endpoint is intentionally open, remove this block.
+    authorization:
+      credentials: REPLACE_WITH_SHIFT_METRICS_TOKEN
+
+
+    static_configs:
+      - targets:
+          - shift-control.internal:8090
+
+  # Readiness probe: one probe per control-plane target, labeled so
+  # probe_success{job="shift-control",healthcheck="ready"} is the series
+  # alerts.yaml evaluates. Adjust the target scheme/host:port to the
+  # readiness URL behind your TLS termination.
+  - job_name: shift-control-probe
+    metrics_path: /probe
+    params:
+      module: [shift_control_ready]
+    static_configs:
+      - targets:
+          - http://shift-control.internal:8090/ready
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: job
+        replacement: shift-control
+      - target_label: healthcheck
+        replacement: ready
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # Agent-side metrics (diagnostics). Agents expose them over the local Unix
+  # socket or the configured metrics listener; adapt per fleet.
+  - job_name: shift-agents
+    static_configs:
+      - targets:
+          - shift-agent.internal:8444

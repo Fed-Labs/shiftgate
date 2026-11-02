@@ -1,0 +1,2 @@
+FROM postgres:16-alpine
+COPY --from=rclone/rclone:1.68 /usr/local/bin/rclone /usr/local/bin/rclone

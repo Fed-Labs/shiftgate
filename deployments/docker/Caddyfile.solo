@@ -1,0 +1,18 @@
+# Caddyfile.solo — TLS front for the solo deployment (plan 4 BR-14).
+# Set SHIFT_DOMAIN in compose.solo.yml's environment; Caddy obtains and
+# renews the certificate automatically. The control plane listens on the
+# internal network only; this is its sole public edge.
+
+{
+	admin off
+}
+
+{$SHIFT_DOMAIN} {
+	reverse_proxy control:8090
+	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+}

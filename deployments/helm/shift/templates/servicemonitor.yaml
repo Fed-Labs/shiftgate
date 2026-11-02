@@ -13,4 +13,9 @@ spec:
   endpoints:
     - port: http
       path: /metrics
+      {{- if .Values.control.metricsTokenSecret }}
+      bearerTokenSecret:
+        name: {{ .Values.control.metricsTokenSecret }}
+        key: {{ .Values.control.metricsTokenKey }}
+      {{- end }}
 {{- end }}

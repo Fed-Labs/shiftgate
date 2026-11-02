@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${SHIFT_BACKUP_STATE_DIR:?set SHIFT_BACKUP_STATE_DIR}"
+: "${SHIFT_BACKUP_OUTPUT_ROOT:?set SHIFT_BACKUP_OUTPUT_ROOT}"
+: "${SHIFT_BACKUP_KEYS_ROOT:?set SHIFT_BACKUP_KEYS_ROOT}"
+: "${SHIFT_BACKUP_RESTORE_STATE_DIR:?set SHIFT_BACKUP_RESTORE_STATE_DIR}"
+: "${SHIFT_BACKUP_RESTORE_DATABASE_URL:?set SHIFT_BACKUP_RESTORE_DATABASE_URL}"
+: "${SHIFT_BACKUP_DATABASE_URL:?set SHIFT_BACKUP_DATABASE_URL}"
+
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+output="$SHIFT_BACKUP_OUTPUT_ROOT/$stamp"
+keys_output="$SHIFT_BACKUP_KEYS_ROOT/$stamp"
+mkdir -p "$output" "$keys_output"
+
+exec "${SHIFT_BACKUP_VERIFY_SCRIPT:-/usr/local/libexec/shift/backup-verify.sh}" \
+  --state-dir "$SHIFT_BACKUP_STATE_DIR" \
+  --database-url "$SHIFT_BACKUP_DATABASE_URL" \
+  --output "$output" \
+  --keys-output "$keys_output" \
+  --restore-state-dir "$SHIFT_BACKUP_RESTORE_STATE_DIR" \
+  --restore-database-url "$SHIFT_BACKUP_RESTORE_DATABASE_URL"

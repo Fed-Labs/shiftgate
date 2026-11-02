@@ -1,0 +1,20 @@
+# Blackbox exporter probe modules for SHIFT.
+#
+# Serve this file to the blackbox exporter (`--config.file=blackbox.yml`) and
+# point the probe scrape job from prometheus-scrape.yml at it. The
+# `shift_control_ready` module is the readiness probe series the
+# ShiftControlPlaneNotReady alert evaluates (probe_success{healthcheck="ready"}).
+modules:
+  shift_control_ready:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+      # /ready answers 200 when ready and 503 while a schema migration is
+      # pending — a pending migration is expected during deploys, so both
+      # statuses pass the probe and only the hard failure codes below
+      # (failed migration, unreachable database) make it fail.
+      valid_status_codes: [200, 503]
+      fail_if_body_matches_regexp:
+        - '"code":"SCHEMA_MIGRATION_FAILED"'
+        - '"code":"DATABASE_UNAVAILABLE"'

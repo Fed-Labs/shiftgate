@@ -1,0 +1,79 @@
+# Container images for SHIFT.
+#
+# Tag-triggered (v*): builds the deployment images from the same tree the
+# release binaries come from and pushes them to GHCR — `shift-control` (the
+# Helm chart's default image), `shift-agent`, and `shift-relay`. The chart's
+# `image.repository`/`image.tag` values point here; a tag that never runs
+# this workflow leaves the chart's default image unpublished, so this
+# workflow is part of the release contract, not a convenience.
+
+name: images
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  push:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - image: shift-control
+            dockerfile: deployments/docker/Dockerfile.control
+          - image: shift-agent
+            dockerfile: deployments/docker/Dockerfile.agent
+          - image: shift-relay
+            dockerfile: deployments/docker/Dockerfile.relay
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          # Hard-coded to the namespace the Helm chart defaults to
+          # (deployments/helm/shift/values.yaml); GHCR names must be
+          # lowercase.
+          images: ghcr.io/fed-labs/${{ matrix.image }}
+          # `latest` comes from the semver type's own flavor handling: it is
+          # stamped only for a well-formed, non-prerelease v* tag. The old
+          # unconditional `type=raw,value=latest` moved `latest` on every v*
+          # push (including non-semver tags like `vfoo`, which the semver
+          # types drop) and could downgrade consumers tracking `latest`.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409e3 # v2
+        with:
+          subject-name: ghcr.io/fed-labs/${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Record immutable digest
+        run: |
+          printf '%s@%s\n' 'ghcr.io/fed-labs/${{ matrix.image }}' '${{ steps.build.outputs.digest }}' >> image-digests.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-digests-${{ matrix.image }}
+          path: image-digests.txt
