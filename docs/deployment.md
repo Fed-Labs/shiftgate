@@ -7,8 +7,6 @@ agents exchange encrypted checkpoint chunks directly with each other.
 The security contract is in [Security](security.md) and
 [Threat Model](threat-model.md); this document is about the moving parts.
 
-
-
 ## Topology
 
 ```
