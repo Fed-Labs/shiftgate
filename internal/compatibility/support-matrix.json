@@ -1,0 +1,65 @@
+{
+  "version": "2026-10-21",
+  "policy": {
+    "unknown": "block_for_automatic_operations",
+    "untested": "experimental_only",
+    "gpu_evidence": "external_hardware_runner_required",
+    "certified": "allow",
+    "unsupported": "block_for_automatic_operations"
+  },
+  "platforms": [
+    {
+      "id": "linux-amd64-ubuntu-2404",
+      "distribution": "ubuntu-24.04",
+      "architecture": "amd64",
+      "kernel_min": "6.8",
+      "kernel_max": "6.11",
+      "criu_versions": ["4.2"],
+      "status": "certified",
+      "evidence": "CI e2e and stress lanes run the full checkpoint/restore suite on ubuntu-24.04 GitHub runners (the 6.8 and 6.11 runner kernel lines) with exactly CRIU 4.2.x from the criu PPA (see .github/workflows/ci.yml e2e/stress jobs and docs/release.md). CRIU 4.0/4.1/4.3 and kernels outside 6.8-6.11 have zero release-lane runs and are not certified by this line; 4.3 may not even be published in that PPA"
+    },
+    {
+      "id": "linux-amd64-ubuntu-2404-unexercised",
+      "distribution": "ubuntu-24.04",
+      "architecture": "amd64",
+      "kernel_min": "6.12",
+      "kernel_max": "6.14",
+      "criu_versions": ["4.0", "4.1", "4.2", "4.3"],
+      "status": "untested",
+      "evidence": "kernels 6.12-6.14 on ubuntu-24.04 and the CRIU 4.0/4.1/4.3 lines are not exercised by any release CI lane; a passing probe is not certification. Run scripts/verify-support-matrix.sh on the target host before certifying or enabling automatic operations"
+    },
+    {
+      "id": "linux-amd64-ubuntu-2204",
+      "distribution": "ubuntu-22.04",
+      "architecture": "amd64",
+      "kernel_min": "5.15",
+      "kernel_max": "5.15",
+      "criu_versions": ["3.17", "3.18", "3.19", "4.0", "4.1", "4.2"],
+      "status": "untested",
+      "evidence": "conservative LTS configuration consistent with the CRIU 3.17+/4.x support policy (docs/limitations.md, README prerequisites); not exercised by the release CI lane — run scripts/verify-support-matrix.sh on the target host before certifying"
+    },
+    {
+      "id": "linux-amd64-debian-12",
+      "distribution": "debian-12",
+      "architecture": "amd64",
+      "kernel_min": "6.1",
+      "kernel_max": "6.12",
+      "criu_versions": ["3.17", "3.18", "3.19", "4.0", "4.1", "4.2"],
+      "status": "untested",
+      "evidence": "docs/benchmarks.md ran CRIU 3.17.1 on a 6.12 kernel in a bookworm environment; treat benchmark results as functional evidence only — run scripts/verify-support-matrix.sh before automatic operations"
+    },
+    {
+      "id": "linux-amd64-generic",
+      "distribution": "linux",
+      "architecture": "amd64",
+      "kernel_min": "5.10",
+      "criu_versions": ["3.17", "3.18", "3.19", "4.0", "4.1", "4.2", "4.3"],
+      "status": "unknown",
+      "evidence": "any other distribution/kernel combination. The CRIU support policy is 3.17+ and 4.x with `criu check` passing; a passing probe is not certification. Per policy, unknown combinations are blocked for automatic operations until they are run through scripts/verify-support-matrix.sh and added here."
+    }
+  ],
+  "gpus": [
+    {"vendor": "nvidia", "runtime": "cuda", "status": "unknown", "evidence": "external GPU runner required; no local hardware claim"},
+    {"vendor": "amd", "runtime": "rocm", "status": "unsupported", "evidence": "ROCm process checkpoint/restore is not available in the current implementation"}
+  ]
+}

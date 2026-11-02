@@ -25,7 +25,7 @@ func machineResponse(record database.MachineRecord) Machine {
 	if capabilities == nil {
 		capabilities = map[string]any{}
 	}
-	return Machine{ID: record.ID, OrganizationID: record.OrganizationID, MachineID: record.MachineID, Name: record.Name, AgentURL: record.AgentURL, Capabilities: capabilities, Status: record.Status, LastSeenAt: record.LastSeenAt, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+	return Machine{ID: record.ID, OrganizationID: record.OrganizationID, MachineID: record.MachineID, Name: record.Name, AgentURL: record.AgentURL, LocalAgentURL: record.LocalAgentURL, Capabilities: capabilities, Status: record.Status, LastSeenAt: record.LastSeenAt, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
 }
 
 func workloadResponse(record database.WorkloadRecord) Workload {
@@ -47,7 +47,7 @@ func migrationResponse(record database.MigrationRecord) MigrationJob {
 	if progress == nil {
 		progress = map[string]any{}
 	}
-	return MigrationJob{ID: record.ID, OrganizationID: record.OrganizationID, WorkloadID: record.WorkloadID, SourceMachineID: record.SourceMachineID, DestinationMachineID: record.DestinationMachineID, Mode: record.Mode, Status: record.Status, Progress: progress, ErrorMessage: record.ErrorMessage, CreatedBy: record.CreatedBy, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, CompletedAt: record.CompletedAt}
+	return MigrationJob{ID: record.ID, OrganizationID: record.OrganizationID, WorkloadID: record.WorkloadID, SourceMachineID: record.SourceMachineID, DestinationMachineID: record.DestinationMachineID, Mode: record.Mode, Route: "", Status: record.Status, Progress: progress, ErrorMessage: record.ErrorMessage, CreatedBy: record.CreatedBy, IdempotencyKey: record.IdempotencyKey, AttemptCount: record.AttemptCount, LeaseOwner: record.LeaseOwner, LeaseExpiresAt: record.LeaseExpiresAt, AgentMigrationID: record.AgentMigrationID, Managed: record.Managed, CancelRequested: record.CancelRequested, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, CompletedAt: record.CompletedAt}
 }
 
 func auditResponse(record database.AuditRecord) AuditEvent {

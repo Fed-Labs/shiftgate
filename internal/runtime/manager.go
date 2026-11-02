@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"shift.dev/shift/internal/model"
+	"shift.dev/shift/internal/network"
 	"shift.dev/shift/internal/persistence"
 	linuxplatform "shift.dev/shift/internal/platform/linux"
 	"shift.dev/shift/internal/securestore"
@@ -79,7 +80,29 @@ func OpenManagerWithCgroups(stateDir, cgroupRoot string, requireCgroup bool, log
 	if err := manager.Reconcile(); err != nil {
 		return nil, err
 	}
+	// The port claims of workloads that survived the restart are rebuilt
+	// here, before the agent wires its network coordinator: the NAT table is
+	// in-memory and starts empty, and without this a fresh agent hands a
+	// still-running workload's host ports to the next restore. A conflict
+	// between surviving claims is logged, not fatal — the agent must come up
+	// even when its records disagree, and the next VALIDATE will refuse the
+	// contested port either way.
+	network.RebuildReservations(manager.portHoldingWorkloads())
 	return manager, nil
+}
+
+// portHoldingWorkloads lists the records whose host-port claims still hold
+// after Reconcile: a record whose process is alive (Reconcile cleared the
+// dead ones) or whose status is checkpointed — the ports of a checkpoint
+// belong to its next restore until the record goes away.
+func (m *Manager) portHoldingWorkloads() []model.Workload {
+	var held []model.Workload
+	for _, workload := range m.records.List() {
+		if workload.Process != nil || workload.Status == model.WorkloadCheckpointed {
+			held = append(held, workload)
+		}
+	}
+	return held
 }
 
 func (m *Manager) Create(spec model.WorkloadSpec) (model.Workload, error) {
@@ -101,6 +124,15 @@ func (m *Manager) Create(spec model.WorkloadSpec) (model.Workload, error) {
 	for _, existing := range m.records.List() {
 		if strings.EqualFold(existing.Spec.Name, spec.Name) {
 			return model.Workload{}, fmt.Errorf("workload name %q already exists", spec.Name)
+		}
+		if existing.Spec.ID == spec.ID {
+			return model.Workload{}, fmt.Errorf("workload ID %q already exists", spec.ID)
+		}
+		if strings.EqualFold(existing.Spec.Name, spec.ID) {
+			return model.Workload{}, fmt.Errorf("workload ID %q collides with the name of workload %s", spec.ID, existing.Spec.ID)
+		}
+		if existing.Spec.ID == spec.Name {
+			return model.Workload{}, fmt.Errorf("workload name %q collides with the ID of workload %s", spec.Name, existing.Spec.ID)
 		}
 	}
 	workload := model.Workload{Spec: spec, Status: model.WorkloadRegistered, Generation: 1}
@@ -349,6 +381,19 @@ func (m *Manager) Stop(idOrName string, timeout time.Duration) (model.Workload, 
 	process := *workload.Process
 	m.stopping[workload.Spec.ID] = true
 	m.mu.Unlock()
+	// The stopping flag must survive until the waiter (or the adopted-process
+	// watcher) records the exit as a stop, but it must not outlive an
+	// abandoned stop: if the kill fails the agent is no longer ordering this
+	// workload's end, and a later death of its own must be recorded as the
+	// failure it is — a leaked flag would hide it as a clean stop.
+	signaled := false
+	defer func() {
+		if !signaled {
+			m.mu.Lock()
+			delete(m.stopping, workload.Spec.ID)
+			m.mu.Unlock()
+		}
+	}()
 	// A checkpointed tree sits stopped where CRIU left it: SIGTERM only
 	// queues behind the stop and burns the whole grace period, and resuming
 	// it with SIGCONT first would let the frozen rollback copy execute. The
@@ -362,17 +407,18 @@ func (m *Manager) Stop(idOrName string, timeout time.Duration) (model.Workload, 
 		// so the kill is delivered, not queued.
 		_ = m.cgroups.Thaw(workload.Spec.ID)
 	} else {
-		_ = syscall.Kill(-process.PGID, syscall.SIGCONT)
+		_ = killProcessGroup(-process.PGID, syscall.SIGCONT)
 	}
-	if err := syscall.Kill(-process.PGID, terminate); err != nil && !errors.Is(err, syscall.ESRCH) {
+	if err := killProcessGroup(-process.PGID, terminate); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return model.Workload{}, err
 	}
+	signaled = true
 	deadline := time.Now().Add(timeout)
 	for linuxplatform.ProcessAlive(process.PID, process.ProcStartTicks) && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if linuxplatform.ProcessAlive(process.PID, process.ProcStartTicks) {
-		if err := syscall.Kill(-process.PGID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		if err := killProcessGroup(-process.PGID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 			return model.Workload{}, err
 		}
 	}
@@ -388,9 +434,17 @@ func (m *Manager) Stop(idOrName string, timeout time.Duration) (model.Workload, 
 	if err := m.records.Put(workload.Spec.ID, workload); err != nil {
 		return model.Workload{}, err
 	}
+	// The terminal state is recorded here; the waiter classifying the same
+	// exit is now redundant, so the flag is cleared for this generation too.
+	delete(m.stopping, workload.Spec.ID)
 	m.removeCgroup(workload.Spec.ID)
 	return workload, nil
 }
+
+// killProcessGroup signals a workload's process group. It is a variable so
+// tests can exercise Stop's failure paths — a signal that fails against a
+// live group cannot be arranged portably.
+var killProcessGroup = syscall.Kill
 
 // removeCgroup tears down the workload's cgroup directory and reports what
 // happened: an occupied directory is another tenant's, not a failure.
@@ -422,6 +476,17 @@ func (m *Manager) AdoptRestored(id string, pid int) (model.Workload, error) {
 	if err != nil {
 		return model.Workload{}, err
 	}
+	// The restored process's real credentials come from the checkpoint's
+	// CRIU images, not from the manifest that admitted them. A hostile
+	// checkpoint can declare uid 1000 to pass admission and carry images of
+	// a root process — so the live process is read back from /proc and
+	// reconciled with the manifest before adoption declares success. On
+	// mismatch the process is killed here and the caller's rollback unwinds
+	// the transaction; nothing else in the agent will ever run it.
+	if err := verifyRestoredCredentials(pid, workload.Spec); err != nil {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		return model.Workload{}, err
+	}
 	startTicks, err := linuxplatform.ProcessStartTicks(pid)
 	if err != nil {
 		return model.Workload{}, err
@@ -440,7 +505,65 @@ func (m *Manager) AdoptRestored(id string, pid int) (model.Workload, error) {
 	if err := m.records.Put(id, workload); err != nil {
 		return model.Workload{}, err
 	}
+	go m.watchAdopted(id, startTicks, pid)
 	return workload, nil
+}
+
+// adoptedReapInterval is how often a restored process's end is checked. The
+// agent did not spawn these processes through os/exec, so there is no command
+// to Wait on; the watcher polls and routes the death through the
+// exit-recording path shared with spawned workloads.
+const adoptedReapInterval = 500 * time.Millisecond
+
+// describeWaitStatus renders a kernel exit status for a workload record.
+func describeWaitStatus(status syscall.WaitStatus) string {
+	switch {
+	case status.Exited():
+		return fmt.Sprintf("exit status %d", status.ExitStatus())
+	case status.Signaled():
+		return fmt.Sprintf("signal %s", status.Signal())
+	default:
+		return "unusual exit state"
+	}
+}
+
+// watchAdopted supervises a restored process the manager adopted — the
+// restore, fork, and clone paths all land here — so its death becomes record
+// state immediately instead of at the next agent restart. It never restarts
+// anything: a dead workload is recorded as failed or stopped and left there.
+func (m *Manager) watchAdopted(id string, startTicks uint64, pid int) {
+	for {
+		time.Sleep(adoptedReapInterval)
+		if exitErr, ended := adoptedProcessExit(pid, startTicks); ended {
+			m.recordExit(id, startTicks, exitErr)
+			return
+		}
+	}
+}
+
+// adoptedProcessExit reports whether a restored process has ended and what
+// its exit is worth recording. A restored root that is the agent's child is
+// reaped here — a zombie would outlive its death as far as /proc is
+// concerned and leak a process slot until the agent exits — and its exit
+// status is recorded the way a spawned workload's would be. A root CRIU
+// parented elsewhere cannot be waited on: its death is detected through the
+// same process identity Start recorded, and its exit status is unrecoverable.
+func adoptedProcessExit(pid int, startTicks uint64) (error, bool) {
+	var status syscall.WaitStatus
+	reaped, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+	if err == nil && reaped == pid {
+		if status.Exited() && status.ExitStatus() == 0 {
+			return nil, true
+		}
+		return fmt.Errorf("restored process exited: %s", describeWaitStatus(status)), true
+	}
+	if err == nil {
+		return nil, false
+	}
+	if linuxplatform.ProcessAlive(pid, startTicks) {
+		return nil, false
+	}
+	return errors.New("restored process exited"), true
 }
 
 // ParkFrozenSource moves a checkpoint's frozen source tree into a private
@@ -484,6 +607,21 @@ func (m *Manager) PrepareRestore(spec model.WorkloadSpec) (model.Workload, bool,
 			return model.Workload{}, false, err
 		}
 		return workload, true, nil
+	}
+	if workload.Spec.ID != spec.ID {
+		return model.Workload{}, false, fmt.Errorf("restore spec id %q does not match the workload record it would replace (%s)", spec.ID, workload.Spec.ID)
+	}
+	if !strings.EqualFold(workload.Spec.Name, spec.Name) {
+		return model.Workload{}, false, fmt.Errorf("restore cannot rename workload %q to %q", workload.Spec.Name, spec.Name)
+	}
+	// The replacement spec is checkpoint-manifest data and the manifest is a
+	// trust boundary — a compromised source signs hostile manifests — so it
+	// is validated exactly like a fresh spec instead of assigned raw. An
+	// empty command would otherwise survive here and panic the next Start;
+	// a root of "/" or a working directory outside the root would be
+	// installed with no validation at all.
+	if err := spec.Normalize(); err != nil {
+		return model.Workload{}, false, err
 	}
 	if workload.Process != nil && linuxplatform.ProcessAlive(workload.Process.PID, workload.Process.ProcStartTicks) {
 		if workload.Status != model.WorkloadCheckpointed {
@@ -575,6 +713,12 @@ func (m *Manager) Reconcile() error {
 			continue
 		}
 		if linuxplatform.ProcessAlive(workload.Process.PID, workload.Process.ProcStartTicks) {
+			// The process survived the agent restart (workloads are
+			// detached from it), so the same supervision a fresh adoption
+			// gets is installed here: without it, a restored workload that
+			// dies after a restart keeps its "running" record until the
+			// next one.
+			go m.watchAdopted(workload.Spec.ID, workload.Process.ProcStartTicks, workload.Process.PID)
 			continue
 		}
 		workload.Process = nil
@@ -632,8 +776,19 @@ func (m *Manager) wait(id string, startTicks uint64, command *exec.Cmd, logFile 
 	err := command.Wait()
 	_ = logFile.Close()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	delete(m.commands, id)
+	m.mu.Unlock()
+	m.recordExit(id, startTicks, err)
+}
+
+// recordExit is the one place a workload's death becomes record state. Both
+// supervision paths end here — the waiter for processes the manager spawned
+// and the adopted-process watcher for trees CRIU restored — so a restored
+// workload's crash is recorded exactly like a spawned one's instead of
+// lingering as "running" until the next agent restart.
+func (m *Manager) recordExit(id string, startTicks uint64, exitErr error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	workload, getErr := m.records.Get(id)
 	if getErr != nil || workload.Process == nil || workload.Process.ProcStartTicks != startTicks {
 		return
@@ -641,9 +796,9 @@ func (m *Manager) wait(id string, startTicks uint64, command *exec.Cmd, logFile 
 	retired := m.stopping[id]
 	delete(m.stopping, id)
 	exitCode := 0
-	if err != nil {
+	if exitErr != nil {
 		var exitError *exec.ExitError
-		if errors.As(err, &exitError) {
+		if errors.As(exitErr, &exitError) {
 			exitCode = exitError.ExitCode()
 		} else {
 			exitCode = -1
@@ -657,9 +812,9 @@ func (m *Manager) wait(id string, startTicks uint64, command *exec.Cmd, logFile 
 	// itself ordered — the operator's stop, a superseded source a committed
 	// restore reaps — is an ordinary stop, and a clean exit needs no error.
 	workload.LastError = ""
-	if err != nil && !retired {
+	if exitErr != nil && !retired {
 		workload.Status = model.WorkloadFailed
-		workload.LastError = err.Error()
+		workload.LastError = exitErr.Error()
 	} else {
 		workload.Status = model.WorkloadStopped
 	}
@@ -726,15 +881,58 @@ func resolveExecutable(command string) (string, error) {
 	return resolved, nil
 }
 
+// workloadBaseEnvironment lists the only variables a workload inherits from
+// the agent's own environment. Everything else the agent runs with is
+// withheld: the environment carries the machines-scope API key (ownership
+// acquire and fence powers across the organization) and the storage
+// credentials, and a workload that can read its own /proc/self/environ can
+// exercise all of them. The spec's Environment is the explicitly scoped
+// state that does move; nothing else does.
+var workloadBaseEnvironment = []string{"PATH", "HOME", "TZ", "LANG"}
+
+// defaultWorkloadPath is the PATH a workload gets when neither the agent nor
+// the spec supplies one, so a minimal environment is still a runnable one.
+const defaultWorkloadPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// isAgentCredentialEnv reports whether an environment variable carries an
+// agent credential or agent configuration. Such variables are scrubbed from
+// the workload environment even when a spec asks for them: the spec's
+// environment crosses a trust boundary on restore (checkpoint manifests are
+// hostile input), and no workload — however created — may end up holding an
+// agent key. CRIU images capture the environment of the process they dump,
+// so anything that leaked in here would be baked into every checkpoint and
+// shipped to peer machines and object storage from there.
+func isAgentCredentialEnv(key string) bool {
+	upper := strings.ToUpper(key)
+	if strings.HasPrefix(upper, "SHIFT_") {
+		return true
+	}
+	switch upper {
+	case "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
+		"S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN":
+		return true
+	}
+	return false
+}
+
+// mergedEnvironment builds the environment a workload is spawned with: the
+// minimal inherited base, overlaid with the spec's explicitly declared
+// variables, minus every agent credential. The agent's own environment is
+// never inherited wholesale.
 func mergedEnvironment(overrides map[string]string) []string {
 	values := make(map[string]string)
-	for _, entry := range os.Environ() {
-		key, value, ok := strings.Cut(entry, "=")
-		if ok {
+	for _, key := range workloadBaseEnvironment {
+		if value, ok := os.LookupEnv(key); ok {
 			values[key] = value
 		}
 	}
+	if _, ok := values["PATH"]; !ok {
+		values["PATH"] = defaultWorkloadPath
+	}
 	for key, value := range overrides {
+		if strings.TrimSpace(key) == "" || isAgentCredentialEnv(key) {
+			continue
+		}
 		values[key] = value
 	}
 	keys := make([]string, 0, len(values))
@@ -760,4 +958,53 @@ func waitForStartTicks(pid int) (uint64, error) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return 0, fmt.Errorf("read process identity for pid %s: %w", strconv.Itoa(pid), lastErr)
+}
+
+// verifyRestoredCredentials reconciles a restored process's real credentials
+// — read back from the kernel, never from the checkpoint — with the identity
+// the manifest declared and the destination policy admitted. The uid/gid
+// boundary is the whole privilege story of a restore: a mismatch means the
+// images carried a process of another identity than the manifest sold, and
+// the restore must not stand.
+func verifyRestoredCredentials(pid int, workload model.WorkloadSpec) error {
+	content, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return fmt.Errorf("cannot verify the restored process's credentials: %w", err)
+	}
+	uid, gid, err := parseProcessCredentials(string(content))
+	if err != nil {
+		return fmt.Errorf("cannot verify the restored process's credentials: %w", err)
+	}
+	if uid != workload.UID || gid != workload.GID {
+		return fmt.Errorf("restored process %d runs as uid %d gid %d but the checkpoint manifest declares uid %d gid %d; refusing to adopt it",
+			pid, uid, gid, workload.UID, workload.GID)
+	}
+	return nil
+}
+
+// parseProcessCredentials extracts the real uid and gid from a
+// /proc/<pid>/status document ("Uid:\treal\teffective\tsaved\tfs", likewise
+// Gid).
+func parseProcessCredentials(status string) (int, int, error) {
+	uid, gid := -1, -1
+	for _, line := range strings.Split(status, "\n") {
+		key, rest, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			continue
+		}
+		switch key {
+		case "Uid":
+			uid, _ = strconv.Atoi(fields[0])
+		case "Gid":
+			gid, _ = strconv.Atoi(fields[0])
+		}
+	}
+	if uid < 0 || gid < 0 {
+		return 0, 0, errors.New("no Uid/Gid lines in process status")
+	}
+	return uid, gid, nil
 }

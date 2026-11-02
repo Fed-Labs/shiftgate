@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -47,8 +48,10 @@ func (store *Store) CreateWorkload(ctx context.Context, record WorkloadRecord, a
 	return record, nil
 }
 
-func (store *Store) Workloads(ctx context.Context, organizationID string) ([]WorkloadRecord, error) {
-	rows, err := store.pool.Query(ctx, `SELECT id,organization_id,COALESCE(machine_id,''),name,spec,status,created_at,updated_at FROM workloads WHERE organization_id=$1 ORDER BY updated_at DESC`, organizationID)
+// Workloads returns one page of an organization's workloads, most recently
+// updated first.
+func (store *Store) Workloads(ctx context.Context, organizationID string, page Page) ([]WorkloadRecord, error) {
+	rows, err := store.pool.Query(ctx, `SELECT id,organization_id,COALESCE(machine_id,''),name,spec,status,created_at,updated_at FROM workloads WHERE organization_id=$1 ORDER BY updated_at DESC`+page.clause(), organizationID)
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +65,15 @@ func (store *Store) Workloads(ctx context.Context, organizationID string) ([]Wor
 		result = append(result, record)
 	}
 	return result, rows.Err()
+}
+
+// Workload reads one workload by id inside its organization. Point lookups
+// use this instead of scanning paged listings.
+func (store *Store) Workload(ctx context.Context, organizationID, workloadID string) (WorkloadRecord, error) {
+	var record WorkloadRecord
+	err := store.pool.QueryRow(ctx, `SELECT id,organization_id,COALESCE(machine_id,''),name,spec,status,created_at,updated_at FROM workloads WHERE organization_id=$1 AND id=$2`, organizationID, workloadID).
+		Scan(&record.ID, &record.OrganizationID, &record.MachineID, &record.Name, &record.Spec, &record.Status, &record.CreatedAt, &record.UpdatedAt)
+	return record, err
 }
 
 func (store *Store) UpdateWorkloadStatus(ctx context.Context, organizationID, workloadID string, status json.RawMessage, audit AuditInput) (WorkloadRecord, error) {
@@ -104,14 +116,28 @@ func (store *Store) UpsertWorkload(ctx context.Context, record WorkloadRecord, a
 	if !machineExists {
 		return WorkloadRecord{}, pgx.ErrNoRows
 	}
+	// Workload ids are agent-supplied, so an id already owned by another
+	// organization must never be re-parented or overwritten. The pre-check
+	// answers with not-found (indistinguishable from a missing row), and the
+	// ON CONFLICT guard below closes the concurrent-insert race where the
+	// foreign row commits between the check and the upsert.
+	var owner string
+	err = tx.QueryRow(ctx, `SELECT organization_id FROM workloads WHERE id=$1`, record.ID).Scan(&owner)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return WorkloadRecord{}, err
+	}
+	if err == nil && owner != record.OrganizationID {
+		return WorkloadRecord{}, pgx.ErrNoRows
+	}
 	status := record.Status
 	if len(status) == 0 {
 		status = json.RawMessage(`{}`)
 	}
 	err = tx.QueryRow(ctx, `INSERT INTO workloads(id,organization_id,machine_id,name,spec,status)
 		VALUES($1,$2,NULLIF($3,''),$4,$5,$6)
-		ON CONFLICT (id) DO UPDATE SET organization_id=EXCLUDED.organization_id,machine_id=EXCLUDED.machine_id,name=EXCLUDED.name,
+		ON CONFLICT (id) DO UPDATE SET machine_id=EXCLUDED.machine_id,name=EXCLUDED.name,
 			spec=EXCLUDED.spec,status=EXCLUDED.status,updated_at=now()
+		WHERE workloads.organization_id = EXCLUDED.organization_id
 		RETURNING created_at,updated_at`,
 		record.ID, record.OrganizationID, record.MachineID, record.Name, record.Spec, status).
 		Scan(&record.CreatedAt, &record.UpdatedAt)

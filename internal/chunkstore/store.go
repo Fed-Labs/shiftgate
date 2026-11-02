@@ -15,8 +15,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sys/unix"
 
 	"shift.dev/shift/internal/model"
 	"shift.dev/shift/internal/securestore"
@@ -26,26 +29,25 @@ const (
 	magic             = "SHFTCHK1"
 	fileFormatVersion = uint16(1)
 	maxEncodedChunk   = 96 << 20
+	// maxPlainChunk is the absolute cap on a chunk's decompressed size. A
+	// declared size outside 1..maxPlainChunk is refused before any
+	// decompression runs, so a crafted frame can never expand into a memory
+	// exhaustion primitive.
+	maxPlainChunk = 64 << 20
 )
 
 // The zstd codec is package state because its encoder and decoder are
 // expensive to build and safe for concurrent EncodeAll/DecodeAll use.
 // SpeedDefault (level 3) both compresses better and runs faster than the
-// gzip BestSpeed implementation this replaced.
+// gzip BestSpeed implementation this replaced. The decoder's maximum decoded
+// size is pinned to maxPlainChunk — without it DecodeAll defaults to a 64 GiB
+// output ceiling, which is a decompression bomb waiting to be claimed.
 var (
-	zstdEncoder = sync.OnceValue(func() *zstd.Encoder {
-		encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
-		if err != nil {
-			panic("chunkstore: zstd encoder: " + err.Error())
-		}
-		return encoder
+	zstdEncoder = sync.OnceValues(func() (*zstd.Encoder, error) {
+		return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 	})
-	zstdDecoder = sync.OnceValue(func() *zstd.Decoder {
-		decoder, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
-		if err != nil {
-			panic("chunkstore: zstd decoder: " + err.Error())
-		}
-		return decoder
+	zstdDecoder = sync.OnceValues(func() (*zstd.Decoder, error) {
+		return zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(maxPlainChunk))
 	})
 )
 
@@ -58,6 +60,12 @@ type Store struct {
 type PutResult struct {
 	Asset             model.AssetManifest
 	DeduplicatedBytes int64
+}
+
+type ChunkInfo struct {
+	Ref      model.ChunkRef
+	Path     string
+	Modified time.Time
 }
 
 func Open(root string, chunkSize int, keys *securestore.Manager) (*Store, error) {
@@ -73,9 +81,40 @@ func Open(root string, chunkSize int, keys *securestore.Manager) (*Store, error)
 	return &Store{root: root, chunkSize: chunkSize, keys: keys}, nil
 }
 
+// OpenExisting opens a chunk store that must already exist. Nothing is
+// created: a verification pass over a damaged tree must see what is missing,
+// not write directories into its target and make it look complete.
+func OpenExisting(root string, chunkSize int, keys *securestore.Manager) (*Store, error) {
+	if keys == nil {
+		return nil, errors.New("secure key manager is required")
+	}
+	if chunkSize < 64<<10 || chunkSize > 64<<20 {
+		return nil, errors.New("chunk size must be between 64 KiB and 64 MiB")
+	}
+	info, err := os.Stat(filepath.Join(root, "chunks"))
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, errors.New("chunk store is missing its chunks directory")
+	}
+	return &Store{root: root, chunkSize: chunkSize, keys: keys}, nil
+}
+
 func (s *Store) ActiveKeyVersion(workloadID string) (uint32, error) {
 	version, _, err := s.keys.GetOrCreateWorkloadKey(workloadID)
 	return version, err
+}
+
+// FreeBytes reports the space available to an unprivileged writer on the
+// filesystem holding the chunk store. Importers check it against a floor so
+// chunk ingest cannot drive the host filesystem to exhaustion.
+func (s *Store) FreeBytes() (uint64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(s.root, &stat); err != nil {
+		return 0, err
+	}
+	return stat.Bavail * uint64(stat.Bsize), nil
 }
 
 func (s *Store) PutAsset(ctx context.Context, workloadID, name, mediaType string, reader io.Reader, required bool, restoreOrder int) (PutResult, error) {
@@ -152,6 +191,113 @@ func (s *Store) RestoreAsset(ctx context.Context, workloadID string, asset model
 	return nil
 }
 
+// Enumerate returns filesystem metadata only. GC must recheck references and
+// validate the exact file again immediately before deleting it.
+func (s *Store) Enumerate(ctx context.Context) ([]ChunkInfo, error) {
+	var result []ChunkInfo
+	err := filepath.WalkDir(filepath.Join(s.root, "chunks"), func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".chunk") {
+			return nil
+		}
+		address := strings.TrimSuffix(entry.Name(), ".chunk")
+		if len(address) != 64 || strings.Trim(address, "0123456789abcdef") != "" {
+			return nil
+		}
+		var keyVersion uint32
+		if _, scanErr := fmt.Sscanf(filepath.Base(filepath.Dir(filepath.Dir(path))), "v%d", &keyVersion); scanErr != nil || keyVersion == 0 {
+			return nil
+		}
+		info, statErr := entry.Info()
+		if statErr != nil {
+			return statErr
+		}
+		result = append(result, ChunkInfo{Ref: model.ChunkRef{Address: address, KeyVersion: keyVersion, StoredSize: info.Size()}, Path: path, Modified: info.ModTime()})
+		return nil
+	})
+	return result, err
+}
+
+// DeleteRef derives the path from the authenticated ref. It rejects symlinks
+// and checks metadata before unlinking; callers cannot supply an arbitrary path.
+// The check and the unlink run against one opened directory handle — the file
+// is re-opened with O_NOFOLLOW, verified through the descriptor, and unlinked
+// from that same descriptor — so a chunk swapped between the check and the
+// unlink cannot make GC delete a chunk it never verified.
+func (s *Store) DeleteRef(ref model.ChunkRef, modified time.Time) error {
+	path, err := s.chunkPath(ref)
+	if err != nil {
+		return err
+	}
+	directory, err := unix.Open(filepath.Dir(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(directory) }()
+	name := filepath.Base(path)
+	fd, err := unix.Openat(directory, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) {
+			return errors.New("chunk is not a regular file")
+		}
+		return err
+	}
+	var stat unix.Stat_t
+	statErr := unix.Fstat(fd, &stat)
+	_ = unix.Close(fd)
+	if statErr != nil {
+		return statErr
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return errors.New("chunk is not a regular file")
+	}
+	mtime := time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec)
+	if !mtime.Equal(modified) || stat.Size != ref.StoredSize {
+		return errors.New("chunk changed since gc planning")
+	}
+	// Re-prove the name still resolves to the descriptor's inode right
+	// before the unlink; anything else is a swap and keeps its file.
+	var linked unix.Stat_t
+	if err := unix.Fstatat(directory, name, &linked, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if linked.Dev != stat.Dev || linked.Ino != stat.Ino {
+		return errors.New("chunk changed since gc planning")
+	}
+	return unix.Unlinkat(directory, name, 0)
+}
+
+// streamCipherDigest hashes a chunk's ciphertext without buffering the whole
+// file, for the dedup/collision checks that only need the digest.
+func streamCipherDigest(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return nil, err
+	}
+	return digest.Sum(nil), nil
+}
+
+// Delete is retained only for source compatibility and cannot be used to pass
+// an arbitrary path; all safe maintenance should call DeleteRef.
+func (s *Store) Delete(candidate ChunkInfo) error {
+	return s.DeleteRef(candidate.Ref, candidate.Modified)
+}
+
+// Missing reports the refs the store cannot serve: absent files, files whose
+// size drifted, and — proven by the streamed ciphertext digest — right-size
+// files whose bytes no longer match the ref. Size alone proves nothing: bit
+// rot that preserves file length would otherwise make a chunk look present
+// forever, so every resume would skip it and the transfer could never repair.
 func (s *Store) Missing(refs []model.ChunkRef) ([]model.ChunkRef, error) {
 	missing := make([]model.ChunkRef, 0)
 	for _, ref := range refs {
@@ -168,6 +314,14 @@ func (s *Store) Missing(refs []model.ChunkRef) ([]model.ChunkRef, error) {
 			return nil, err
 		}
 		if info.Size() != ref.StoredSize {
+			missing = append(missing, ref)
+			continue
+		}
+		if ref.CipherSHA256 == "" {
+			continue
+		}
+		digest, err := streamCipherDigest(path)
+		if err != nil || hex.EncodeToString(digest) != ref.CipherSHA256 {
 			missing = append(missing, ref)
 		}
 	}
@@ -203,17 +357,40 @@ func (s *Store) ImportChunk(ctx context.Context, workloadID string, ref model.Ch
 	return err
 }
 
-// ImportChunkResult reports whether this call installed a new chunk. A retry
-// of an already accepted upload is successful but does not consume quota a
-// second time.
+// ImportChunkResult reports whether this call stored bytes that were not in
+// the store before. A retry of an already accepted upload — and a repair of a
+// present-but-corrupt chunk — is successful but does not consume quota a
+// second time. The declared sizes are bounded before a single byte is read:
+// an import is untrusted input, and a forged ref must not be able to drive
+// reads or decompression past the store's absolute plain-chunk cap. The bound
+// is maxPlainChunk rather than the configured chunk size because chunk size is
+// a per-agent setting: a destination tuned below its source must still accept
+// the source's chunks, and the session quota plus the free-space floor bound
+// total ingest.
 func (s *Store) ImportChunkResult(ctx context.Context, workloadID string, ref model.ChunkRef, reader io.Reader) (bool, error) {
+	if ref.StoredSize < 1 || ref.StoredSize > maxEncodedChunk {
+		return false, errors.New("chunk stored size out of range")
+	}
+	if ref.PlainSize < 1 || ref.PlainSize > maxPlainChunk {
+		return false, errors.New("chunk plain size out of range")
+	}
 	path, err := s.chunkPath(ref)
 	if err != nil {
 		return false, err
 	}
-	if info, err := os.Stat(path); err == nil && info.Size() == ref.StoredSize {
-		_, verifyErr := s.readChunk(workloadID, ref)
-		return false, verifyErr
+	present := false
+	if info, err := os.Stat(path); err == nil {
+		present = true
+		if info.Size() == ref.StoredSize {
+			if _, verifyErr := s.readChunk(workloadID, ref); verifyErr == nil {
+				return false, nil
+			}
+		}
+		// Present but unverifiable — bit rot or at-rest damage that kept (or
+		// changed) the size. Fall through and replace it: a corrupt chunk
+		// must be repairable by re-upload, not permanently stuck.
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return false, err
@@ -223,12 +400,12 @@ func (s *Store) ImportChunkResult(ctx context.Context, workloadID string, ref mo
 		return false, err
 	}
 	temporaryPath := temporary.Name()
-	committed := false
+	// The staging file is always removed: once it is hard-linked into place
+	// the chunk keeps the inode, and a name left behind would pin the data
+	// after GC unlinks the chunk — or after a failed import.
 	defer func() {
 		_ = temporary.Close()
-		if !committed {
-			_ = os.Remove(temporaryPath)
-		}
+		_ = os.Remove(temporaryPath)
 	}()
 	if err := temporary.Chmod(0o600); err != nil {
 		return false, err
@@ -252,20 +429,27 @@ func (s *Store) ImportChunkResult(ctx context.Context, workloadID string, ref mo
 		return false, err
 	}
 	if err := os.Link(temporaryPath, path); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			if _, verifyErr := s.readChunk(workloadID, ref); verifyErr != nil {
-				return false, verifyErr
-			}
+		if !errors.Is(err, os.ErrExist) {
+			return false, err
+		}
+		// A name already exists at the target: an existing chunk that
+		// verifies against the declared ref is a dedup hit and is left
+		// alone; anything else is corrupt or foreign and is replaced by the
+		// verified bytes just staged, atomically, so concurrent readers see
+		// one complete file or the other.
+		if _, verifyErr := s.readChunk(workloadID, ref); verifyErr == nil {
 			return false, nil
 		}
-		return false, err
+		present = true
+		if err := os.Rename(temporaryPath, path); err != nil {
+			return false, err
+		}
 	}
-	committed = true
 	if _, err := s.readChunk(workloadID, ref); err != nil {
 		_ = os.Remove(path)
 		return false, err
 	}
-	return true, nil
+	return !present, nil
 }
 
 func (s *Store) ValidateAsset(ctx context.Context, workloadID string, asset model.AssetManifest) error {
@@ -278,7 +462,10 @@ func (s *Store) putChunk(workloadID string, keyVersion uint32, dataKey []byte, s
 		return model.ChunkRef{}, false, err
 	}
 	plainDigest := sha256.Sum256(plaintext)
-	compressed := compress(plaintext)
+	compressed, err := compress(plaintext)
+	if err != nil {
+		return model.ChunkRef{}, false, err
+	}
 	aad := chunkAAD(workloadID, address, keyVersion, int64(len(plaintext)))
 	nonce, ciphertext, err := securestore.Encrypt(dataKey, workloadID, "checkpoint-chunk", compressed, aad)
 	if err != nil {
@@ -305,12 +492,13 @@ func (s *Store) putChunk(workloadID string, keyVersion uint32, dataKey []byte, s
 		return model.ChunkRef{}, false, err
 	}
 	if info, err := os.Stat(path); err == nil && info.Size() == int64(len(encoded)) {
-		existing, readErr := os.ReadFile(path)
-		if readErr == nil {
-			existingDigest := sha256.Sum256(existing)
-			existingRef := ref
-			existingRef.StoredSize = int64(len(existing))
-			existingRef.CipherSHA256 = hex.EncodeToString(existingDigest[:])
+		// Stream the existing chunk's digest instead of buffering the whole
+		// ciphertext: the collision/import path must not hold 96 MiB just to
+		// decide the chunk it found is the chunk it meant.
+		existingRef := ref
+		existingRef.StoredSize = info.Size()
+		if digest, digestErr := streamCipherDigest(path); digestErr == nil {
+			existingRef.CipherSHA256 = hex.EncodeToString(digest)
 			existingPlaintext, codec, verifyErr := s.verifyChunk(workloadID, existingRef)
 			if verifyErr == nil && bytes.Equal(existingPlaintext, plaintext) {
 				existingRef.Compression = codec
@@ -397,6 +585,12 @@ func (s *Store) readChunk(workloadID string, ref model.ChunkRef) ([]byte, error)
 // zstd switch — so the codec is resolved from the bytes and the caller can
 // label the manifest truthfully.
 func (s *Store) verifyChunk(workloadID string, ref model.ChunkRef) (plaintext []byte, codec string, err error) {
+	if ref.PlainSize < 1 || ref.PlainSize > maxPlainChunk {
+		return nil, "", errors.New("chunk plain size out of range")
+	}
+	if ref.StoredSize < 1 || ref.StoredSize > maxEncodedChunk {
+		return nil, "", errors.New("chunk stored size out of range")
+	}
 	path, err := s.chunkPath(ref)
 	if err != nil {
 		return nil, "", err
@@ -488,6 +682,9 @@ func decodeChunk(encoded []byte) (keyVersion uint32, plainSize int64, nonce, cip
 	if err := binary.Read(reader, binary.BigEndian, &plainSize); err != nil {
 		return 0, 0, nil, nil, err
 	}
+	if plainSize < 1 || plainSize > maxPlainChunk {
+		return 0, 0, nil, nil, errors.New("chunk plain size out of range")
+	}
 	if err := binary.Read(reader, binary.BigEndian, &nonceLength); err != nil {
 		return 0, 0, nil, nil, err
 	}
@@ -512,8 +709,12 @@ func decodeChunk(encoded []byte) (keyVersion uint32, plainSize int64, nonce, cip
 // AEAD cover is over the compressed bytes). zstd at SpeedDefault both
 // compresses better and runs faster than the gzip BestSpeed codec this
 // replaced.
-func compress(plaintext []byte) []byte {
-	return zstdEncoder().EncodeAll(plaintext, make([]byte, 0, len(plaintext)/2))
+func compress(plaintext []byte) ([]byte, error) {
+	encoder, err := zstdEncoder()
+	if err != nil {
+		return nil, err
+	}
+	return encoder.EncodeAll(plaintext, make([]byte, 0, len(plaintext)/2)), nil
 }
 
 // The frame magic identifies which codec a decrypted chunk body uses: gzip
@@ -529,12 +730,20 @@ var (
 )
 
 // decompress reverses compress for either codec the store has ever written,
-// returning the codec it found. The size check runs after decompression so a
-// stream that expands to anything other than the recorded plaintext size is
-// rejected however it got there.
+// returning the codec it found. The declared size is bounded before any
+// decoding runs, the decoders themselves are memory-capped, and the size
+// check afterwards rejects a stream that expands to anything other than the
+// recorded plaintext size however it got there.
 func decompress(compressed []byte, expectedSize int64) (plaintext []byte, codec string, err error) {
+	if expectedSize < 1 || expectedSize > maxPlainChunk {
+		return nil, "", errors.New("declared chunk size out of range")
+	}
 	if bytes.HasPrefix(compressed, zstdFrameMagic) {
-		plaintext, err := zstdDecoder().DecodeAll(compressed, nil)
+		decoder, err := zstdDecoder()
+		if err != nil {
+			return nil, "", err
+		}
+		plaintext, err := decoder.DecodeAll(compressed, nil)
 		if err != nil {
 			return nil, "", err
 		}

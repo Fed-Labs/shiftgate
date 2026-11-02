@@ -39,6 +39,24 @@ func (store *Store) SCIMCreateUser(ctx context.Context, organizationID string, u
 		return SCIMUser{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// SCIM provisioning grows membership exactly like an invite does, so it
+	// respects the purchased seat ceiling under the same serialization.
+	if err := lockSeatGate(ctx, tx, organizationID); err != nil {
+		return SCIMUser{}, err
+	}
+	seatCeiling, err := seatCeilingFor(ctx, tx, organizationID)
+	if err != nil {
+		return SCIMUser{}, err
+	}
+	if seatCeiling > 0 {
+		var members int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM organization_members m JOIN users u ON u.id = m.user_id WHERE m.organization_id=$1 AND u.disabled_at IS NULL`, organizationID).Scan(&members); err != nil {
+			return SCIMUser{}, err
+		}
+		if members+1 > seatCeiling {
+			return SCIMUser{}, ErrSeatCeilingExceeded
+		}
+	}
 	userID, err := model.NewID()
 	if err != nil {
 		return SCIMUser{}, err
@@ -83,36 +101,41 @@ func (store *Store) SCIMUserByID(ctx context.Context, organizationID, userID str
 }
 
 // SCIMUsers lists the organization's provisioned users, filtered by the
-// parsed SCIM filter (clauses ANDed together). Values only ever bind as query
-// parameters — attribute and operator names come from fixed whitelists, never
-// from the request text.
-func (store *Store) SCIMUsers(ctx context.Context, organizationID string, filter []SCIMClause) ([]SCIMUser, error) {
-	query := scimUserSelect
+// parsed SCIM filter (clauses ANDed together) and paged in SQL: the window
+// function reports the total match count alongside the page, so large
+// directories never materialize in memory just to be sliced. Values only ever
+// bind as query parameters — attribute and operator names come from fixed
+// whitelists, never from the request text.
+func (store *Store) SCIMUsers(ctx context.Context, organizationID string, filter []SCIMClause, page Page) ([]SCIMUser, int, error) {
+	query := `SELECT u.id,u.external_id,u.email,u.display_name,(u.disabled_at IS NULL) AS active,count(*) OVER () AS total
+	FROM users u JOIN organization_members m ON m.user_id=u.id
+	WHERE m.organization_id=$1`
 	args := []any{organizationID}
 	for _, clause := range filter {
 		fragment, value, ok := renderSCIMClause(clause, len(args)+1)
 		if !ok {
-			return nil, fmt.Errorf("unsupported SCIM filter on %q with operator %q", clause.Attribute, clause.Operator)
+			return nil, 0, fmt.Errorf("unsupported SCIM filter on %q with operator %q", clause.Attribute, clause.Operator)
 		}
 		query += " AND " + fragment
 		if value != nil {
 			args = append(args, value)
 		}
 	}
-	rows, err := store.pool.Query(ctx, query+` ORDER BY u.email`, args...)
+	rows, err := store.pool.Query(ctx, query+` ORDER BY u.email`+page.clause(), args...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 	var result []SCIMUser
+	total := 0
 	for rows.Next() {
 		var user SCIMUser
-		if err := rows.Scan(&user.ID, &user.ExternalID, &user.Email, &user.DisplayName, &user.Active); err != nil {
-			return nil, err
+		if err := rows.Scan(&user.ID, &user.ExternalID, &user.Email, &user.DisplayName, &user.Active, &total); err != nil {
+			return nil, 0, err
 		}
 		result = append(result, user)
 	}
-	return result, rows.Err()
+	return result, total, rows.Err()
 }
 
 // SCIMClause is one parsed filter comparison. Attribute and Operator hold
@@ -273,16 +296,23 @@ func renderSCIMClause(clause SCIMClause, placeholder int) (predicate string, arg
 	case "eq":
 		return fmt.Sprintf("%s = lower($%d)", column, placeholder), clause.Value, true
 	case "co":
-		return fmt.Sprintf("%s LIKE '%%' || lower($%d) || '%%'", column, placeholder), clause.Value, true
+		return fmt.Sprintf("%s LIKE '%%' || lower($%d) || '%%' ESCAPE '\\'", column, placeholder), escapeLikeValue(clause.Value), true
 	case "sw":
-		return fmt.Sprintf("%s LIKE lower($%d) || '%%'", column, placeholder), clause.Value, true
+		return fmt.Sprintf("%s LIKE lower($%d) || '%%' ESCAPE '\\'", column, placeholder), escapeLikeValue(clause.Value), true
 	case "ew":
-		return fmt.Sprintf("%s LIKE '%%' || lower($%d)", column, placeholder), clause.Value, true
+		return fmt.Sprintf("%s LIKE '%%' || lower($%d) ESCAPE '\\'", column, placeholder), escapeLikeValue(clause.Value), true
 	case "pr":
 		return fmt.Sprintf("%s <> ''", column), nil, true
 	default:
 		return "", nil, false
 	}
+}
+
+// escapeLikeValue neutralizes SQL LIKE wildcards inside a SCIM filter value,
+// so a filter matches the literal text the caller wrote instead of every row
+// that happens to contain a percent sign or underscore.
+func escapeLikeValue(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(value)
 }
 
 // SCIMReplaceUser applies a full replacement of the idP-controlled fields.

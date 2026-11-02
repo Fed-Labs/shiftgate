@@ -99,16 +99,29 @@ func publishRelease(t *testing.T, signer *update.Signer, directory, version stri
 	return feedPath, update.TrustedKey{ID: signer.KeyID(), PublicKeyPEM: publicPEM, Comment: "test signer"}
 }
 
-// openUpdateService opens an agent whose updates are configured against a file
-// feed with one published release, and whose executable is a real script that
-// answers --version with the running version.
-func openUpdateService(t *testing.T, version string) (*Service, update.TrustedKey) {
+// updateHarness is an update-configured agent plus the exact files the feed
+// and artifact live in, so tests can tamper with what the installer verifies.
+type updateHarness struct {
+	service    *Service
+	executable string
+	artifact   string
+	feedPath   string
+	trusted    update.TrustedKey
+}
+
+// newUpdateHarness opens an agent whose updates are configured against a file
+// feed with one published release signed by publish, trusting exactly the
+// given keys (nil means the publisher's own). The executable is a real script
+// that answers --version with the running version.
+func newUpdateHarness(t *testing.T, version string, publish *update.Signer, trust []update.TrustedKey) *updateHarness {
 	t.Helper()
 	root := t.TempDir()
-	signer := newUpdateSigner(t)
 	executable := filepath.Join(root, "agent-bin")
 	writeFile(t, executable, agentVersionScript(version), 0o755)
-	feedPath, trusted := publishRelease(t, signer, root, "9.9.9")
+	feedPath, trusted := publishRelease(t, publish, root, "9.9.9")
+	if trust == nil {
+		trust = []update.TrustedKey{trusted}
+	}
 
 	configuration := config.DefaultAgent()
 	configuration.StateDir = filepath.Join(root, "state")
@@ -117,7 +130,7 @@ func openUpdateService(t *testing.T, version string) (*Service, update.TrustedKe
 	updates := config.DefaultUpdates()
 	updates.Enabled = true
 	updates.FeedFile = feedPath
-	updates.TrustedKeys = []update.TrustedKey{trusted}
+	updates.TrustedKeys = trust
 	updates.ExecutablePath = executable
 	configuration.Updates = updates
 
@@ -128,7 +141,29 @@ func openUpdateService(t *testing.T, version string) (*Service, update.TrustedKe
 	if service.updates == nil {
 		t.Fatal("the update manager was not built from configuration")
 	}
-	return service, trusted
+	return &updateHarness{service: service, executable: executable, artifact: filepath.Join(root, "agent-9.9.9"), feedPath: feedPath, trusted: trusted}
+}
+
+// assertExecutableUnchanged pins that no install ran: the agent binary is
+// byte-for-byte what the machine booted with.
+func assertExecutableUnchanged(t *testing.T, harness *updateHarness, version string) {
+	t.Helper()
+	content, err := os.ReadFile(harness.executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(content, agentVersionScript(version)) {
+		t.Fatal("the agent binary changed despite the install being refused")
+	}
+}
+
+// openUpdateService opens an agent whose updates are configured against a file
+// feed with one published release, and whose executable is a real script that
+// answers --version with the running version.
+func openUpdateService(t *testing.T, version string) (*Service, update.TrustedKey) {
+	t.Helper()
+	harness := newUpdateHarness(t, version, newUpdateSigner(t), nil)
+	return harness.service, harness.trusted
 }
 
 func updateRequest(t *testing.T, service *Service, method, path string, body any, uid uint32) *httptest.ResponseRecorder {
@@ -331,6 +366,18 @@ func TestUpdateGateBlocksEachKindOfInFlightWork(t *testing.T) {
 			want: "incoming transfer s1",
 		},
 		{
+			name: "held replication session is parked state, not work",
+			work: inFlightWork{
+				migrations: func() []model.Migration { return nil },
+				restores:   func() []checkpoint.RestoreRecord { return nil },
+				forks:      func() []checkpoint.ForkRecord { return nil },
+				sessions: func() []transfer.Session {
+					return []transfer.Session{{ID: "s1", WorkloadID: "w1", State: transfer.SessionHeld}}
+				},
+			},
+			want: "",
+		},
+		{
 			name: "terminal records are history",
 			work: inFlightWork{
 				migrations: func() []model.Migration {
@@ -361,4 +408,64 @@ func TestUpdateGateBlocksEachKindOfInFlightWork(t *testing.T) {
 			t.Fatalf("%s: expected %q, got %v", testCase.name, testCase.want, err)
 		}
 	}
+}
+
+// TestUpdateGateAllowsInstallWhileAReplicationIsHeld: a held replication
+// session is parked, complete, verified state — the duty record is the
+// operational truth — and it sits in HELD for its full reservation TTL. If
+// the gate treated it as in-flight, a warm standby receiving pushes more
+// often than the TTL could never self-update at all. An active push still
+// defers the install; the parked one does not.
+func TestUpdateGateAllowsInstallWhileAReplicationIsHeld(t *testing.T) {
+	service, _ := openUpdateService(t, config.Version)
+	if _, err := service.sessions.Reserve(transfer.Session{
+		ID: "session-held-1", SourceMachineID: "machine-remote", WorkloadID: "workload-remote",
+		Purpose: transfer.PurposeReplication,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.inFlightWork().busy(); err == nil {
+		t.Fatal("an incoming replication push in flight must defer an update")
+	}
+	if _, err := service.sessions.UpdateCleanup("session-held-1", "machine-remote", func(value *transfer.Session) error {
+		value.State = transfer.SessionHeld
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.inFlightWork().busy(); err != nil {
+		t.Fatalf("a held replication session must not defer updates: %v", err)
+	}
+	response := updateRequest(t, service, http.MethodPost, "/v1/updates/apply", map[string]string{"version": "9.9.9"}, uint32(os.Geteuid()))
+	if response.Code != http.StatusOK {
+		t.Fatalf("self-update must apply on a warm standby, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+// TestUpdateApplyRefusesATamperedArtifact: the signed release promises one
+// digest and the downloaded bytes must match it. A binary tampered with after
+// signing is refused even when it still runs and reports the promised
+// version — the signature's digest, not the binary's behavior, is the truth.
+func TestUpdateApplyRefusesATamperedArtifact(t *testing.T) {
+	harness := newUpdateHarness(t, config.Version, newUpdateSigner(t), nil)
+	writeFile(t, harness.artifact, append(agentVersionScript("9.9.9"), []byte("\n# tampered after signing\n")...), 0o755)
+	response := updateRequest(t, harness.service, http.MethodPost, "/v1/updates/apply", map[string]string{"version": "9.9.9"}, uint32(os.Geteuid()))
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("a tampered artifact must be refused, got %d: %s", response.Code, response.Body.String())
+	}
+	assertExecutableUnchanged(t, harness, config.Version)
+}
+
+// TestUpdateApplyRefusesAnUntrustedSignature: a release signed by a key the
+// machine does not trust is never installed — the feed is untrusted input
+// and only signatures the key ring holds vouch for a binary.
+func TestUpdateApplyRefusesAnUntrustedSignature(t *testing.T) {
+	publisher := newUpdateSigner(t)
+	_, trustedFromOtherSigner := publishRelease(t, newUpdateSigner(t), t.TempDir(), "9.9.9")
+	harness := newUpdateHarness(t, config.Version, publisher, []update.TrustedKey{trustedFromOtherSigner})
+	response := updateRequest(t, harness.service, http.MethodPost, "/v1/updates/apply", map[string]string{"version": "9.9.9"}, uint32(os.Geteuid()))
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("an untrusted signature must be refused, got %d: %s", response.Code, response.Body.String())
+	}
+	assertExecutableUnchanged(t, harness, config.Version)
 }

@@ -77,7 +77,9 @@ func (store *TokenStore) Load(controlPlaneURL string) (StoredSession, error) {
 }
 
 // Save writes the session with restrictive permissions, creating the parent
-// directory 0700 first.
+// directory 0700 first. The chmod after the write repairs a pre-existing
+// file whose mode was too open — WriteFile's 0600 only applies to files it
+// creates.
 func (store *TokenStore) Save(session StoredSession) error {
 	if err := os.MkdirAll(filepath.Dir(store.path), 0o700); err != nil {
 		return fmt.Errorf("create token store directory: %w", err)
@@ -88,6 +90,9 @@ func (store *TokenStore) Save(session StoredSession) error {
 	}
 	if err := os.WriteFile(store.path, encoded, 0o600); err != nil {
 		return fmt.Errorf("write token store: %w", err)
+	}
+	if err := os.Chmod(store.path, 0o600); err != nil {
+		return fmt.Errorf("lock down token store permissions: %w", err)
 	}
 	return nil
 }

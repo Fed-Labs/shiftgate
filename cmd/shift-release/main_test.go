@@ -49,12 +49,16 @@ func publish(t *testing.T, directory, version string) (signedPath, keysPath stri
 		t.Fatalf("keygen: %v", err)
 	}
 	// The trusted-key entry the tool prints is the one a fleet configuration
-	// carries; parse it back out of stdout.
-	start := strings.Index(output.String(), "{")
-	var entry update.TrustedKey
-	if err := json.Unmarshal([]byte(output.String()[start:]), &entry); err != nil {
+	// carries; parse the one-element array back out of stdout.
+	start := strings.Index(output.String(), "[")
+	var entries []update.TrustedKey
+	if err := json.Unmarshal([]byte(output.String()[start:]), &entries); err != nil {
 		t.Fatalf("parse trusted-key entry: %v", err)
 	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly one trusted-key entry, got %d", len(entries))
+	}
+	entry := entries[0]
 	releasePath := filepath.Join(directory, "release-"+version+".json")
 	writeJSONFile(t, releasePath, releaseDocument(version, "https://releases.example/agent-"+version))
 	signedPath = filepath.Join(directory, "signed-"+version+".json")

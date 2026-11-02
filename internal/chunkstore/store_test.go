@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -264,7 +265,11 @@ func TestNewChunksCompressWithZstd(t *testing.T) {
 	if !bytes.Equal(content, restored.Bytes()) {
 		t.Fatal("restored asset differs")
 	}
-	if _, codec, err := decompress(compress(content[:4096]), 4096); err != nil || codec != "zstd" {
+	compressed, err := compress(content[:4096])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, codec, err := decompress(compressed, 4096); err != nil || codec != "zstd" {
 		t.Fatalf("direct codec round trip: codec=%q err=%v", codec, err)
 	}
 	if _, _, err := decompress([]byte("not a compressed frame at all"), 8); err == nil {
@@ -358,5 +363,250 @@ func TestDedupAgainstLegacyGzipChunkLabelsTheRealCodec(t *testing.T) {
 	}
 	if err := store.ValidateAsset(context.Background(), "w3", result.Asset); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestMissingFlagsCorruptButRightSizeChunks: a chunk damaged at rest in a way
+// that preserves its file size must still be reported missing — size alone
+// proves nothing, and a resume that trusts it skips the chunk forever.
+func TestMissingFlagsCorruptButRightSizeChunks(t *testing.T) {
+	root := t.TempDir()
+	keys, err := securestore.Open(root + "/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(root+"/store", 64<<10, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("durable state\n"), 500)
+	result, err := store.PutAsset(context.Background(), "w1", "fs", "application/x-tar", bytes.NewReader(content), true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := result.Asset.Chunks[0]
+	path, err := store.chunkPath(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded[len(encoded)-1] ^= 0xff
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := store.Missing([]model.ChunkRef{ref})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 1 || missing[0].Address != ref.Address {
+		t.Fatalf("a right-size corrupt chunk must be missing, got %+v", missing)
+	}
+}
+
+// TestImportRepairsCorruptChunk: re-uploading a chunk whose stored copy went
+// bad repairs it in place instead of refusing to replace, so a stuck
+// transfer resumes without an operator deleting files by hand.
+func TestImportRepairsCorruptChunk(t *testing.T) {
+	sourceRoot := t.TempDir()
+	sourceKeys, err := securestore.Open(sourceRoot + "/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := Open(sourceRoot+"/store", 64<<10, sourceKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("repair me"), 1000)
+	asset, err := source.PutAsset(context.Background(), "workload", "asset", "application/octet-stream", bytes.NewReader(content), true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := asset.Asset.Chunks[0]
+	keyVersion := ref.KeyVersion
+	key, err := sourceKeys.ExportWorkloadKey("workload", keyVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationRoot := t.TempDir()
+	destinationKeys, err := securestore.Open(destinationRoot + "/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationKeys.ImportWorkloadKey("workload", keyVersion, key); err != nil {
+		t.Fatal(err)
+	}
+	destination, err := Open(destinationRoot+"/store", 64<<10, destinationKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := source.ExportChunk(ref, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	if inserted, err := destination.ImportChunkResult(context.Background(), "workload", ref, bytes.NewReader(encoded.Bytes())); err != nil || !inserted {
+		t.Fatalf("first import: inserted=%v err=%v", inserted, err)
+	}
+	path, err := destination.chunkPath(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt[len(corrupt)-1] ^= 0xff
+	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := destination.Missing([]model.ChunkRef{ref})
+	if err != nil || len(missing) != 1 {
+		t.Fatalf("corrupt chunk must be reported missing before repair: %v %+v", err, missing)
+	}
+	if _, err := destination.ImportChunkResult(context.Background(), "workload", ref, bytes.NewReader(encoded.Bytes())); err != nil {
+		t.Fatalf("re-upload must repair the corrupt chunk, got %v", err)
+	}
+	if err := destination.ValidateAsset(context.Background(), "workload", asset.Asset); err != nil {
+		t.Fatalf("repaired chunk must validate: %v", err)
+	}
+	if missing, err := destination.Missing([]model.ChunkRef{ref}); err != nil || len(missing) != 0 {
+		t.Fatalf("repaired chunk must be present again: %v %+v", err, missing)
+	}
+}
+
+// TestImportLeavesNoStagingFiles: the .import-* staging file is removed on
+// every path — success, rejected upload, and post-install verification
+// failure — because a leftover hard link would pin the chunk's disk space
+// after GC unlinks the chunk itself.
+func TestImportLeavesNoStagingFiles(t *testing.T) {
+	root := t.TempDir()
+	keys, err := securestore.Open(root + "/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(root+"/store", 64<<10, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("staged"), 1000)
+	result, err := store.PutAsset(context.Background(), "w1", "fs", "application/octet-stream", bytes.NewReader(content), true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := result.Asset.Chunks[0]
+	var encoded bytes.Buffer
+	if err := store.ExportChunk(ref, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	path, err := store.chunkPath(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	assertNoStaging := func(stage string) {
+		t.Helper()
+		found := make([]string, 0)
+		chunksRoot := filepath.Join(root, "store", "chunks")
+		_ = filepath.WalkDir(chunksRoot, func(path string, entry os.DirEntry, err error) error {
+			if err == nil && !entry.IsDir() && strings.HasPrefix(entry.Name(), ".import-") {
+				found = append(found, path)
+			}
+			return nil
+		})
+		if len(found) > 0 {
+			t.Fatalf("%s leaked staging files %v", stage, found)
+		}
+	}
+	if _, err := store.ImportChunkResult(context.Background(), "w1", ref, bytes.NewReader(encoded.Bytes()[:len(encoded.Bytes())-1])); err == nil {
+		t.Fatal("a truncated upload must be refused")
+	}
+	assertNoStaging("rejected upload")
+	if _, err := store.ImportChunkResult(context.Background(), "w1", ref, bytes.NewReader(encoded.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	assertNoStaging("successful import")
+	forged := ref
+	forged.Address = strings.Repeat("a", 64)
+	if _, err := store.ImportChunkResult(context.Background(), "w1", forged, bytes.NewReader(encoded.Bytes())); err == nil {
+		t.Fatal("a forged content address must fail post-install verification")
+	}
+	assertNoStaging("failed post-install verification")
+}
+
+// TestImportAcceptsChunksLargerThanLocalChunkSize: chunk size is per-agent
+// configuration; a destination tuned below its source must accept the
+// source's chunks up to the absolute cap instead of failing every migration
+// with "chunk plain size out of range".
+func TestImportAcceptsChunksLargerThanLocalChunkSize(t *testing.T) {
+	sourceRoot := t.TempDir()
+	sourceKeys, err := securestore.Open(sourceRoot + "/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := Open(sourceRoot+"/store", 1<<20, sourceKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("large chunk content\n"), 12000)
+	result, err := source.PutAsset(context.Background(), "workload", "asset", "application/octet-stream", bytes.NewReader(content), true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := result.Asset.Chunks[0]
+	if ref.PlainSize <= 64<<10 {
+		t.Fatalf("fixture chunk must exceed the destination chunk size, got %d", ref.PlainSize)
+	}
+	key, err := sourceKeys.ExportWorkloadKey("workload", ref.KeyVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationRoot := t.TempDir()
+	destinationKeys, err := securestore.Open(destinationRoot + "/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationKeys.ImportWorkloadKey("workload", ref.KeyVersion, key); err != nil {
+		t.Fatal(err)
+	}
+	destination, err := Open(destinationRoot+"/store", 64<<10, destinationKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := source.ExportChunk(ref, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	if inserted, err := destination.ImportChunkResult(context.Background(), "workload", ref, bytes.NewReader(encoded.Bytes())); err != nil || !inserted {
+		t.Fatalf("import across differing chunk sizes: inserted=%v err=%v", inserted, err)
+	}
+	if err := destination.ValidateAsset(context.Background(), "workload", result.Asset); err != nil {
+		t.Fatalf("cross-size chunk must validate on the destination: %v", err)
+	}
+}
+
+// TestOpenExistingRefusesToCreateAChunkStore: verification must not write
+// directories into its target — a missing store is damage to report, not a
+// blank slate to create.
+func TestOpenExistingRefusesToCreateAChunkStore(t *testing.T) {
+	root := t.TempDir()
+	keys, err := securestore.Open(root + "/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExisting(root+"/store", 64<<10, keys); err == nil {
+		t.Fatal("a missing chunk store must be refused")
+	}
+	if _, err := os.Stat(filepath.Join(root, "store")); !os.IsNotExist(err) {
+		t.Fatal("OpenExisting must not create the store root")
+	}
+	if _, err := Open(root+"/store", 64<<10, keys); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExisting(root+"/store", 64<<10, keys); err != nil {
+		t.Fatalf("an existing store must open: %v", err)
 	}
 }

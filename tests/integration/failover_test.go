@@ -5,14 +5,15 @@
 // command, and once entirely on the standby's own two-signal judgment (dead
 // peer listener plus a stale control-plane presence record).
 //
-// The operator-command scenario runs with the standard e2e gate:
+// Both scenarios run in the standard e2e lane (they match -run TestE2E):
 //
 //	SHIFT_TEST_E2E=1 go test ./tests/integration/ -run TestE2EWarmStandby -v
+//	SHIFT_TEST_E2E=1 go test ./tests/integration/ -run TestE2EAutomaticFailover -v
 //
 // The automatic scenario waits out the presence staleness bound (90s after
-// the source's last heartbeat), so it carries its own gate on top:
-//
-//	SHIFT_TEST_E2E=1 SHIFT_TEST_FAILOVER=1 go test ./tests/integration/ -run TestE2EAutomaticFailover -v
+// the source's last heartbeat) before its judgment may fire; that cost is
+// budgeted into the lane like every other scenario's, so the marketed
+// automatic path runs in CI instead of only for whoever remembers a flag.
 package integration
 
 import (
@@ -337,14 +338,18 @@ func assertFailoverOutcome(t testing.TB, standby *agentProcess, workloadID strin
 }
 
 // waitCounterResumes waits for the restored writer to append past the count
-// the dead source left — the proof the restored process is the same workload
-// continuing, not a fresh start.
+// the dead source left, then pins the proof that the restored process is
+// the same workload continuing, not a fresh start: the counter log stays
+// the unbroken 1..N sequence, so the line past the source's last carries
+// quiet+1 instead of a restarted 1. Line growth alone proves only that
+// something is writing.
 func waitCounterResumes(t testing.TB, logPath string, quiet int) {
 	t.Helper()
 	waitUntil(t, 60*time.Second, "the restored counter to make progress", func() (bool, string) {
 		lines := fileLineCount(t, logPath)
 		return lines > quiet, fmt.Sprintf("lines=%d (was %d when the source died)", lines, quiet)
 	})
+	assertCounterContinuity(t, logPath, quiet)
 }
 
 // TestE2EWarmStandbyFailover: a protected workload's source machine dies —
@@ -442,12 +447,11 @@ func TestE2EWarmStandbyFailover(t *testing.T) {
 // once it dies, and only then — dead peer listener plus a stale record, the
 // two signals — does the standby restore the workload with no operator
 // command at all. The wait is the presence staleness bound (90s) plus tick
-// and restore time, which is why this scenario carries its own gate.
+// and restore time, budgeted into the e2e lane like every other scenario —
+// the automatic path is the marketed one and must run wherever the lane
+// runs, not only where an extra flag was remembered.
 func TestE2EAutomaticFailover(t *testing.T) {
 	requireE2E(t)
-	if os.Getenv("SHIFT_TEST_FAILOVER") != "1" {
-		t.Skip("set SHIFT_TEST_FAILOVER=1 to run the automatic failover end-to-end (it waits out the 90s presence staleness bound)")
-	}
 	const (
 		fleetOrg    = "e2e-failover-org"
 		fleetAPIKey = "failover-e2e-api-key-0000000000"

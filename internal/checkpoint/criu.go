@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,10 @@ import (
 type CRIU struct {
 	binary string
 	helper string
+	// verbosity is CRIU's -vNUM log level. Large image sets at -v4 write
+	// megabytes of pass log per transaction; production runs lower and the
+	// level is raisable when a restore needs investigation.
+	verbosity int
 }
 
 type DumpOptions struct {
@@ -71,7 +76,30 @@ func NewCRIU(binary string) (*CRIU, error) {
 	if err != nil {
 		helper = ""
 	}
-	return &CRIU{binary: binary, helper: helper}, nil
+	return &CRIU{binary: binary, helper: helper, verbosity: defaultCRIUVerbosity()}, nil
+}
+
+// defaultCRIUVerbosity is the production log level (2), raisable to 4 for a
+// debugging session through SHIFT_CRIU_VERBOSITY without a rebuild.
+func defaultCRIUVerbosity() int {
+	level := 2
+	if raw := os.Getenv("SHIFT_CRIU_VERBOSITY"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 && parsed <= 4 {
+			level = parsed
+		}
+	}
+	return level
+}
+
+// SetVerbosity overrides the CRIU log level (-vNUM, 0..4).
+func (c *CRIU) SetVerbosity(level int) {
+	if level < 0 {
+		level = 0
+	}
+	if level > 4 {
+		level = 4
+	}
+	c.verbosity = level
 }
 
 // SetMountNamespaceHelper overrides the binary re-executed as the private mount
@@ -148,7 +176,7 @@ func (c *CRIU) Restore(ctx context.Context, options RestoreOptions) (int, error)
 		"--log-file", "restore.log",
 		// CRIU spells verbosity -vNUM (its long form is --verbosity=NUM);
 		// --log-level is not an option it recognizes.
-		"-v4",
+		fmt.Sprintf("-v%d", c.verbosity),
 		"--restore-detached",
 		"--pidfile", pidFile,
 	}
@@ -156,15 +184,24 @@ func (c *CRIU) Restore(ctx context.Context, options RestoreOptions) (int, error)
 	if options.LazyPages {
 		args = append(args, "--lazy-pages")
 	}
-	if err := c.runInNamespace(ctx, options.ImagesDirectory, args, options.BindMounts); err != nil {
-		return 0, err
+	runErr := c.runInNamespace(ctx, options.ImagesDirectory, args, options.BindMounts)
+	content, readErr := os.ReadFile(pidFile)
+	pid, parseErr := strconv.Atoi(strings.TrimSpace(string(content)))
+	if runErr != nil {
+		// A restore that fails after its tree detached would leave an
+		// unadopted restored process nothing ever reaps: whatever the pid
+		// file names is killed before returning, so a failed restore leaks
+		// no process tree. (The pid file lives in this restore's own fresh
+		// work directory, so anything it names is this restore's tree.)
+		if readErr == nil && parseErr == nil && pid > 1 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		return 0, runErr
 	}
-	content, err := os.ReadFile(pidFile)
-	if err != nil {
-		return 0, fmt.Errorf("read restored pid: %w", err)
+	if readErr != nil {
+		return 0, fmt.Errorf("read restored pid: %w", readErr)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(content)))
-	if err != nil || pid <= 0 {
+	if parseErr != nil || pid <= 0 {
 		return 0, errors.New("CRIU returned an invalid restored pid")
 	}
 	return pid, nil
@@ -196,7 +233,7 @@ func (c *CRIU) dumpArgs(action string, options DumpOptions) ([]string, error) {
 		"--log-file", action + ".log",
 		// CRIU spells verbosity -vNUM (its long form is --verbosity=NUM);
 		// --log-level is not an option it recognizes.
-		"-v4",
+		fmt.Sprintf("-v%d", c.verbosity),
 	}
 	args = appendFeatureArgs(args, options.TCPState, options.ShellJob, options.FileLocks, options.ExternalUNIX, options.ManageCgroups)
 	if options.ParentImages != "" {
@@ -264,9 +301,12 @@ func (c *CRIU) runInNamespace(ctx context.Context, imagesDirectory string, args 
 		command = exec.CommandContext(ctx, c.helper, shimArgs...)
 		command.SysProcAttr = &syscall.SysProcAttr{Unshareflags: syscall.CLONE_NEWNS}
 	}
+	// CRIU's combined stdout/stderr is capped: a chatty dump at high
+	// verbosity must not buffer unbounded while the checkpoint holds.
 	var output bytes.Buffer
-	command.Stdout = &output
-	command.Stderr = &output
+	capped := &limitedBuffer{buffer: &output, remaining: 1 << 20}
+	command.Stdout = capped
+	command.Stderr = capped
 	if err := command.Run(); err != nil {
 		logTail := tailFile(filepath.Join(imagesDirectory, "work", args[0]+".log"), 40)
 		return fmt.Errorf("criu %s failed: %w: %s%s", args[0], err, strings.TrimSpace(output.String()), logTail)
@@ -275,19 +315,40 @@ func (c *CRIU) runInNamespace(ctx context.Context, imagesDirectory string, args 
 }
 
 func tailFile(path string, lines int) string {
+	if lines <= 0 {
+		return ""
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return ""
 	}
 	defer func() { _ = file.Close() }()
 	values := make([]string, 0, lines)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
+	appendLine := func(line string) {
+		if len(line) > tailFileLineCap {
+			line = "..." + line[len(line)-tailFileLineCap:]
+		}
 		if len(values) == lines {
 			copy(values, values[1:])
-			values[len(values)-1] = scanner.Text()
+			values[len(values)-1] = line
 		} else {
-			values = append(values, scanner.Text())
+			values = append(values, line)
+		}
+	}
+	// ReadString, not a default-capped Scanner: CRIU logs can carry huge
+	// single lines (hex dumps), and a 64 KiB token limit aborted the scan
+	// there — silently emptying the tail exactly when diagnosis matters most.
+	reader := bufio.NewReader(file)
+	for {
+		line, readErr := reader.ReadString('\n')
+		if line != "" || readErr == nil {
+			appendLine(strings.TrimSuffix(line, "\n"))
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				appendLine("(log read error: " + readErr.Error() + ")")
+			}
+			break
 		}
 	}
 	if len(values) == 0 {
@@ -296,9 +357,42 @@ func tailFile(path string, lines int) string {
 	return "\nCRIU log:\n" + strings.Join(values, "\n")
 }
 
-func commandTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+// tailFileLineCap bounds how much of any single retained log line is copied
+// into an error message: a pathological one-liner must not balloon the
+// message even though the scan itself keeps going past it.
+const tailFileLineCap = 256 << 10
+
+// maxCommandTimeout caps even a size-scaled default: a corrupt size hint must
+// not pin a checkpoint pipeline open forever.
+const maxCommandTimeout = 24 * time.Hour
+
+// commandTimeout bounds one dump/restore pipeline, including its chunk I/O.
+// An explicit timeout is honored as given. The default scales with the bytes
+// the pipeline must move — a flat 10 minutes silently killed CRIU mid-restore
+// of huge memory images — so callers that know the checkpoint's size pass it
+// as a hint.
+func commandTimeout(parent context.Context, timeout time.Duration, sizeHints ...int64) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
-		timeout = 10 * time.Minute
+		timeout = defaultCommandTimeout(sizeHints...)
 	}
 	return context.WithTimeout(parent, timeout)
+}
+
+// defaultCommandTimeout is a 10-minute base plus 2 minutes per GiB of hinted
+// data, capped at maxCommandTimeout.
+func defaultCommandTimeout(sizeHints ...int64) time.Duration {
+	timeout := 10 * time.Minute
+	var bytes int64
+	for _, hint := range sizeHints {
+		if hint > 0 {
+			bytes += hint
+		}
+	}
+	if bytes > 0 {
+		timeout += time.Duration(bytes>>30) * 2 * time.Minute
+	}
+	if timeout > maxCommandTimeout {
+		timeout = maxCommandTimeout
+	}
+	return timeout
 }

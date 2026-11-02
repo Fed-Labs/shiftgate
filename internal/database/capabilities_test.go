@@ -5,24 +5,64 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"shift.dev/shift/internal/model"
 )
 
-// openTestStore connects to the integration database and applies migrations.
-// The whole file skips without SHIFT_TEST_DATABASE_URL: the projection and the
-// retention sweep are SQL behavior, and SQL behavior needs a real PostgreSQL.
+// openTestStore returns a Store whose database is isolated to this test: the
+// suite runs against one PostgreSQL server, packages run in parallel, and
+// schema churn (Migrate/MigrateDown) or global sweeps (retention) from one
+// test must never race another test's fixtures. The throwaway database is
+// dropped with the test. The whole file skips without
+// SHIFT_TEST_DATABASE_URL: the projection and the retention sweep are SQL
+// behavior, and SQL behavior needs a real PostgreSQL.
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	databaseURL := os.Getenv("SHIFT_TEST_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("set SHIFT_TEST_DATABASE_URL to run the PostgreSQL integration test")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	store, err := Open(ctx, databaseURL)
+	adminConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := pgxpool.NewWithConfig(ctx, adminConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	suffix, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Database names cannot be quoted as identifiers in CREATE DATABASE here,
+	// so keep to the unquoted-identifier alphabet.
+	name := "shift_test_" + strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, strings.ToLower(suffix))
+	if _, err := admin.Exec(ctx, `CREATE DATABASE `+name); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer dropCancel()
+		_, _ = admin.Exec(dropCtx, `DROP DATABASE IF EXISTS `+name+` WITH (FORCE)`)
+	})
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.ConnConfig.Database = name
+	store, err := OpenWithConfig(ctx, config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +154,7 @@ func TestMachineCapabilityProjection(t *testing.T) {
 	register("cpu-only", map[string]any{"architecture": "arm64"})
 
 	// Numbers: every machine with gpu_count, best first, and a floor at 2.
-	numbered, err := store.MachinesWithCapability(ctx, organizationID, "gpu_count", "number", nil)
+	numbered, err := store.MachinesWithCapability(ctx, organizationID, "gpu_count", "number", nil, Page{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +162,7 @@ func TestMachineCapabilityProjection(t *testing.T) {
 		t.Fatalf("numeric capability lookup returned %v", machineIDs(numbered))
 	}
 	floor := 2.0
-	numbered, err = store.MachinesWithCapability(ctx, organizationID, "gpu_count", "number", &floor)
+	numbered, err = store.MachinesWithCapability(ctx, organizationID, "gpu_count", "number", &floor, Page{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +171,7 @@ func TestMachineCapabilityProjection(t *testing.T) {
 	}
 
 	// Text: exact match.
-	textual, err := store.MachinesWithCapability(ctx, organizationID, "cuda_version", "text", nil)
+	textual, err := store.MachinesWithCapability(ctx, organizationID, "cuda_version", "text", nil, Page{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +180,7 @@ func TestMachineCapabilityProjection(t *testing.T) {
 	}
 
 	// Booleans: only the machine that reports it set.
-	flagged, err := store.MachinesWithCapability(ctx, organizationID, "supports_live_migration", "boolean", nil)
+	flagged, err := store.MachinesWithCapability(ctx, organizationID, "supports_live_migration", "boolean", nil, Page{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +189,7 @@ func TestMachineCapabilityProjection(t *testing.T) {
 	}
 
 	// Objects are not flattened: the nested document leaves no rows behind.
-	if _, err := store.MachinesWithCapability(ctx, organizationID, "nested", "text", nil); err != nil {
+	if _, err := store.MachinesWithCapability(ctx, organizationID, "nested", "text", nil, Page{}); err != nil {
 		t.Fatalf("objects must stay JSONB-only, not error: %v", err)
 	}
 
@@ -167,7 +207,7 @@ func TestMachineCapabilityProjection(t *testing.T) {
 	if heartbeatDocument["gpu_count"] != 2.0 || len(heartbeatDocument) != 1 {
 		t.Fatalf("heartbeat did not replace the document: %s", updated.Capabilities)
 	}
-	flagged, err = store.MachinesWithCapability(ctx, organizationID, "cuda_version", "text", nil)
+	flagged, err = store.MachinesWithCapability(ctx, organizationID, "cuda_version", "text", nil, Page{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +219,7 @@ func TestMachineCapabilityProjection(t *testing.T) {
 	if _, err := store.UpdateMachineHeartbeat(ctx, organizationID, "gpu-a", "", "", nil, "online"); err != nil {
 		t.Fatal(err)
 	}
-	numbered, err = store.MachinesWithCapability(ctx, organizationID, "gpu_count", "number", nil)
+	numbered, err = store.MachinesWithCapability(ctx, organizationID, "gpu_count", "number", nil, Page{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +228,7 @@ func TestMachineCapabilityProjection(t *testing.T) {
 	}
 
 	// Unknown kind is a caller error, not an empty result.
-	if _, err := store.MachinesWithCapability(ctx, organizationID, "gpu_count", "array", nil); err == nil {
+	if _, err := store.MachinesWithCapability(ctx, organizationID, "gpu_count", "array", nil, Page{}); err == nil {
 		t.Fatal("an unknown capability kind must be rejected")
 	}
 }
@@ -242,7 +282,7 @@ func TestRetentionPolicyLifecycle(t *testing.T) {
 	}
 
 	// The policy change is audited alongside its effect.
-	events, err := store.AuditEvents(ctx, organizationID, 10)
+	events, err := store.AuditEvents(ctx, organizationID, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,6 +328,17 @@ func TestEnforceRetentionSweep(t *testing.T) {
 	if _, err := store.CreateCheckpoint(ctx, CheckpointRecord{ID: checkpointID, OrganizationID: organizationID, WorkloadID: workloadID, MachineID: "sweep-machine", Kind: "full", Manifest: json.RawMessage(`{}`), StoredBytes: 1024, Status: "available"}, testAudit(organizationID, "checkpoint.create", checkpointID)); err != nil {
 		t.Fatal(err)
 	}
+	// A second, newer checkpoint for the same workload: the sweep may mark
+	// the old one but must never touch a workload's newest live checkpoint —
+	// the keep-newest guard of report 16's CRITICAL. Both age past the window
+	// below, so the guard is the only thing keeping this copy alive.
+	newCheckpointID, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateCheckpoint(ctx, CheckpointRecord{ID: newCheckpointID, OrganizationID: organizationID, WorkloadID: workloadID, MachineID: "sweep-machine", Kind: "full", Manifest: json.RawMessage(`{}`), StoredBytes: 1024, Status: "available"}, testAudit(organizationID, "checkpoint.create", newCheckpointID)); err != nil {
+		t.Fatal(err)
+	}
 	// A storage object already soft-deleted, waiting out its grace window.
 	if _, err := store.pool.Exec(ctx, `INSERT INTO storage_objects(id,organization_id,workload_id,checkpoint_id,bytes,object_count,state,deleted_at)
 		VALUES($1,$2,$3,$4,1024,1,'deleted',now())`, "storage-"+checkpointID, organizationID, workloadID, checkpointID); err != nil {
@@ -309,6 +360,11 @@ func TestEnforceRetentionSweep(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The newer checkpoint is aged past the one-day window too (36 hours), so
+	// surviving the sweep proves the keep-newest guard, not mere youth.
+	if _, err := store.pool.Exec(ctx, `UPDATE checkpoints SET created_at=now()-interval '36 hours' WHERE id=$1`, newCheckpointID); err != nil {
+		t.Fatal(err)
+	}
 	sweep, err := store.EnforceRetention(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -316,20 +372,32 @@ func TestEnforceRetentionSweep(t *testing.T) {
 	if sweep.AuditEventsDeleted == 0 {
 		t.Fatal("sweep deleted no audit rows")
 	}
-	if sweep.CheckpointsMarked == 0 {
-		t.Fatal("sweep marked no checkpoints")
+	if sweep.CheckpointsMarked != 1 {
+		t.Fatalf("sweep marked %d checkpoints, want exactly the aged non-newest one", sweep.CheckpointsMarked)
 	}
 	if sweep.StorageObjectsPurged == 0 {
 		t.Fatal("sweep purged no storage objects")
 	}
 
-	// The checkpoint row survives, marked; the storage object row is gone.
-	checkpoints, err := store.Checkpoints(ctx, organizationID, workloadID)
+	// The old checkpoint row survives, marked; the workload's newest
+	// checkpoint is untouched (the keep-newest guard); the storage object
+	// row is gone.
+	checkpoints, err := store.Checkpoints(ctx, organizationID, workloadID, Page{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(checkpoints) != 1 || checkpoints[0].Status != "deleted" || checkpoints[0].DeletedAt == nil {
-		t.Fatalf("checkpoint not marked deleted: %+v", checkpoints)
+	if len(checkpoints) != 2 {
+		t.Fatalf("expected both checkpoint rows to stay for lineage, got %+v", checkpoints)
+	}
+	byID := make(map[string]CheckpointRecord, len(checkpoints))
+	for _, record := range checkpoints {
+		byID[record.ID] = record
+	}
+	if old := byID[checkpointID]; old.Status != "deleted" || old.DeletedAt == nil {
+		t.Fatalf("aged checkpoint not marked deleted: %+v", old)
+	}
+	if newest := byID[newCheckpointID]; newest.Status != "available" || newest.DeletedAt != nil {
+		t.Fatalf("retention deleted the workload's newest checkpoint: %+v", newest)
 	}
 	var remaining int
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM storage_objects WHERE organization_id=$1`, organizationID).Scan(&remaining); err != nil {

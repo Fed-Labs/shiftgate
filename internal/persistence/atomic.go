@@ -9,6 +9,20 @@ import (
 	"path/filepath"
 )
 
+// CheckPrivateFileMode refuses configuration files readable by group or
+// other. Config files carry peppers and API keys; a world-readable one leaks
+// them silently to every local account, so loading fails closed instead.
+func CheckPrivateFileMode(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return fmt.Errorf("config file %s has mode %04o; it must not be readable by group or other (chmod 600)", path, mode)
+	}
+	return nil
+}
+
 func ReadJSON(path string, target any) error {
 	file, err := os.Open(path)
 	if err != nil {

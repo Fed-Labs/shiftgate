@@ -148,6 +148,23 @@ func (store *Store) UpsertComputeOffer(ctx context.Context, record ComputeOfferR
 	record.AgentURL = agentURL
 	record.Capabilities = jsonOrDefault(capabilities, "{}")
 	record.LastSeenAt = lastSeenAt
+	// Empty enum fields fail the CHECK constraints instead of defaulting;
+	// normalize to the schema defaults so a sparse record inserts cleanly.
+	if record.Visibility == "" {
+		record.Visibility = "organization"
+	}
+	if record.Status == "" {
+		record.Status = "offline"
+	}
+	if record.Trust == "" {
+		record.Trust = "unverified"
+	}
+	record.Exposed = jsonOrDefault(record.Exposed, "{}")
+	record.Pricing = jsonOrDefault(record.Pricing, "{}")
+	record.Geography = jsonOrDefault(record.Geography, "{}")
+	record.Policy = jsonOrDefault(record.Policy, "{}")
+	record.Availability = jsonOrDefault(record.Availability, "{}")
+	record.Latency = jsonOrDefault(record.Latency, "[]")
 	stored, err := scanComputeOffer(tx.QueryRow(ctx, `INSERT INTO compute_offers(id,organization_id,machine_id,machine_name,
 		agent_url,visibility,status,trust,identity_verified,region,country,exposed,pricing,geography,policy,availability,
 		capabilities,latency,last_seen_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
@@ -176,29 +193,32 @@ func (store *Store) UpsertComputeOffer(ctx context.Context, record ComputeOfferR
 	return stored, nil
 }
 
-// ComputeOffers returns every offer this organization has published, withdrawn
-// ones included, so operators can see the whole history of what they exposed.
-func (store *Store) ComputeOffers(ctx context.Context, organizationID string) ([]ComputeOfferRecord, error) {
+// ComputeOffers returns one page of the offers this organization has
+// published, withdrawn ones included, so operators can see the whole history
+// of what they exposed.
+func (store *Store) ComputeOffers(ctx context.Context, organizationID string, page Page) ([]ComputeOfferRecord, error) {
 	rows, err := store.pool.Query(ctx, `SELECT `+computeOfferColumns+` FROM compute_offers
-		WHERE organization_id=$1 ORDER BY created_at`, organizationID)
+		WHERE organization_id=$1 ORDER BY created_at`+page.clause(), organizationID)
 	if err != nil {
 		return nil, err
 	}
 	return collectComputeOffers(rows)
 }
 
-// SchedulableComputeOffers returns the inventory one organization is allowed to
-// see: its own machines, partner offers that name it explicitly, and — only when
-// an operator has opened public trading — the public marketplace. Deny lists and
-// every other constraint are enforced by the scheduler, which remains the single
-// source of placement truth; this query only narrows visibility.
-func (store *Store) SchedulableComputeOffers(ctx context.Context, organizationID string, includePublic bool) ([]ComputeOfferRecord, error) {
+// SchedulableComputeOffers returns one page of the inventory one organization
+// is allowed to see: its own machines, partner offers that name it explicitly,
+// and — only when an operator has opened public trading — the public
+// marketplace. Deny lists and every other constraint are enforced by the
+// scheduler, which remains the single source of placement truth; this query
+// only narrows visibility. Callers that need the whole inventory page through
+// it (see the control plane's schedulableOffers).
+func (store *Store) SchedulableComputeOffers(ctx context.Context, organizationID string, includePublic bool, page Page) ([]ComputeOfferRecord, error) {
 	rows, err := store.pool.Query(ctx, `SELECT `+computeOfferColumns+` FROM compute_offers
 		WHERE withdrawn_at IS NULL AND status<>'withdrawn' AND (
 			organization_id=$1
 			OR (visibility='organization' AND COALESCE(policy->'allowed_organizations','[]'::jsonb) @> to_jsonb($1::text))
 			OR ($2::boolean AND visibility='public')
-		) ORDER BY created_at`, organizationID, includePublic)
+		) ORDER BY created_at`+page.clause(), organizationID, includePublic)
 	if err != nil {
 		return nil, err
 	}
@@ -245,9 +265,10 @@ func (store *Store) ExpireComputeReservations(ctx context.Context, now time.Time
 
 // ComputeReservations lists an organization's reservations, newest first. An
 // empty offerID returns every offer's reservations.
-func (store *Store) ComputeReservations(ctx context.Context, organizationID, offerID string) ([]ComputeReservationRecord, error) {
-	rows, err := store.pool.Query(ctx, `SELECT `+computeReservationColumns+` FROM compute_reservations
-		WHERE organization_id=$1 AND ($2='' OR offer_id=$2) ORDER BY created_at DESC`, organizationID, offerID)
+func (store *Store) ComputeReservations(ctx context.Context, organizationID, offerID string, page Page) ([]ComputeReservationRecord, error) {
+	query := `SELECT ` + computeReservationColumns + ` FROM compute_reservations
+		WHERE organization_id=$1 AND ($2='' OR offer_id=$2) ORDER BY created_at DESC` + page.clause()
+	rows, err := store.pool.Query(ctx, query, organizationID, offerID)
 	if err != nil {
 		return nil, err
 	}

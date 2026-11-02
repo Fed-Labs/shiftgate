@@ -61,6 +61,9 @@ func run() error {
 	flag.BoolVar(&showVersion, "version", false, "print version")
 	flag.BoolVar(&printDefault, "print-default-config", false, "print default JSON configuration")
 	flag.Parse()
+	if flag.NArg() > 0 {
+		return fmt.Errorf("unexpected argument %q (shift-agent takes flags only)", flag.Arg(0))
+	}
 	if showVersion {
 		fmt.Println("shift-agent", config.Version)
 		return nil
@@ -109,5 +112,12 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// After the first signal, restore the default disposition so a second
+	// Ctrl+C/kill force-quits a wedged shutdown instead of being swallowed
+	// until an operator escalates to SIGKILL.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	return service.Run(ctx)
 }

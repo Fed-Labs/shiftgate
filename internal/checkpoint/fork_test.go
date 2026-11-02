@@ -2,6 +2,8 @@ package checkpoint
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -109,6 +111,11 @@ func newForkFixture(t *testing.T, engine Engine) forkFixture {
 		t.Fatal(err)
 	}
 	service := NewService(stateRoot, runtimeManager, machine, linuxplatform.NewInventory(machine.Machine.ID), chunks, repository, engine, logger)
+	// Test roots live under the OS temp directory, which production policy
+	// denies outright; the explicit operator override is what admits them.
+	if err := service.SetRestorePolicy(RestorePolicy{AllowRootWorkload: true, AllowSystemTreeTargets: []string{os.TempDir()}}); err != nil {
+		t.Fatal(err)
+	}
 	// The agent always attaches a network coordinator; a fork of the
 	// port-declaring source below needs it to reserve the fork's ports.
 	service.SetNetwork(network.NewCoordinator(logger))
@@ -408,6 +415,9 @@ func TestForkSpecificationRebasesPathsAndIncrementsGeneration(t *testing.T) {
 	if spec.RootPath != "/srv/app-fork" || spec.WorkingDir != "/srv/app-fork/work" {
 		t.Fatalf("paths were not rebased: %+v", spec)
 	}
+	if len(spec.Command) != 1 || spec.Command[0] != "/srv/app-fork/run.sh" {
+		t.Fatalf("command was not rebased onto the fork root: %v", spec.Command)
+	}
 	if len(spec.Paths) != 2 || spec.Paths[0].Path != "/srv/app-fork" || spec.Paths[1].Path != "/srv/app-fork/data" {
 		t.Fatalf("path specs were not rebased: %+v", spec.Paths)
 	}
@@ -438,5 +448,360 @@ func TestRebasePathRejectsPathsOutsideTheSourceRoot(t *testing.T) {
 	}
 	if _, err := rebasePath("/srv/app", "/srv/app-fork", "/etc/passwd"); err == nil {
 		t.Fatal("a path outside the source root must not be rebased")
+	}
+}
+
+func TestForkSpecificationKeepsHostLevelCommands(t *testing.T) {
+	source := model.WorkloadSpec{
+		ID: "source-id", Name: "source",
+		Command:  []string{"python3", "/srv/app/writer.py", "/usr/bin/env", "--config=/srv/app/cfg", "relative.txt"},
+		RootPath: "/srv/app", WorkingDir: "/srv/app", UID: os.Geteuid(), GID: os.Getegid(),
+	}
+	spec, err := forkSpecification(source, "fork-id", "fork", "/srv/app-fork", "0123456789abcdef", "checkpoint-7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"python3", "/srv/app-fork/writer.py", "/usr/bin/env", "--config=/srv/app/cfg", "relative.txt"}
+	if len(spec.Command) != len(want) {
+		t.Fatalf("command: %v, want %v", spec.Command, want)
+	}
+	for index := range want {
+		if spec.Command[index] != want[index] {
+			t.Fatalf("command element %d is %q, want %q", index, spec.Command[index], want[index])
+		}
+	}
+}
+
+// writeScriptAtomic replaces a script file the way an editor would: a rename,
+// never a truncate-in-place. Overwriting a script a running shell is still
+// reading truncates the file under the shell and either kills its loop or
+// makes it re-read the new content mid-run.
+func writeScriptAtomic(t *testing.T, path, content string) {
+	t.Helper()
+	temp := path + ".new"
+	if err := os.WriteFile(temp, []byte(content), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(temp, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// waitScriptStarted blocks until the workload's shell has its script open.
+// The shell opens the script path shortly after the process is spawned, so a
+// rename that replaces the script earlier can be picked up by the workload
+// itself instead of the restart under test.
+func waitScriptStarted(t *testing.T, pid int, script string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid)); err == nil {
+			for _, entry := range entries {
+				if target, linkErr := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, entry.Name())); linkErr == nil && target == script {
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("workload %d never opened its script %s", pid, script)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestForkCommandRebasedRestartRunsForkRootFile is the independence
+// regression: after a stop→start the fork must execute its own root's file,
+// never the source tree's — even when the source's file is edited afterwards.
+func TestForkCommandRebasedRestartRunsForkRootFile(t *testing.T) {
+	fixture := newForkFixture(t, fakeEngine{})
+	marker := "#!/bin/sh\nrm -f \"$PWD/ran.txt\"\necho \"$0\" > \"$PWD/ran.txt\"\nwhile true; do sleep 1; done\n"
+	waitScriptStarted(t, fixture.source.Process.PID, filepath.Join(fixture.rootPath, "run.sh"))
+	writeScriptAtomic(t, filepath.Join(fixture.rootPath, "run.sh"), marker)
+	record, err := fixture.forker.Fork(context.Background(), fixture.source.Spec.ID, ForkOptions{Name: "fork-restart"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = fixture.runtime.Stop(record.ForkWorkloadID, time.Second)
+		_ = fixture.runtime.Delete(record.ForkWorkloadID)
+	})
+	// Poison the source's script after the fork: the fork must not notice.
+	writeScriptAtomic(t, filepath.Join(fixture.rootPath, "run.sh"), "#!/bin/sh\necho SOURCE-RAN > \"$PWD/ran.txt\"\nwhile true; do sleep 1; done\n")
+	forked, err := fixture.runtime.Get(record.ForkWorkloadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCommand := filepath.Join(record.RootPath, "run.sh")
+	if len(forked.Spec.Command) == 0 || forked.Spec.Command[0] != wantCommand {
+		t.Fatalf("fork command was not rebased onto the fork root: %v, want %q", forked.Spec.Command, wantCommand)
+	}
+	if _, err := fixture.runtime.Start(record.ForkWorkloadID); err != nil {
+		t.Fatalf("restart the fork: %v", err)
+	}
+	t.Cleanup(func() { _, _ = fixture.runtime.Stop(record.ForkWorkloadID, time.Second) })
+	ranPath := filepath.Join(record.RootPath, "data", "ran.txt")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if content, readErr := os.ReadFile(ranPath); readErr == nil {
+			got := strings.TrimSpace(string(content))
+			if got == "" {
+				// The writer truncates then writes; an empty read is a
+				// not-yet, not an answer.
+				if time.Now().After(deadline) {
+					t.Fatal("the fork never executed its command")
+				}
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			if got != wantCommand {
+				t.Fatalf("fork executed %q, want its own root's file %q", got, wantCommand)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the fork never executed its command")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if content, statErr := os.ReadFile(filepath.Join(fixture.rootPath, "data", "ran.txt")); statErr == nil {
+		t.Fatalf("the restart wrote into the source root: %q", string(content))
+	}
+}
+
+// TestForkActivateFailsEarlyOnLivePortConflict pins the documented contract:
+// forking a port-publishing workload beside the still-running original fails
+// with an explicit port-conflict error before anything is copied — never
+// after the full extraction and capture, and never inside the CRIU restore.
+func TestForkActivateFailsEarlyOnLivePortConflict(t *testing.T) {
+	fixture := newForkFixture(t, &activatingEngine{})
+	sourceMappings, err := network.MappingsFor(fixture.source.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The running source's published claim, exactly as the agent holds it.
+	if err := fixture.service.network.Prepare(fixture.source.Spec.ID, sourceMappings); err != nil {
+		t.Fatal(err)
+	}
+	record, err := fixture.forker.Fork(context.Background(), fixture.source.Spec.ID, ForkOptions{Name: "fork-conflict", Activate: true})
+	if err == nil {
+		t.Fatal("forking beside the live published source must fail")
+	}
+	if !strings.Contains(err.Error(), "port conflict") || !strings.Contains(err.Error(), "18080") {
+		t.Fatalf("the failure must name the conflicting port explicitly, got: %v", err)
+	}
+	if record.ID != "" {
+		t.Fatalf("the refusal must happen before any fork state is created: %+v", record)
+	}
+	matches, globErr := filepath.Glob(fixture.rootPath + "-fork-*")
+	if globErr != nil {
+		t.Fatal(globErr)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("nothing may be copied before the conflict error, found: %v", matches)
+	}
+	if _, statErr := os.Stat(filepath.Join(fixture.service.stateDir, "forks")); statErr == nil {
+		t.Fatal("no fork images may be extracted before the conflict error")
+	}
+}
+
+// TestForkActivateClaimsSourcePublishedPorts proves the reservation is taken
+// at the published host port with the container port recorded — not at the
+// container port alone, which conflicts with nothing when host != container.
+func TestForkActivateClaimsSourcePublishedPorts(t *testing.T) {
+	fixture := newForkFixture(t, &activatingEngine{})
+	record, err := fixture.forker.Fork(context.Background(), fixture.source.Spec.ID, ForkOptions{Name: "fork-claims", Activate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = fixture.runtime.Stop(record.ForkWorkloadID, time.Second)
+		_ = fixture.runtime.Delete(record.ForkWorkloadID)
+	})
+	if err := fixture.service.network.Prepare("intruder", []model.PortMapping{{Protocol: "tcp", ContainerPort: 8080, HostPort: 8080}}); err == nil {
+		t.Fatal("the fork's own listener port must be claimed")
+	}
+	if err := fixture.service.network.Prepare("intruder", []model.PortMapping{{Protocol: "tcp", ContainerPort: 8080, HostPort: 18080}}); err == nil {
+		t.Fatal("the source's published host port must be claimed beside the fork's own")
+	}
+	// Releasing the fork gives the ports back — the claim never leaks.
+	fixture.service.network.Deactivate(record.ForkWorkloadID, 0)
+	if err := fixture.service.network.Prepare("intruder", []model.PortMapping{{Protocol: "tcp", ContainerPort: 8080, HostPort: 18080}}); err != nil {
+		t.Fatalf("released ports must be claimable again: %v", err)
+	}
+	fixture.service.network.Deactivate("intruder", 0)
+}
+
+// rejectingEngine fails every restore, so the fork is rolled back after the
+// port claim was taken — the claim must roll back with it.
+type rejectingEngine struct{ fakeEngine }
+
+func (rejectingEngine) Restore(context.Context, RestoreOptions) (int, error) {
+	return 0, errors.New("injected restore failure")
+}
+
+func TestForkRollbackReleasesPortClaim(t *testing.T) {
+	fixture := newForkFixture(t, rejectingEngine{})
+	record, err := fixture.forker.Fork(context.Background(), fixture.source.Spec.ID, ForkOptions{Name: "fork-doomed-ports", Activate: true})
+	if err == nil {
+		t.Fatal("the injected restore failure must fail the fork")
+	}
+	if record.State != ForkRolledBack {
+		t.Fatalf("fork state %s, want %s", record.State, ForkRolledBack)
+	}
+	if err := fixture.service.network.Prepare("intruder", []model.PortMapping{{Protocol: "tcp", ContainerPort: 8080, HostPort: 18080}}); err != nil {
+		t.Fatalf("a rolled-back fork must not keep the source's published port: %v", err)
+	}
+	fixture.service.network.Deactivate("intruder", 0)
+	if err := fixture.service.network.Prepare("intruder", []model.PortMapping{{Protocol: "tcp", ContainerPort: 8080, HostPort: 8080}}); err != nil {
+		t.Fatalf("a rolled-back fork must not keep its own port: %v", err)
+	}
+	fixture.service.network.Deactivate("intruder", 0)
+	if _, loadErr := fixture.repo.Load(record.ForkCheckpointID); loadErr == nil {
+		t.Fatal("the rolled-back fork's checkpoint must be gone")
+	}
+}
+
+// TestForkRecoverReversesCrashWindowRecord is the crash-window regression: a
+// fork that died mid-materialize left the workload record and the fork
+// checkpoint on disk, and recovery must remove exactly those — the record
+// names them because materialize persists each mutation the moment it
+// happens, not at the next state change after the heavy capture and mirror.
+func TestForkRecoverReversesCrashWindowRecord(t *testing.T) {
+	fixture := newForkFixture(t, fakeEngine{})
+	point, err := fixture.service.Create(context.Background(), fixture.source.Spec.ID, CreateOptions{Timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanRoot := filepath.Join(t.TempDir(), "crash-root")
+	if err := os.MkdirAll(orphanRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := fixture.runtime.Create(model.WorkloadSpec{
+		Name: "crash-fork", Command: []string{"/bin/sh", "-c", "while true; do sleep 1; done"},
+		RootPath: orphanRoot, UID: os.Geteuid(), GID: os.Getegid(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fork's own checkpoint, saved under the fork's key namespace the way
+	// captureFork saves it before the crash.
+	forkManifest := point
+	forkCheckpointID, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	forkManifest.ID = forkCheckpointID
+	forkManifest.Workload = orphan.Spec
+	if err := SignManifest(&forkManifest, fixture.service.identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repo.Save(forkManifest); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	// Exactly what materialize persists between PrepareRestore and the
+	// MATERIALIZED transition when the agent dies mid-capture.
+	forged := ForkRecord{
+		ID: "crash-fork-record", SourceWorkloadID: fixture.source.Spec.ID, SourceCheckpointID: point.ID,
+		SourceRootPath: fixture.rootPath, ForkWorkloadID: orphan.Spec.ID, ForkName: "crash-fork",
+		State: ForkPreparing, RootPath: orphanRoot, StagingRoot: filepath.Join(t.TempDir(), "crash-staging"),
+		ImagesDirectory:  filepath.Join(t.TempDir(), "crash-images"),
+		ForkCheckpointID: forkManifest.ID, CreatedWorkload: true,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := fixture.forker.records.Put(forged.ID, forged); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.forker.Recover(context.Background()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	rolled, err := fixture.forker.Get(forged.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rolled.State != ForkRolledBack {
+		t.Fatalf("crash-window fork state %s, want %s", rolled.State, ForkRolledBack)
+	}
+	if _, getErr := fixture.runtime.Get(orphan.Spec.ID); getErr == nil {
+		t.Fatal("the crash-window fork workload survived recovery")
+	}
+	if _, statErr := os.Stat(orphanRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("the crash-window fork root survived recovery: %v", statErr)
+	}
+	if _, loadErr := fixture.repo.Load(forkManifest.ID); loadErr == nil {
+		t.Fatal("the crash-window fork checkpoint survived recovery")
+	}
+	if _, loadErr := fixture.repo.Load(point.ID); loadErr != nil {
+		t.Fatalf("recovery removed the source checkpoint: %v", loadErr)
+	}
+}
+
+// TestForkRecoversEveryRecordDespiteRollbackError pins the startup contract:
+// one stuck rollback must not strand every later interrupted fork or block
+// the agent from booting — all records are attempted and the failures are
+// collected.
+func TestForkRecoversEveryRecordDespiteRollbackError(t *testing.T) {
+	fixture := newForkFixture(t, fakeEngine{})
+	committed, err := fixture.forker.Fork(context.Background(), fixture.source.Spec.ID, ForkOptions{Name: "fork-safe"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fixture.runtime.Delete(committed.ForkWorkloadID) })
+
+	stuckRoot := filepath.Join(t.TempDir(), "stuck-root")
+	if err := os.MkdirAll(stuckRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	stuck := ForkRecord{
+		ID: "stuck-fork", SourceWorkloadID: fixture.source.Spec.ID, SourceCheckpointID: committed.SourceCheckpointID,
+		SourceRootPath: fixture.rootPath, ForkWorkloadID: "ghost-workload", ForkName: "stuck",
+		State: ForkMaterialized, RootPath: stuckRoot, StagingRoot: filepath.Join(t.TempDir(), "stuck-staging"),
+		ImagesDirectory: filepath.Join(t.TempDir(), "stuck-images"),
+		// The rollback's repository.Delete fails on a checkpoint that never
+		// existed — a deterministic rollback failure on any uid.
+		ForkCheckpointID: "missing-checkpoint",
+		CreatedAt:        now, UpdatedAt: now,
+	}
+	if err := fixture.forker.records.Put(stuck.ID, stuck); err != nil {
+		t.Fatal(err)
+	}
+	orphanRoot := filepath.Join(t.TempDir(), "orphan-root")
+	if err := os.MkdirAll(orphanRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := ForkRecord{
+		ID: "orphan-fork", SourceWorkloadID: fixture.source.Spec.ID, SourceCheckpointID: committed.SourceCheckpointID,
+		SourceRootPath: fixture.rootPath, ForkWorkloadID: "ghost-workload-2", ForkName: "orphan",
+		State: ForkPreparing, RootPath: orphanRoot, StagingRoot: filepath.Join(t.TempDir(), "orphan-staging"),
+		ImagesDirectory: filepath.Join(t.TempDir(), "orphan-images"),
+		CreatedAt:       now, UpdatedAt: now,
+	}
+	if err := fixture.forker.records.Put(orphan.ID, orphan); err != nil {
+		t.Fatal(err)
+	}
+	recoverErr := fixture.forker.Recover(context.Background())
+	if recoverErr == nil {
+		t.Fatal("the stuck rollback must be reported")
+	}
+	if !strings.Contains(recoverErr.Error(), stuck.ID) {
+		t.Fatalf("the aggregate must name the record that failed: %v", recoverErr)
+	}
+	rolled, err := fixture.forker.Get(orphan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rolled.State != ForkRolledBack {
+		t.Fatalf("the later interrupted fork was stranded by the stuck one: %s", rolled.State)
+	}
+	if _, statErr := os.Stat(orphanRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("the later fork root survived recovery: %v", statErr)
+	}
+	if safe, getErr := fixture.forker.Get(committed.ID); getErr != nil || safe.State != ForkCommitted {
+		t.Fatalf("the committed fork was disturbed by recovery: %+v %v", safe, getErr)
+	}
+	// Recovery problems never fail OpenForker — the agent boots either way.
+	if opened, openErr := OpenForker(fixture.service); openErr != nil || opened == nil {
+		t.Fatalf("fork recovery problems must not block startup: %v", openErr)
 	}
 }

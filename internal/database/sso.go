@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -173,16 +174,57 @@ func (store *Store) federateByEmail(ctx context.Context, tx pgx.Tx, issuer, subj
 
 // ensureSSOMemberships adds the user to every SSO-enforcing organization
 // whose email domain matches, as a viewer. Existing memberships — of any
-// role — are left exactly as they are.
+// role — are left exactly as they are. Auto-join grows membership exactly
+// like an invite or a SCIM provision does, so it runs the same seat gate:
+// organizations whose ceiling is reached are skipped, never over-admitted.
 func ensureSSOMemberships(ctx context.Context, tx pgx.Tx, user UserRecord) error {
 	domain := EmailDomain(user.Email)
 	if domain == "" {
 		return nil
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO organization_members(organization_id,user_id,role,created_at)
-		SELECT o.id,$1,'viewer',now() FROM organizations o
-		WHERE o.sso_enforced AND lower(o.sso_email_domain)=$2
-		  AND NOT EXISTS(SELECT 1 FROM organization_members m WHERE m.organization_id=o.id AND m.user_id=$1)
-		ON CONFLICT DO NOTHING`, user.ID, domain)
-	return err
+	rows, err := tx.Query(ctx, `SELECT o.id FROM organizations o
+		WHERE o.sso_enforced AND lower(o.sso_email_domain)=$1
+		  AND NOT EXISTS(SELECT 1 FROM organization_members m WHERE m.organization_id=o.id AND m.user_id=$2)`, domain, user.ID)
+	if err != nil {
+		return err
+	}
+	var organizationIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		organizationIDs = append(organizationIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// Deterministic lock order: concurrent logins must take the seat-gate
+	// locks in the same order or they can deadlock on each other.
+	sort.Strings(organizationIDs)
+	for _, organizationID := range organizationIDs {
+		if err := lockSeatGate(ctx, tx, organizationID); err != nil {
+			return err
+		}
+		ceiling, err := seatCeilingFor(ctx, tx, organizationID)
+		if err != nil {
+			return err
+		}
+		if ceiling > 0 {
+			var members int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM organization_members m JOIN users u ON u.id = m.user_id WHERE m.organization_id=$1 AND u.disabled_at IS NULL`, organizationID).Scan(&members); err != nil {
+				return err
+			}
+			if members+1 > ceiling {
+				continue
+			}
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO organization_members(organization_id,user_id,role,created_at) VALUES($1,$2,'viewer',now())
+			ON CONFLICT (organization_id,user_id) DO NOTHING`, organizationID, user.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -7,14 +7,37 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"shift.dev/shift/internal/agentclient"
 	"shift.dev/shift/internal/model"
 )
+
+// integrityErrorMessage reports whether a restore failure names the chunk
+// authentication/integrity fault a corrupted chunk must cause — the digest,
+// AEAD, size, or content-address checks in the chunk reader — as opposed to
+// some unrelated reason a restore can fail for.
+func integrityErrorMessage(message string) bool {
+	for _, marker := range []string{
+		"ciphertext digest mismatch",
+		"plaintext digest mismatch",
+		"content address mismatch",
+		"message authentication failed",
+		"chunk header does not match manifest",
+		"invalid encoded chunk size",
+		"chunk stored size out of range",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // TestE2ECheckpointCorruptionDetected: checkpoint a workload, flip bytes in
 // an encrypted chunk on disk, and verify restore refuses to proceed.
@@ -57,10 +80,19 @@ func TestE2ECheckpointCorruptionDetected(t *testing.T) {
 	t.Logf("corrupted chunk %s", corrupted)
 
 	// Restore over corrupted state: it must fail, with the failure visible
-	// to the caller — not a hang, not a silent success.
+	// to the caller and naming the chunk authentication/integrity fault the
+	// corruption causes. A restore that failed for an unrelated reason
+	// (timeout, missing dependency) must not pass for detection.
 	_, restoreErr := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 120})
 	if restoreErr == nil {
 		t.Fatal("restore succeeded over corrupted state; corruption went undetected")
+	}
+	var api *agentclient.APIError
+	if !errors.As(restoreErr, &api) || api.Code != "RESTORE_FAILED" {
+		t.Fatalf("restore failed with %v, want the RESTORE_FAILED API error carrying the corruption detail", restoreErr)
+	}
+	if !integrityErrorMessage(api.Message) {
+		t.Fatalf("restore error %q does not identify chunk authentication/integrity; some other fault is being reported as detection", api.Message)
 	}
 	t.Logf("restore failed as required: %v", restoreErr)
 

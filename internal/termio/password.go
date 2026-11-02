@@ -19,27 +19,40 @@ import (
 // not echoed and a newline is emitted afterwards so the next prompt starts on
 // a fresh line; when it is not a terminal the line is read as-is.
 func ReadPassword(file *os.File) (string, error) {
+	return ReadPasswordFrom(bufio.NewReader(file), file, os.Stderr)
+}
+
+// ReadPasswordFrom reads one password line from a reader shared with earlier
+// prompts. A piped login loses its password when the email prompt's buffered
+// reader over-reads the pipe and the password read starts on an exhausted
+// stream — so every prompt on one input must read through one reader. The
+// post-prompt newline goes to output (stderr for a CLI), never back into the
+// input file: writing to stdin only works by accident on ttys and silently
+// vanishes on pipes and files.
+func ReadPasswordFrom(reader *bufio.Reader, file *os.File, output io.Writer) (string, error) {
 	var state syscall.Termios
 	if err := ioctlTermios(file.Fd(), syscall.TCGETS, &state); err != nil {
 		// ENOTTY and friends: a pipe or a redirection. Read plainly — the
 		// caller chose non-interactive input.
-		return readLine(file)
+		return readLine(reader)
 	}
 	saved := state
 	state.Lflag &^= syscall.ECHO
 	if err := ioctlTermios(file.Fd(), syscall.TCSETS, &state); err != nil {
 		return "", err
 	}
-	line, readErr := readLine(file)
+	line, readErr := readLine(reader)
 	// Restore the terminal whatever the read did; a broken prompt on exit is
 	// worse than a lost error here.
 	_ = ioctlTermios(file.Fd(), syscall.TCSETS, &saved)
-	_, _ = fmt.Fprintln(file)
+	if output != nil {
+		_, _ = fmt.Fprintln(output)
+	}
 	return line, readErr
 }
 
-func readLine(file *os.File) (string, error) {
-	line, err := bufio.NewReader(file).ReadString('\n')
+func readLine(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadString('\n')
 	if err != nil && err != io.EOF {
 		return "", err
 	}

@@ -271,7 +271,10 @@ func (provider *Provider) checkClaims(claims Claims, expectedNonce string) (Clai
 	if claims.IssuedAt > now.Add(5*time.Minute).Unix() {
 		return Claims{}, errors.New("ID token was issued in the future")
 	}
-	if expectedNonce != "" && claims.Nonce != expectedNonce {
+	if expectedNonce == "" {
+		return Claims{}, errors.New("no expected nonce was supplied for this authorization request")
+	}
+	if claims.Nonce != expectedNonce {
 		return Claims{}, errors.New("ID-token nonce does not match this authorization request")
 	}
 	if claims.Subject == "" {

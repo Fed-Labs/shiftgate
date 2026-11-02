@@ -34,19 +34,28 @@ func (channel Channel) Valid() bool {
 
 // Component names what an artifact replaces. The agent and the desktop
 // application update independently: a desktop release must never be installed
-// over an agent, so the component is part of what is signed.
+// over an agent, so the component is part of what is signed. The tool
+// components (control plane, GC, state verifier, relay) are shipped in the
+// same release tarball and are recorded so the release document binds a
+// digest to every binary a release ships; nothing self-updates them today.
 type Component string
 
 const (
 	ComponentAgent   Component = "agent"
 	ComponentDesktop Component = "desktop"
 	ComponentCLI     Component = "cli"
+	// Tool components: signed and digest-bound, not self-updatable.
+	ComponentControl Component = "control"
+	ComponentGC      Component = "gc"
+	ComponentVerify  Component = "verify"
+	ComponentRelay   Component = "relay"
 )
 
 // Valid reports whether the component is one this implementation knows.
 func (component Component) Valid() bool {
 	switch component {
-	case ComponentAgent, ComponentDesktop, ComponentCLI:
+	case ComponentAgent, ComponentDesktop, ComponentCLI,
+		ComponentControl, ComponentGC, ComponentVerify, ComponentRelay:
 		return true
 	default:
 		return false

@@ -27,8 +27,10 @@ var reservationTransitions = map[ReservationState]map[ReservationState]bool{
 }
 
 // CanTransitionReservation reports whether a reservation state change is legal.
-// Released and expired are terminal: capacity that was handed back is never
-// silently taken again under the same reservation id.
+// Released and expired are terminal holds: capacity that was handed back is
+// never silently taken again under the same reservation id. A failed
+// reservation may still be explicitly released for bookkeeping, but it no
+// longer holds capacity the moment it fails.
 func CanTransitionReservation(from, to ReservationState) bool {
 	return reservationTransitions[from][to]
 }
@@ -42,9 +44,11 @@ func (state ReservationState) Valid() bool {
 	}
 }
 
-// Terminal reports whether the reservation no longer holds capacity.
+// Terminal reports whether the reservation no longer holds capacity. A FAILED
+// reservation is a dead hold: keeping its capacity committed until expiry
+// would pin an offer's resources to work that will never run.
 func (state ReservationState) Terminal() bool {
-	return state == ReservationReleased || state == ReservationExpired
+	return state == ReservationReleased || state == ReservationExpired || state == ReservationFailed
 }
 
 // Reservation is capacity held on one offer for one workload.

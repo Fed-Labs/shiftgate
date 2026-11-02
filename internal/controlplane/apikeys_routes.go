@@ -11,9 +11,9 @@ import (
 )
 
 func (server *Server) handleAPIKeyList(writer http.ResponseWriter, request *http.Request) {
-	records, err := server.database.APIKeys(request.Context(), request.PathValue("organizationID"))
+	records, err := server.database.APIKeys(request.Context(), request.PathValue("organizationID"), pageFromRequest(request))
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "API_KEYS_LOOKUP_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "API_KEYS_LOOKUP_FAILED", err)
 		return
 	}
 	result := make([]APIKey, 0, len(records))
@@ -42,19 +42,19 @@ func (server *Server) handleAPIKeyCreate(writer http.ResponseWriter, request *ht
 	}
 	secret, _, err := newToken(apiKeyPrefix)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "TOKEN_GENERATION_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "TOKEN_GENERATION_FAILED", err)
 		return
 	}
 	id, err := model.NewID()
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "ID_GENERATION_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "ID_GENERATION_FAILED", err)
 		return
 	}
 	scopes, _ := json.Marshal(input.Scopes)
 	principal := principalFrom(request.Context())
 	record, err := server.database.CreateAPIKey(request.Context(), database.APIKeyRecord{ID: id, OrganizationID: request.PathValue("organizationID"), UserID: principal.UserID, Name: input.Name, Prefix: secret[:minInt(len(secret), 16)], Scopes: scopes, ExpiresAt: input.ExpiresAt}, tokenDigest(server.config.TokenPepper, secret), server.auditInput(request, "api_key.create", "api_key", id, map[string]any{"scopes": input.Scopes}))
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "API_KEY_CREATE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "API_KEY_CREATE_FAILED", err)
 		return
 	}
 	writeJSON(writer, http.StatusCreated, APIKeyCreated{APIKey: apiKeyResponse(record), Secret: secret})
@@ -66,7 +66,7 @@ func (server *Server) handleAPIKeyRevoke(writer http.ResponseWriter, request *ht
 			writeError(writer, http.StatusNotFound, "API_KEY_NOT_FOUND", "API key was not found or already revoked")
 			return
 		}
-		writeError(writer, http.StatusInternalServerError, "API_KEY_REVOKE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "API_KEY_REVOKE_FAILED", err)
 		return
 	}
 	writer.WriteHeader(http.StatusNoContent)

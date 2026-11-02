@@ -543,6 +543,15 @@ func validateKey(key string) error {
 	if key == "" || len(key) > 1024 || strings.ContainsRune(key, 0) || strings.Contains(key, "\\") || strings.HasPrefix(key, "/") {
 		return ErrInvalidKey
 	}
+	// Control characters are refused outright: keys are chunk addresses and
+	// manifest names, never arbitrary text, and a newline or escape byte in a
+	// key can corrupt signed-request canonicalization and log lines. NUL is
+	// caught above; this covers the rest of C0 and DEL.
+	for _, character := range key {
+		if character < 0x20 || character == 0x7f {
+			return ErrInvalidKey
+		}
+	}
 	for _, part := range strings.Split(key, "/") {
 		if part == "" || part == "." || part == ".." {
 			return ErrInvalidKey

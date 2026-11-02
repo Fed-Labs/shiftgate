@@ -93,10 +93,14 @@ func TestE2EShellCheckpointRestore(t *testing.T) {
 
 	// The restored process must resume the counter where it left off: the
 	// line count must keep growing past the baseline, and the first line
-	// written after restore must continue the sequence.
+	// written after restore must continue the sequence — the whole log stays
+	// the unbroken 1, 2, 3, ... only a surviving process can produce, with
+	// the line at index `baseline` carrying baseline+1 instead of a
+	// restarted 1.
 	waitUntil(t, 60*time.Second, "restored counter to write more lines", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
 	if restored.Spec.ID != workload.Spec.ID {
 		t.Fatalf("restore created a different workload: %s", restored.Spec.ID)
 	}
@@ -168,6 +172,7 @@ func TestE2EIncrementalCheckpointRestores(t *testing.T) {
 	waitUntil(t, 60*time.Second, "restored counter to write more lines", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
 }
 
 // TestE2EPeriodicCheckpointPolicy proves the agent's periodic-checkpoint
@@ -312,19 +317,12 @@ while True:
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadRunning)
 
 	// The restored interpreter resumes with its `n` variable intact, so the
-	// next appended value is baseline+1 — not 1 again.
+	// next appended value is baseline+1 — not 1 again — and the whole log
+	// stays the unbroken sequence.
 	waitUntil(t, 60*time.Second, "restored python counter to append", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	last := lines[len(lines)-1]
-	if last != fmt.Sprint(len(lines)) {
-		t.Fatalf("counter restarted instead of resuming: last=%s lines=%d", last, len(lines))
-	}
+	assertCounterContinuity(t, logPath, baseline)
 }
 
 // TestE2ENodeApplication runs a real Node.js application through checkpoint
@@ -389,14 +387,7 @@ setInterval(() => {
 	waitUntil(t, 60*time.Second, "restored node counter to append", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if lines[len(lines)-1] != fmt.Sprint(len(lines)) {
-		t.Fatalf("node counter restarted instead of resuming: last=%s lines=%d", lines[len(lines)-1], len(lines))
-	}
+	assertCounterContinuity(t, logPath, baseline)
 }
 
 // TestE2EWebServer runs a real web server as a workload with a declared port,
@@ -410,10 +401,10 @@ func TestE2EWebServer(t *testing.T) {
 	}
 	agentProc := startAgent(t, "web-agent")
 	root := t.TempDir()
-	port, err := freePort()
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The server's port is held until the workload's own listener binds it,
+	// released just before start — another test's free-port search cannot
+	// claim it in the gap.
+	port, releasePort := reservePort(t)
 	script := filepath.Join(root, "server.py")
 	source := fmt.Sprintf(`import http.server
 
@@ -454,6 +445,7 @@ http.server.HTTPServer(("127.0.0.1", %d), Handler).serve_forever()
 	if err != nil {
 		t.Fatalf("create workload: %v", err)
 	}
+	releasePort()
 	started, err := agentProc.client.WorkloadAction(ctx, created.Spec.ID, "start", struct{}{})
 	if err != nil {
 		t.Fatalf("start workload: %v", err)
@@ -504,27 +496,36 @@ http.server.HTTPServer(("127.0.0.1", %d), Handler).serve_forever()
 		t.Fatalf("restore ended in %s (error: %s)", record.State, record.Error)
 	}
 
-	// In-memory hit counter resumed from its checkpointed value: the first
-	// response after restore continues the sequence (a number above 3)
-	// instead of restarting at 1. A connection refused while the restored
-	// process rebinds is expected and retried.
-	var resumed int
-	waitUntil(t, 60*time.Second, "restored server to answer with a continuing hit counter", func() (bool, string) {
-		response := fetch()
-		if _, err := fmt.Sscanf(response, "hit %d", &resumed); err != nil {
-			return false, "last response was " + response
-		}
-		return resumed > 3, fmt.Sprintf("last response was %q (want a hit number above 3)", response)
+	// In-memory hit counter resumed from its checkpointed value: exactly
+	// three requests were served before the checkpoint, so the FIRST
+	// response the restored server gives must be "hit 4". The check is
+	// exact and runs before any retry loop — a re-executed server answers
+	// "hit 1", and a polling loop that tolerates low numbers would walk it
+	// to 4 and hide the restart (each poll is itself a hit). A connection
+	// refused while the restored process rebinds is expected and retried:
+	// refused attempts never reach the handler and do not advance the
+	// counter.
+	first := ""
+	waitUntil(t, 60*time.Second, "restored server to answer", func() (bool, string) {
+		first = fetch()
+		return first != "", "no response yet"
 	})
-	if resumed <= 3 {
-		t.Fatalf("hit counter restarted at %d after restore instead of continuing past 3", resumed)
+	if first != "hit 4" {
+		t.Fatalf("first response after restore was %q, want %q — the hit counter restarted instead of continuing past the checkpointed 3", first, "hit 4")
+	}
+	if second := fetch(); second != "hit 5" {
+		t.Fatalf("second response after restore was %q, want %q — the resumed counter is not continuing", second, "hit 5")
 	}
 }
 
-// TestE2EMultiProcessWorkload checkpoints a whole process tree — one parent
-// and three background workers, each tagging its output lines. CRIU must
-// carry every process; after restore each of the four processes keeps
-// writing. A partial restore would leave tags missing from the log's tail.
+// TestE2EMultiProcessWorkload checkpoints a whole process tree — a parent
+// shell that spawns three background workers, each tagging its output
+// lines. CRIU must carry every process in the tree; after restore each of
+// the three writers keeps counting from its own in-memory counter. The
+// per-writer sequences are the evidence: a partial restore would leave tags
+// missing from the log's tail, and a dropped tree re-spawned from its
+// supervisor would re-log every tag's counter from 1 — both break a
+// writer's unbroken 1, 2, 3, ... run, while whole-log growth hides them.
 func TestE2EMultiProcessWorkload(t *testing.T) {
 	requireE2E(t)
 	agentProc := startAgent(t, "tree-agent")
@@ -552,27 +553,20 @@ wait
 	workload := createWorkload(t, agentProc.client, "process-tree", root, script)
 	logPath := filepath.Join(root, "progress.log")
 
-	allTags := func() map[string]int {
-		data, err := os.ReadFile(logPath)
-		if err != nil {
-			return nil
-		}
+	tagCounts := func() map[string]int {
 		counts := make(map[string]int)
-		for _, line := range strings.Split(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) == 2 {
-				counts[fields[0]]++
-			}
+		for writer, values := range tagValues(t, logPath) {
+			counts[writer] = len(values)
 		}
 		return counts
 	}
 
 	waitUntil(t, 60*time.Second, "all three processes to write", func() (bool, string) {
-		counts := allTags()
-		return len(counts) >= 3 && counts["parent"] > 0 && counts["child-a"] > 0 && counts["child-b"] > 0,
+		counts := tagCounts()
+		return counts["parent"] > 0 && counts["child-a"] > 0 && counts["child-b"] > 0,
 			fmt.Sprintf("counts=%v", counts)
 	})
-	baseline := allTags()
+	baseline := tagCounts()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -594,13 +588,14 @@ wait
 	}
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadRunning)
 
-	waitUntil(t, 90*time.Second, "every process in the restored tree to keep writing", func() (bool, string) {
-		counts := allTags()
+	waitUntil(t, 90*time.Second, "every writer in the restored tree to keep counting", func() (bool, string) {
+		counts := tagCounts()
 		grew := counts["parent"] > baseline["parent"] &&
 			counts["child-a"] > baseline["child-a"] &&
 			counts["child-b"] > baseline["child-b"]
 		return grew, fmt.Sprintf("baseline=%v now=%v", baseline, counts)
 	})
+	assertTagContinuity(t, logPath, baseline)
 }
 
 // TestE2EContainerizedWorkload runs the workload inside its own PID namespace —

@@ -94,3 +94,33 @@ func TestDiagnosticsIgnoresEmptyTransfers(t *testing.T) {
 		t.Fatalf("ignored transfers still counted time:\n%s", rendered.String())
 	}
 }
+
+// TestDiagnosticsBoundsLabelVocabulary: outcome and direction strings are
+// clamped to a fixed vocabulary, so a caller passing arbitrary strings cannot
+// mint a new series (and map entry) per distinct value.
+func TestDiagnosticsBoundsLabelVocabulary(t *testing.T) {
+	diagnostics := NewDiagnostics()
+	diagnostics.MigrationFinished("workload-abc-123", time.Second, 0)
+	diagnostics.MigrationFinished("workload-def-456", time.Second, 0)
+	diagnostics.CheckpointFinished("weird outcome")
+	diagnostics.RestoreFinished("")
+	diagnostics.Transferred("sideways", 512, time.Second)
+	diagnostics.SetGauge("bad name\nshift_fake 1", 1)
+	diagnostics.SetGauge(`braces{x="y"}`, 1)
+	var rendered bytes.Buffer
+	diagnostics.RenderTo(&rendered)
+	output := rendered.String()
+	for _, expected := range []string{
+		`shift_migration_outcomes_total{outcome="other"} 2`,
+		`shift_checkpoint_outcomes_total{outcome="other"} 1`,
+		`shift_restore_outcomes_total{outcome="other"} 1`,
+		`shift_transfer_bytes_total{direction="other"} 512`,
+	} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("clamped series missing %q:\n%s", expected, output)
+		}
+	}
+	if strings.Contains(output, "workload-abc") || strings.Contains(output, "shift_fake") || strings.Contains(output, "braces") {
+		t.Fatalf("unbounded label values leaked into the exposition:\n%s", output)
+	}
+}

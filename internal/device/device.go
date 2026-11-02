@@ -14,9 +14,40 @@ package device
 
 import (
 	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"syscall"
 
 	"shift.dev/shift/internal/model"
 )
+
+// trustedLookPath resolves a vendor tool like exec.LookPath but refuses
+// binaries that could spoof this machine's device inventory: the GPU vendor,
+// model, driver, and checkpoint/restore claims all come from these tools'
+// output, so a shadowed binary in a user-writable PATH entry would forge
+// device identities. The resolved file must be a regular, non-group/
+// world-writable binary owned by root or by the agent's own user.
+func trustedLookPath(name string) (string, error) {
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 {
+		return "", errUntrustedBinary
+	}
+	stats, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || (stats.Uid != 0 && stats.Uid != uint32(os.Geteuid())) {
+		return "", errUntrustedBinary
+	}
+	return path, nil
+}
+
+var errUntrustedBinary = errors.New("executable is not a regular root-owned file with safe permissions")
 
 // Report is everything the device layer can prove about one machine.
 type Report struct {

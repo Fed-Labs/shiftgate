@@ -105,8 +105,27 @@ func AssumeRole(ctx context.Context, endpoint, region, accessKeyID, secretAccess
 	if credentials.Expiration.IsZero() {
 		return STSCredentials{}, fmt.Errorf("%w: AssumeRole response is missing the expiration", ErrRemote)
 	}
+	// The returned expiration is the credential's real lifetime, so it is
+	// checked against the requested ttl and our own clock with a skew
+	// allowance: a service whose clock drifts a few minutes still works, but
+	// a credential that already expired here (beyond the allowance) is
+	// refused rather than handed to an agent to fail with mid-restore, and a
+	// credential outliving the requested session is refused as well — an
+	// STS answer must never extend its own lease.
+	expiration := credentials.Expiration.UTC()
+	now := time.Now().UTC()
+	if expiration.Before(now.Add(-stsExpirationSkew)) {
+		return STSCredentials{}, fmt.Errorf("%w: AssumeRole returned already-expired credentials (expiration %s); check clock synchronization", ErrRemote, expiration.Format(time.RFC3339))
+	}
+	if expiration.After(now.Add(ttl + stsExpirationSkew)) {
+		return STSCredentials{}, fmt.Errorf("%w: AssumeRole returned credentials outliving the requested %s session", ErrRemote, ttl)
+	}
 	return STSCredentials(credentials), nil
 }
+
+// stsExpirationSkew is how far an STS service's clock may drift from ours
+// before returned credentials are treated as expired or over-long.
+const stsExpirationSkew = 5 * time.Minute
 
 type assumeRoleResult struct {
 	AssumedRoleUser assumeRoleUser `xml:"AssumeRoleResult"`

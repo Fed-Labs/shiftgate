@@ -57,7 +57,7 @@ func TestE2EMigrationCompletes(t *testing.T) {
 		t.Fatalf("create migration: %v", err)
 	}
 
-	migration := waitForMigrationTerminal(t, source.client, created.ID)
+	migration := waitForMigrationTerminal(t, source.client, created.ID, 5*time.Minute)
 	if migration.Stage != model.MigrationCompleted {
 		t.Fatalf("migration ended in %s (%s: %s)", migration.Stage, migration.FailureCode, migration.FailureReason)
 	}
@@ -66,6 +66,12 @@ func TestE2EMigrationCompletes(t *testing.T) {
 	}
 	if migration.Metrics.TransferredBytes <= 0 {
 		t.Fatalf("migration transferred no bytes: %+v", migration.Metrics)
+	}
+	// The freeze is measured and reported: a completed move of a running
+	// workload froze it and resumed it later, so downtime is the
+	// (non-zero) distance between those two instants.
+	if migration.Metrics.Downtime <= 0 {
+		t.Fatalf("completed migration of a running workload reported no downtime: %+v", migration.Metrics)
 	}
 
 	// Destination: the same workload ID, running, with the counter resumed.
@@ -76,8 +82,11 @@ func TestE2EMigrationCompletes(t *testing.T) {
 	waitUntil(t, 90*time.Second, "migrated counter to keep counting on the destination", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
 
-	// Source: stopped, no live process, no reclamation of the root.
+	// Source: stopped, no live process, no reclamation of the root — its
+	// directory survives the move with the counter's pre-move history in
+	// place (the sequence check above reads line 1 through N from it).
 	sourceWorkload, err := source.client.Workload(ctx, workload.Spec.ID)
 	if err != nil {
 		t.Fatalf("read source workload: %v", err)
@@ -87,6 +96,9 @@ func TestE2EMigrationCompletes(t *testing.T) {
 	}
 	if sourceWorkload.Process != nil {
 		t.Fatalf("source still reports a live process (pid %d)", sourceWorkload.Process.PID)
+	}
+	if _, statErr := os.Stat(root); statErr != nil {
+		t.Fatalf("completed migration reclaimed the source root: %v", statErr)
 	}
 }
 
@@ -104,7 +116,9 @@ func TestE2EMigrationUnreachableDestination(t *testing.T) {
 	}
 	// freePort binds, reads the port, and closes: the port is currently
 	// free, so a connection to it must be refused — not hang, not reach a
-	// stray listener.
+	// stray listener. Re-checked immediately before the probe below: a
+	// port recycled to another process in between would turn the must-fail
+	// destination into a reachable one.
 
 	root := t.TempDir()
 	script := filepath.Join(root, "run.sh")
@@ -118,6 +132,7 @@ func TestE2EMigrationUnreachableDestination(t *testing.T) {
 	})
 	baseline := fileLineCount(t, logPath)
 
+	requirePortDead(t, deadPort)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	created, err := source.client.CreateMigration(ctx, agentclient.MigrationCreateRequest{
@@ -132,7 +147,7 @@ func TestE2EMigrationUnreachableDestination(t *testing.T) {
 		t.Fatalf("create migration: %v", err)
 	}
 
-	migration := waitForMigrationTerminal(t, source.client, created.ID)
+	migration := waitForMigrationTerminal(t, source.client, created.ID, 5*time.Minute)
 	if migration.Stage != model.MigrationRolledBack {
 		for _, event := range migration.Events {
 			t.Logf("event %d %s %s %s", event.Sequence, event.Timestamp.Format("15:04:05.000"), event.Stage, event.Message)
@@ -148,7 +163,9 @@ func TestE2EMigrationUnreachableDestination(t *testing.T) {
 	}
 
 	// The source workload survived: running again, and its counter never
-	// stopped for long — the lines keep accumulating past the baseline.
+	// restarted — the lines keep accumulating past the baseline in one
+	// unbroken sequence. Invariant: a failed move never destroys the
+	// source; its root and its history are intact.
 	resumed := waitForWorkload(t, source.client, workload.Spec.ID, model.WorkloadRunning)
 	if resumed.Process == nil {
 		t.Fatal("resumed workload has no live process")
@@ -156,6 +173,10 @@ func TestE2EMigrationUnreachableDestination(t *testing.T) {
 	waitUntil(t, 60*time.Second, "source counter to keep counting after rollback", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
+	if _, statErr := os.Stat(root); statErr != nil {
+		t.Fatalf("failed move destroyed the source root: %v", statErr)
+	}
 }
 
 // TestE2EMigrationDryRun exercises `migrate --dry-run` over real peer TLS: a
@@ -230,6 +251,7 @@ func TestE2EMigrationDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	requirePortDead(t, deadPort)
 	_, err = source.client.PreflightMigration(ctx, agentclient.MigrationCreateRequest{
 		WorkloadID:  workload.Spec.ID,
 		Destination: model.Destination{AgentURL: fmt.Sprintf("https://127.0.0.1:%d", deadPort)},
@@ -322,7 +344,7 @@ func TestE2EMigrationDestinationDiesMidTransfer(t *testing.T) {
 		t.Fatalf("never observed the transfer stage (last stage visible before terminal: see migration %s)", created.ID)
 	}
 
-	migration := waitForMigrationTerminal(t, source.client, created.ID)
+	migration := waitForMigrationTerminal(t, source.client, created.ID, 5*time.Minute)
 	if migration.Stage == model.MigrationCompleted {
 		t.Fatal("migration completed despite the destination dying mid-transfer")
 	}
@@ -330,11 +352,17 @@ func TestE2EMigrationDestinationDiesMidTransfer(t *testing.T) {
 		t.Fatal("failed migration did not preserve the source")
 	}
 
-	// The source workload must be back and still counting.
+	// The source workload must be back and still counting — with its state
+	// and history intact: a failed move never destroys the source. The
+	// counter log stays the unbroken sequence, and the root survives.
 	waitForWorkload(t, source.client, workload.Spec.ID, model.WorkloadRunning)
 	waitUntil(t, 120*time.Second, "source counter to keep counting after the destination died", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
+	if _, statErr := os.Stat(root); statErr != nil {
+		t.Fatalf("failed move destroyed the source root: %v", statErr)
+	}
 }
 
 // TestE2ELiveMigrationDestinationDiesDuringPreCopy: the destination agent is
@@ -419,7 +447,7 @@ while True:
 		t.Fatal("never observed a pre-copy pass transfer")
 	}
 
-	migration := waitForMigrationTerminal(t, source.client, created.ID)
+	migration := waitForMigrationTerminal(t, source.client, created.ID, 5*time.Minute)
 	if migration.Stage == model.MigrationCompleted {
 		t.Fatal("migration completed despite the destination dying mid-pass")
 	}
@@ -436,6 +464,10 @@ while True:
 	waitUntil(t, 120*time.Second, "source counter to keep counting after the destination died mid-pass", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
+	if _, statErr := os.Stat(root); statErr != nil {
+		t.Fatalf("failed move destroyed the source root: %v", statErr)
+	}
 }
 
 // TestE2EAgentRestartResume: machine disconnect, machine restart. A workload
@@ -494,6 +526,7 @@ func TestE2EAgentRestartResume(t *testing.T) {
 	waitUntil(t, 90*time.Second, "resumed counter to pass the pre-restart baseline", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
 }
 
 // TestE2ELiveMigrationIterativePreCopy: a live migration whose pre-copy loop
@@ -536,7 +569,7 @@ func TestE2ELiveMigrationIterativePreCopy(t *testing.T) {
 		t.Fatalf("create migration: %v", err)
 	}
 
-	migration := waitForMigrationTerminal(t, source.client, created.ID)
+	migration := waitForMigrationTerminal(t, source.client, created.ID, 5*time.Minute)
 	if migration.Stage != model.MigrationCompleted {
 		t.Fatalf("live migration ended in %s (%s: %s)", migration.Stage, migration.FailureCode, migration.FailureReason)
 	}
@@ -573,6 +606,13 @@ func TestE2ELiveMigrationIterativePreCopy(t *testing.T) {
 	if migration.Metrics.TotalStateBytes <= 0 {
 		t.Fatalf("live migration recorded no state bytes: %+v", migration.Metrics)
 	}
+	// The freeze window is measured, not assumed: the workload was frozen
+	// and resumed on the other machine, so the reported downtime is the
+	// non-zero span between those instants — the number maintenance
+	// windows are planned around.
+	if migration.Metrics.Downtime <= 0 {
+		t.Fatalf("completed live migration of a running workload reported no downtime: %+v", migration.Metrics)
+	}
 
 	// The destination runs the workload and the counter continued — the
 	// merged multi-pass image set restored complete state.
@@ -583,6 +623,7 @@ func TestE2ELiveMigrationIterativePreCopy(t *testing.T) {
 	waitUntil(t, 90*time.Second, "migrated counter to keep counting on the destination", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
 
 	// The source is stopped and clean.
 	sourceWorkload, err := source.client.Workload(ctx, workload.Spec.ID)

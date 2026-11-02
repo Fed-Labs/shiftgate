@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"shift.dev/shift/internal/billing"
 	"shift.dev/shift/internal/database"
 )
 
@@ -26,20 +27,25 @@ func (server *Server) handleStorageStatus(writer http.ResponseWriter, request *h
 		return
 	}
 	organizationID := request.PathValue("organizationID")
+	prefix, err := storagePrefix(organizationID)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "STORAGE_ORGANIZATION_INVALID", "organization id cannot be used in a storage prefix")
+		return
+	}
 	entitlement, err := server.database.Entitlement(request.Context(), organizationID)
 	if err != nil {
 		if database.IsNotFound(err) {
 			writeError(writer, http.StatusNotFound, "ENTITLEMENT_NOT_FOUND", "organization entitlement was not found")
 			return
 		}
-		writeError(writer, http.StatusInternalServerError, "ENTITLEMENT_LOOKUP_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "ENTITLEMENT_LOOKUP_FAILED", err)
 		return
 	}
 	status := storageStatusFrom(entitlement)
 	status.Enabled = true
 	status.Endpoint = server.storage.configuration.AgentEndpoint()
 	status.Bucket = server.storage.configuration.Bucket
-	status.Prefix = storagePrefix(organizationID) + "/"
+	status.Prefix = prefix + "/"
 	if server.storage.stale(organizationID) {
 		seen, err := server.storage.reconcileOrganization(request.Context(), organizationID)
 		if err != nil {
@@ -54,7 +60,7 @@ func (server *Server) handleStorageStatus(writer http.ResponseWriter, request *h
 			status.Enabled = true
 			status.Endpoint = server.storage.configuration.AgentEndpoint()
 			status.Bucket = server.storage.configuration.Bucket
-			status.Prefix = storagePrefix(organizationID) + "/"
+			status.Prefix = prefix + "/"
 			status.LastReconciledAt = &seen.at
 			writeJSON(writer, http.StatusOK, status)
 			return
@@ -78,16 +84,31 @@ func storageStatusFrom(entitlement database.EntitlementRecord) StorageStatus {
 }
 
 // handleStorageCredentials mints one short-lived, org-scoped credential set
-// for an agent. This is the quota gate for hosted mirroring: an organization
-// past its storage entitlement gets no credentials, its mirror fails, and the
-// local checkpoint reports "persisted locally but mirror failed" — local
-// checkpointing itself never stops. Exactly-at-quota organizations still
-// receive credentials: restores must keep working when the bucket is merely
-// full.
+// for an agent. Storage quota gates what the credential may DO, never whether
+// one exists: an organization at or under quota gets a full read/write
+// credential, while an organization past its quota gets a read/delete-only
+// credential with s3:PutObject removed from the session policy. Every write is
+// refused by the credential itself, so the mirror cannot push the org further
+// over quota — but restores keep working and DeleteObject stays available,
+// because a lockout that also blocks deletion can never end: the same
+// credentials are the only way to reach the objects that need freeing. Local
+// checkpointing itself never stops either way.
 func (server *Server) handleStorageCredentials(writer http.ResponseWriter, request *http.Request) {
 	organizationID := request.PathValue("organizationID")
 	if server.storage == nil {
 		writeError(writer, http.StatusServiceUnavailable, "STORAGE_NOT_CONFIGURED", "this control plane does not host checkpoint storage")
+		return
+	}
+	prefix, err := storagePrefix(organizationID)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "STORAGE_ORGANIZATION_INVALID", "organization id cannot be used in a storage prefix")
+		return
+	}
+	// Fair-use transfer throttle (plan 4 BR-01): restore/egress credential
+	// issuance is the second enforcement point. Writes are governed by the
+	// storage quota check below instead.
+	if !server.enforceTransferBudget(writer, request, organizationID) {
+		server.recordRefusalEvent(request.Context(), organizationID, "storage_credentials", billing.TransferFairUseExceededCode)
 		return
 	}
 	entitlement, err := server.database.Entitlement(request.Context(), organizationID)
@@ -96,19 +117,11 @@ func (server *Server) handleStorageCredentials(writer http.ResponseWriter, reque
 			writeError(writer, http.StatusNotFound, "ENTITLEMENT_NOT_FOUND", "organization entitlement was not found")
 			return
 		}
-		writeError(writer, http.StatusInternalServerError, "ENTITLEMENT_LOOKUP_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "ENTITLEMENT_LOOKUP_FAILED", err)
 		return
 	}
-	if entitlement.MaxStorageBytes >= 0 && entitlement.UsedStorageBytes > entitlement.MaxStorageBytes {
-		writeJSON(writer, http.StatusForbidden, map[string]any{
-			"code":               "STORAGE_QUOTA_EXCEEDED",
-			"message":            "organization checkpoint storage quota is exceeded; free space or upgrade the plan to resume mirroring",
-			"used_storage_bytes": entitlement.UsedStorageBytes,
-			"max_storage_bytes":  entitlement.MaxStorageBytes,
-		})
-		return
-	}
-	policy := server.storage.sessionPolicy(organizationID)
+	overQuota := entitlement.MaxStorageBytes >= 0 && entitlement.UsedStorageBytes > entitlement.MaxStorageBytes
+	policy := server.storage.sessionPolicy(organizationID, !overQuota)
 	if policy == "" {
 		writeError(writer, http.StatusInternalServerError, "STORAGE_CREDENTIALS_FAILED", "session policy could not be built")
 		return
@@ -120,18 +133,23 @@ func (server *Server) handleStorageCredentials(writer http.ResponseWriter, reque
 		return
 	}
 	// The audit record carries who received credentials and when — never the
-	// credentials themselves.
+	// credentials themselves. The mode shows whether the issuance was
+	// write-capable, so an operator can see the quota gate doing its job.
 	principal := principalFrom(request.Context())
 	actor := principal.UserID
 	if principal.APIKeyID != "" {
 		actor = "apikey:" + principal.APIKeyID
 	}
-	_ = server.database.RecordAudit(request.Context(), server.auditInput(request, "storage.credentials_issued", "organization", organizationID, map[string]string{"principal": actor, "expiration": credentials.Expiration.Format(time.RFC3339)}))
+	mode := "full"
+	if overQuota {
+		mode = "read-delete"
+	}
+	_ = server.database.RecordAudit(request.Context(), server.auditInput(request, "storage.credentials_issued", "organization", organizationID, map[string]string{"principal": actor, "expiration": credentials.Expiration.Format(time.RFC3339), "mode": mode}))
 	writeJSON(writer, http.StatusOK, StorageCredentials{
 		Endpoint:        server.storage.configuration.AgentEndpoint(),
 		Region:          server.storage.configuration.Region,
 		Bucket:          server.storage.configuration.Bucket,
-		Prefix:          storagePrefix(organizationID),
+		Prefix:          prefix,
 		AccessKeyID:     credentials.AccessKeyID,
 		SecretAccessKey: credentials.SecretAccessKey,
 		SessionToken:    credentials.SessionToken,
@@ -148,21 +166,26 @@ func (server *Server) handleStorageReconcile(writer http.ResponseWriter, request
 		return
 	}
 	organizationID := request.PathValue("organizationID")
+	prefix, err := storagePrefix(organizationID)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "STORAGE_ORGANIZATION_INVALID", "organization id cannot be used in a storage prefix")
+		return
+	}
 	if _, err := server.database.Entitlement(request.Context(), organizationID); err != nil {
 		if database.IsNotFound(err) {
 			writeError(writer, http.StatusNotFound, "ENTITLEMENT_NOT_FOUND", "organization entitlement was not found")
 			return
 		}
-		writeError(writer, http.StatusInternalServerError, "ENTITLEMENT_LOOKUP_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "ENTITLEMENT_LOOKUP_FAILED", err)
 		return
 	}
 	seen, err := server.storage.reconcileOrganization(request.Context(), organizationID)
 	if err != nil {
-		writeError(writer, http.StatusBadGateway, "STORAGE_RECONCILE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusBadGateway, "STORAGE_RECONCILE_FAILED", err)
 		return
 	}
 	if err := server.database.UpdateStorageUsage(request.Context(), organizationID, seen.bytes); err != nil && !errors.Is(err, database.ErrEntitlementMissing) {
-		writeError(writer, http.StatusInternalServerError, "STORAGE_RECONCILE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "STORAGE_RECONCILE_FAILED", err)
 		return
 	}
 	day := seen.at.UTC().Truncate(24 * time.Hour)
@@ -173,19 +196,19 @@ func (server *Server) handleStorageReconcile(writer http.ResponseWriter, request
 		PeriodStart:    day,
 		PeriodEnd:      day,
 	}); err != nil {
-		writeError(writer, http.StatusInternalServerError, "STORAGE_RECONCILE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "STORAGE_RECONCILE_FAILED", err)
 		return
 	}
 	entitlement, err := server.database.Entitlement(request.Context(), organizationID)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "ENTITLEMENT_LOOKUP_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "ENTITLEMENT_LOOKUP_FAILED", err)
 		return
 	}
 	status := storageStatusFrom(entitlement)
 	status.Enabled = true
 	status.Endpoint = server.storage.configuration.AgentEndpoint()
 	status.Bucket = server.storage.configuration.Bucket
-	status.Prefix = storagePrefix(organizationID) + "/"
+	status.Prefix = prefix + "/"
 	status.LastReconciledAt = &seen.at
 	writeJSON(writer, http.StatusOK, status)
 }

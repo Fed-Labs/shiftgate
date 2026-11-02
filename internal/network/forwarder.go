@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -32,9 +33,11 @@ const (
 // migration contract. The other half — the workload being told that its old
 // connections did not survive — is the status document in plan.go.
 type Forwarder struct {
-	mapping  model.PortMapping
-	upstream string
-	log      *slog.Logger
+	mapping   model.PortMapping
+	upstream  []string
+	log       *slog.Logger
+	dialCtx   context.Context
+	dialClose context.CancelFunc
 
 	listener net.Listener
 	mu       sync.Mutex
@@ -57,12 +60,20 @@ func NewForwarder(mapping model.PortMapping, log *slog.Logger) *Forwarder {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	dialCtx, dialClose := context.WithCancel(context.Background())
+	port := strconv.Itoa(mapping.ContainerPort)
 	return &Forwarder{
-		mapping:  mapping,
-		upstream: fmt.Sprintf("127.0.0.1:%d", mapping.ContainerPort),
-		log:      log,
-		conns:    make(map[*forwardedConn]struct{}),
-		slots:    make(chan struct{}, forwardConnectionLimit),
+		mapping: mapping,
+		// The upstream is tried on IPv4 loopback first and then IPv6: a
+		// workload whose listener binds only [::1] is unreachable on the
+		// former, and a forwarder that only ever dialed 127.0.0.1 would
+		// accept connections it could never carry.
+		upstream:  []string{net.JoinHostPort("127.0.0.1", port), net.JoinHostPort("::1", port)},
+		log:       log,
+		dialCtx:   dialCtx,
+		dialClose: dialClose,
+		conns:     make(map[*forwardedConn]struct{}),
+		slots:     make(chan struct{}, forwardConnectionLimit),
 	}
 }
 
@@ -73,9 +84,13 @@ func (forwarder *Forwarder) Mapping() model.PortMapping {
 
 // Start binds the host port on every interface — the port is the workload's
 // published address, not a loopback-only convenience — and serves connections
-// until Stop or Drain is called. It returns an error rather than retrying: a
-// port that cannot be bound is a failed mapping, and the caller must surface
-// that instead of running the workload half-reachable.
+// until Stop or Drain is called. The context bounds only listener setup: every
+// real caller passes the activation context and cancels it when the activating
+// call returns, while the contract promises serving until Stop or Drain, so
+// per-connection work runs under the forwarder's own lifecycle instead. It
+// returns an error rather than retrying: a port that cannot be bound is a
+// failed mapping, and the caller must surface that instead of running the
+// workload half-reachable.
 func (forwarder *Forwarder) Start(ctx context.Context) error {
 	listener, err := (&net.ListenConfig{}).Listen(ctx, ProtocolTCP, fmt.Sprintf(":%d", forwarder.mapping.HostPort))
 	if err != nil {
@@ -91,12 +106,14 @@ func (forwarder *Forwarder) Start(ctx context.Context) error {
 	forwarder.mu.Unlock()
 
 	forwarder.idle.Add(1)
-	go forwarder.acceptLoop(ctx, listener)
+	go forwarder.acceptLoop(listener)
 	return nil
 }
 
 // acceptLoop hands accepted connections to handle until the listener closes.
-func (forwarder *Forwarder) acceptLoop(ctx context.Context, listener net.Listener) {
+// It ends only when Stop or Drain closes the listener; a canceled activation
+// context is not a shutdown signal — the port must keep serving.
+func (forwarder *Forwarder) acceptLoop(listener net.Listener) {
 	defer forwarder.idle.Done()
 	for {
 		client, err := listener.Accept()
@@ -104,7 +121,7 @@ func (forwarder *Forwarder) acceptLoop(ctx context.Context, listener net.Listene
 			forwarder.mu.Lock()
 			closed := forwarder.closed
 			forwarder.mu.Unlock()
-			if closed || ctx.Err() != nil {
+			if closed {
 				return
 			}
 			forwarder.log.Warn("forwarder accept failed", slog.String("mapping", forwarder.mapping.String()), slog.String("error", err.Error()))
@@ -114,7 +131,7 @@ func (forwarder *Forwarder) acceptLoop(ctx context.Context, listener net.Listene
 		forwarder.idle.Add(1)
 		go func(client net.Conn) {
 			defer forwarder.idle.Done()
-			forwarder.handle(ctx, client)
+			forwarder.handle(client)
 		}(client)
 	}
 }
@@ -122,7 +139,7 @@ func (forwarder *Forwarder) acceptLoop(ctx context.Context, listener net.Listene
 // handle proxies one connection from start to finish: it holds a connection
 // slot until the pair has fully closed, so the cap bounds live connections,
 // not handoffs.
-func (forwarder *Forwarder) handle(ctx context.Context, client net.Conn) {
+func (forwarder *Forwarder) handle(client net.Conn) {
 	select {
 	case forwarder.slots <- struct{}{}:
 	default:
@@ -134,7 +151,7 @@ func (forwarder *Forwarder) handle(ctx context.Context, client net.Conn) {
 	}
 	defer func() { <-forwarder.slots }()
 
-	upstream, err := (&net.Dialer{Timeout: forwardDialTimeout}).DialContext(ctx, ProtocolTCP, forwarder.upstream)
+	upstream, err := forwarder.dialUpstream()
 	if err != nil {
 		forwarder.log.Debug("forwarder could not reach workload listener",
 			slog.String("mapping", forwarder.mapping.String()),
@@ -174,6 +191,27 @@ func (forwarder *Forwarder) handle(ctx context.Context, client net.Conn) {
 	_ = upstream.Close()
 }
 
+// dialUpstream opens the workload-side leg of a forwarded connection. The
+// dial runs under the forwarder's lifecycle context — not the activation
+// context, which its callers cancel the moment activation returns — bounded
+// by forwardDialTimeout and aborted the instant Stop or Drain begins, so a
+// pending dial can never outlive the drain grace period. The upstream is
+// tried on each loopback family in turn: 127.0.0.1 first, then ::1, so a
+// workload that listens only on IPv6 loopback is reachable too.
+func (forwarder *Forwarder) dialUpstream() (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(forwarder.dialCtx, forwardDialTimeout)
+	defer cancel()
+	var lastErr error
+	for _, address := range forwarder.upstream {
+		connection, err := (&net.Dialer{}).DialContext(dialCtx, ProtocolTCP, address)
+		if err == nil {
+			return connection, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 // halfClose signals end-of-stream in one direction so a peer that shut down
 // writes is not left waiting for a response that will never come.
 func halfClose(connection net.Conn) {
@@ -197,12 +235,16 @@ func (forwarder *Forwarder) ActiveConnections() int {
 	return len(forwarder.conns)
 }
 
-// stopListening closes the listener so no new connections arrive. It is the
-// shared first step of Stop and Drain.
+// stopListening closes the listener so no new connections arrive and aborts
+// any upstream dial still in flight. It is the shared first step of Stop and
+// Drain: canceling the dial context is what keeps Drain's bound honest — a
+// pair still inside the dial is torn down immediately instead of surfacing
+// only after the dial timeout.
 func (forwarder *Forwarder) stopListening() error {
 	forwarder.mu.Lock()
 	defer forwarder.mu.Unlock()
 	forwarder.closed = true
+	forwarder.dialClose()
 	if forwarder.listener != nil {
 		return forwarder.listener.Close()
 	}

@@ -104,7 +104,13 @@ func (server *Server) computeScheduler() *scheduler.Scheduler {
 	return scheduler.New(configuration)
 }
 
-func computeOfferResponse(offer scheduler.Offer, withdrawnAt *time.Time) ComputeOffer {
+// computeOfferResponse shapes one stored offer for an API response. Trust is
+// a publisher claim; the response shows exactly the tier placement would honor
+// for this viewer (scheduler.ClampTrust, the same call the scheduler makes),
+// so the inventory can never display a "verified" badge the scheduler
+// silently clamps away.
+func computeOfferResponse(offer scheduler.Offer, withdrawnAt *time.Time, viewerOrganizationID string) ComputeOffer {
+	offer.Trust = scheduler.ClampTrust(offer.Trust, offer.OrganizationID == viewerOrganizationID, offer.IdentityVerified)
 	return ComputeOffer{Offer: offer, Available: offer.Available(), WithdrawnAt: withdrawnAt}
 }
 
@@ -254,15 +260,24 @@ func (server *Server) computeInventory(ctx context.Context, records []database.C
 // schedulableOffers is the inventory one organization may place onto: its own
 // machines, partner offers that name it, and the public marketplace when trading
 // is enabled. Lapsed holds are expired first so a crashed migration cannot pin
-// capacity that placement would then refuse to use.
+// capacity that placement would then refuse to use. The inventory is walked in
+// pages — a placement decision needs every candidate, but no single query may
+// materialize an unbounded marketplace.
 func (server *Server) schedulableOffers(ctx context.Context, organizationID string) ([]scheduler.Offer, error) {
 	now := time.Now().UTC()
 	if _, err := server.database.ExpireComputeReservations(ctx, now); err != nil {
 		return nil, err
 	}
-	records, err := server.database.SchedulableComputeOffers(ctx, organizationID, server.config.ComputeTradingEnabled)
-	if err != nil {
-		return nil, err
+	var records []database.ComputeOfferRecord
+	for offset := 0; ; offset += database.MaxPageLimit {
+		batch, err := server.database.SchedulableComputeOffers(ctx, organizationID, server.config.ComputeTradingEnabled, database.NormalizePage(database.MaxPageLimit, offset))
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, batch...)
+		if len(batch) < database.MaxPageLimit {
+			break
+		}
 	}
 	return server.computeInventory(ctx, records, now)
 }
@@ -272,7 +287,7 @@ func (server *Server) schedulableOffers(ctx context.Context, organizationID stri
 // captured state size, which is more trustworthy than a client-supplied figure.
 // An empty workloadID searches every checkpoint in the organization.
 func (server *Server) checkpointManifest(ctx context.Context, organizationID, workloadID, checkpointID string) (manifest model.CheckpointManifest, stateBytes int64, found bool, err error) {
-	records, err := server.database.Checkpoints(ctx, organizationID, workloadID)
+	records, err := server.allCheckpoints(ctx, organizationID, workloadID)
 	if err != nil {
 		return model.CheckpointManifest{}, 0, false, err
 	}
@@ -293,15 +308,15 @@ func (server *Server) checkpointManifest(ctx context.Context, organizationID, wo
 
 func (server *Server) handleComputeOfferList(writer http.ResponseWriter, request *http.Request) {
 	organizationID := request.PathValue("organizationID")
-	records, err := server.database.ComputeOffers(request.Context(), organizationID)
+	records, err := server.database.ComputeOffers(request.Context(), organizationID, pageFromRequest(request))
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_OFFERS_LOOKUP_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_OFFERS_LOOKUP_FAILED", err)
 		return
 	}
 	now := time.Now().UTC()
 	offers, err := server.computeInventory(request.Context(), records, now)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_OFFERS_DECODE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_OFFERS_DECODE_FAILED", err)
 		return
 	}
 	withdrawn := make(map[string]*time.Time, len(records))
@@ -310,20 +325,21 @@ func (server *Server) handleComputeOfferList(writer http.ResponseWriter, request
 	}
 	result := make([]ComputeOffer, 0, len(offers))
 	for _, offer := range offers {
-		result = append(result, computeOfferResponse(offer, withdrawn[offer.ID]))
+		result = append(result, computeOfferResponse(offer, withdrawn[offer.ID], organizationID))
 	}
 	writeJSON(writer, http.StatusOK, result)
 }
 
 func (server *Server) handleComputeInventory(writer http.ResponseWriter, request *http.Request) {
-	offers, err := server.schedulableOffers(request.Context(), request.PathValue("organizationID"))
+	organizationID := request.PathValue("organizationID")
+	offers, err := server.schedulableOffers(request.Context(), organizationID)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_INVENTORY_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_INVENTORY_FAILED", err)
 		return
 	}
 	result := make([]ComputeOffer, 0, len(offers))
 	for _, offer := range offers {
-		result = append(result, computeOfferResponse(offer, nil))
+		result = append(result, computeOfferResponse(offer, nil, organizationID))
 	}
 	writeJSON(writer, http.StatusOK, ComputeInventory{TradingEnabled: server.config.ComputeTradingEnabled, Offers: result})
 }
@@ -349,7 +365,7 @@ func (server *Server) handleComputeOfferPublish(writer http.ResponseWriter, requ
 			writeError(writer, http.StatusNotFound, "COMPUTE_OFFER_MACHINE_NOT_FOUND", "the machine is not registered in this organization")
 			return
 		}
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_OFFER_MACHINE_LOOKUP_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_OFFER_MACHINE_LOOKUP_FAILED", err)
 		return
 	}
 	if machine.Status == "disabled" {
@@ -358,7 +374,7 @@ func (server *Server) handleComputeOfferPublish(writer http.ResponseWriter, requ
 	}
 	offerID, err := model.NewID()
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "ID_GENERATION_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "ID_GENERATION_FAILED", err)
 		return
 	}
 	offer := scheduler.Offer{
@@ -387,7 +403,7 @@ func (server *Server) handleComputeOfferPublish(writer http.ResponseWriter, requ
 	}
 	if len(machine.Capabilities) > 0 {
 		if err := json.Unmarshal(machine.Capabilities, &offer.Capabilities); err != nil {
-			writeError(writer, http.StatusInternalServerError, "COMPUTE_OFFER_CAPABILITIES_UNREADABLE", err.Error())
+			server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_OFFER_CAPABILITIES_UNREADABLE", err)
 			return
 		}
 	}
@@ -401,7 +417,7 @@ func (server *Server) handleComputeOfferPublish(writer http.ResponseWriter, requ
 func (server *Server) publishComputeOffer(writer http.ResponseWriter, request *http.Request, offer scheduler.Offer, machineID string) {
 	record, err := recordFromOffer(offer)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_OFFER_ENCODE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_OFFER_ENCODE_FAILED", err)
 		return
 	}
 	audit := server.auditInput(request, "compute.offer.publish", "compute_offer", offer.ID, map[string]any{
@@ -415,15 +431,15 @@ func (server *Server) publishComputeOffer(writer http.ResponseWriter, request *h
 			writeError(writer, http.StatusNotFound, "COMPUTE_OFFER_MACHINE_NOT_FOUND", "the machine is not registered in this organization")
 			return
 		}
-		writeError(writer, http.StatusBadRequest, "COMPUTE_OFFER_PUBLISH_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_OFFER_PUBLISH_FAILED", err)
 		return
 	}
 	published, err := offerFromRecord(stored)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_OFFER_DECODE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_OFFER_DECODE_FAILED", err)
 		return
 	}
-	writeJSON(writer, http.StatusCreated, computeOfferResponse(published, stored.WithdrawnAt))
+	writeJSON(writer, http.StatusCreated, computeOfferResponse(published, stored.WithdrawnAt, published.OrganizationID))
 }
 
 func (server *Server) handleComputeOfferWithdraw(writer http.ResponseWriter, request *http.Request) {
@@ -436,15 +452,15 @@ func (server *Server) handleComputeOfferWithdraw(writer http.ResponseWriter, req
 			writeError(writer, http.StatusNotFound, "COMPUTE_OFFER_NOT_FOUND", "the offer does not exist in this organization")
 			return
 		}
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_OFFER_WITHDRAW_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_OFFER_WITHDRAW_FAILED", err)
 		return
 	}
 	offer, err := offerFromRecord(stored)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_OFFER_DECODE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_OFFER_DECODE_FAILED", err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, computeOfferResponse(offer, stored.WithdrawnAt))
+	writeJSON(writer, http.StatusOK, computeOfferResponse(offer, stored.WithdrawnAt, organizationID))
 }
 
 func (server *Server) handleComputePlacement(writer http.ResponseWriter, request *http.Request) {
@@ -474,7 +490,7 @@ func (server *Server) handleComputePlacement(writer http.ResponseWriter, request
 	}
 	offers, err := server.schedulableOffers(request.Context(), organizationID)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "PLACEMENT_INVENTORY_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "PLACEMENT_INVENTORY_FAILED", err)
 		return
 	}
 	result, err := server.computeScheduler().Place(placement, offers)
@@ -494,7 +510,7 @@ func (server *Server) applyCheckpointToRequest(writer http.ResponseWriter, reque
 	}
 	manifest, plainBytes, found, err := server.checkpointManifest(request.Context(), organizationID, placement.WorkloadID, checkpointID)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "PLACEMENT_CHECKPOINT_LOOKUP_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "PLACEMENT_CHECKPOINT_LOOKUP_FAILED", err)
 		return false
 	}
 	if !found {
@@ -525,19 +541,19 @@ var capacityRejections = map[string]bool{
 func (server *Server) handleComputeReservationList(writer http.ResponseWriter, request *http.Request) {
 	organizationID := request.PathValue("organizationID")
 	if _, err := server.database.ExpireComputeReservations(request.Context(), time.Now().UTC()); err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_RESERVATION_EXPIRY_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_RESERVATION_EXPIRY_FAILED", err)
 		return
 	}
-	records, err := server.database.ComputeReservations(request.Context(), organizationID, strings.TrimSpace(request.URL.Query().Get("offer_id")))
+	records, err := server.database.ComputeReservations(request.Context(), organizationID, strings.TrimSpace(request.URL.Query().Get("offer_id")), pageFromRequest(request))
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_RESERVATIONS_LOOKUP_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_RESERVATIONS_LOOKUP_FAILED", err)
 		return
 	}
 	result := make([]scheduler.Reservation, 0, len(records))
 	for _, record := range records {
 		reservation, err := reservationFromRecord(record)
 		if err != nil {
-			writeError(writer, http.StatusInternalServerError, "COMPUTE_RESERVATIONS_DECODE_FAILED", err.Error())
+			server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_RESERVATIONS_DECODE_FAILED", err)
 			return
 		}
 		result = append(result, reservation)
@@ -584,7 +600,7 @@ func (server *Server) handleComputeReservationCreate(writer http.ResponseWriter,
 	now := time.Now().UTC()
 	reservationID, err := model.NewID()
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "ID_GENERATION_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "ID_GENERATION_FAILED", err)
 		return
 	}
 	reservation := scheduler.Reservation{
@@ -603,7 +619,7 @@ func (server *Server) handleComputeReservationCreate(writer http.ResponseWriter,
 	}
 	requested, err := json.Marshal(reservation.Requested)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_RESERVATION_ENCODE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_RESERVATION_ENCODE_FAILED", err)
 		return
 	}
 	server.createComputeReservation(writer, request, database.ComputeReservationRecord{
@@ -663,18 +679,18 @@ func (server *Server) createComputeReservation(writer http.ResponseWriter, reque
 	})
 	stored, err := server.database.CreateComputeReservation(request.Context(), record, approve, audit)
 	if err != nil {
-		server.writeComputeReservationError(writer, err, rejection)
+		server.writeComputeReservationError(writer, request, err, rejection)
 		return
 	}
 	created, err := reservationFromRecord(stored)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_RESERVATION_DECODE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_RESERVATION_DECODE_FAILED", err)
 		return
 	}
 	writeJSON(writer, http.StatusCreated, created)
 }
 
-func (server *Server) writeComputeReservationError(writer http.ResponseWriter, err error, rejection *scheduler.Rejection) {
+func (server *Server) writeComputeReservationError(writer http.ResponseWriter, request *http.Request, err error, rejection *scheduler.Rejection) {
 	switch {
 	case errors.Is(err, database.ErrComputeCapacityUnavailable):
 		if rejection != nil && capacityRejections[rejection.Code] {
@@ -687,7 +703,9 @@ func (server *Server) writeComputeReservationError(writer http.ResponseWriter, e
 	case database.IsConflict(err):
 		writeError(writer, http.StatusConflict, "COMPUTE_RESERVATION_EXISTS", "a reservation with this id already exists")
 	default:
-		writeError(writer, http.StatusBadRequest, "COMPUTE_RESERVATION_FAILED", err.Error())
+		// Storage trouble, not caller input: a database outage must read as
+		// one, with the cause logged rather than echoed.
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_RESERVATION_FAILED", err)
 	}
 }
 
@@ -719,13 +737,13 @@ func (server *Server) handleComputeReservationState(writer http.ResponseWriter, 
 		case database.IsNotFound(err):
 			writeError(writer, http.StatusNotFound, "COMPUTE_RESERVATION_NOT_FOUND", "the reservation does not exist in this organization")
 		default:
-			writeError(writer, http.StatusInternalServerError, "COMPUTE_RESERVATION_STATE_FAILED", err.Error())
+			server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_RESERVATION_STATE_FAILED", err)
 		}
 		return
 	}
 	updated, err := reservationFromRecord(stored)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "COMPUTE_RESERVATION_DECODE_FAILED", err.Error())
+		server.writeInternalError(writer, request, http.StatusInternalServerError, "COMPUTE_RESERVATION_DECODE_FAILED", err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, updated)

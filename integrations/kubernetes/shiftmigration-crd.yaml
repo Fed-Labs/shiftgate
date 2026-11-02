@@ -1,0 +1,39 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: shiftmigrations.shiftgate.dev
+spec:
+  group: shiftgate.dev
+  scope: Namespaced
+  names:
+    plural: shiftmigrations
+    singular: shiftmigration
+    kind: ShiftMigration
+    shortNames: [shm]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [workloadId, sourceMachineId, destinationMachineId]
+              properties:
+                workloadId: {type: string, minLength: 1}
+                sourceMachineId: {type: string, minLength: 1}
+                destinationMachineId: {type: string, minLength: 1}
+                mode: {type: string, enum: [cold, live], default: cold}
+            status:
+              type: object
+              properties:
+                phase: {type: string}
+                reason: {type: string}
+                observedGeneration: {type: integer, format: int64}
+                operationID: {type: string}
+                lastObservedAt: {type: string, format: date-time}
+      subresources:
+        status: {}

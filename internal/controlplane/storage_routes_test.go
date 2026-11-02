@@ -183,8 +183,8 @@ func TestStorageSessionPolicyScopesToOrganization(t *testing.T) {
 	configuration := config.DefaultControlPlane()
 	configuration.Storage = hostedStorageConfiguration("http://storage.test")
 	service := &storageService{configuration: configuration.Storage}
-	policy := service.sessionPolicy("org_1")
-	if policy != service.sessionPolicy("org_1") {
+	policy := service.sessionPolicy("org_1", true)
+	if policy != service.sessionPolicy("org_1", true) {
 		t.Fatal("session policy is not deterministic across issuances")
 	}
 	var parsed struct {
@@ -229,12 +229,47 @@ func TestStorageSessionPolicyScopesToOrganization(t *testing.T) {
 	if !sawPrefixCondition {
 		t.Fatalf("bucket listing is not conditioned on the org prefix: %s", policy)
 	}
+	// A full credential writes; the over-quota read/delete policy must keep
+	// Get and Delete but drop PutObject — s3:PutObject is what covers
+	// multipart uploads too, so its absence blocks every write path.
+	if !strings.Contains(policy, "s3:PutObject") {
+		t.Fatalf("full policy must allow writes: %s", policy)
+	}
+	readonly := service.sessionPolicy("org_1", false)
+	if readonly == "" {
+		t.Fatal("read/delete policy could not be built")
+	}
+	if strings.Contains(readonly, "s3:PutObject") {
+		t.Fatalf("read/delete policy must not allow writes: %s", readonly)
+	}
+	for _, action := range []string{"s3:GetObject", "s3:DeleteObject", "s3:ListBucket"} {
+		if !strings.Contains(readonly, action) {
+			t.Fatalf("read/delete policy lost %s: %s", action, readonly)
+		}
+	}
+	if !strings.Contains(readonly, "arn:aws:s3:::shift-checkpoints/org/org_1/*") {
+		t.Fatalf("read/delete policy is not scoped to the organization prefix: %s", readonly)
+	}
+	// A glob metacharacter in an organization ID would broaden the policy's
+	// ARN and s3:prefix conditions across every tenant; such IDs are refused
+	// before any policy exists.
+	for _, hostile := range []string{"", "org/*", "org/../other", "org_1*", "org?1", "org 1", "org\n1", strings.Repeat("x", 129)} {
+		if policy := service.sessionPolicy(hostile, true); policy != "" {
+			t.Fatalf("hostile organization id %q produced a session policy: %s", hostile, policy)
+		}
+		if _, err := storagePrefix(hostile); err == nil {
+			t.Fatalf("hostile organization id %q produced a storage prefix", hostile)
+		}
+	}
+	if prefix, err := storagePrefix("1c9e4c1a-2b3c-4d5e-8f90-0123456789ab"); err != nil || prefix != "org/1c9e4c1a-2b3c-4d5e-8f90-0123456789ab" {
+		t.Fatalf("real UUID id mishandled: %q %v", prefix, err)
+	}
 }
 
 // The data-backed flow: status reconciles from the bucket, a machines-scope
 // API key receives credentials scoped to its organization, a foreign scope is
-// refused, quota blocks issuance fail-closed, and a forced reconcile restores
-// usage from the bucket's truth.
+// refused, quota narrows an over-quota issuance to read/delete-only, and a
+// forced reconcile restores usage from the bucket's truth.
 func TestHostedStorageFlowWithDatabase(t *testing.T) {
 	databaseURL := os.Getenv("SHIFT_TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -335,43 +370,51 @@ func TestHostedStorageFlowWithDatabase(t *testing.T) {
 		t.Fatalf("wrong-scope key error: %#v", scopeError)
 	}
 
-	// Over quota: no credentials, and nothing reaches the STS service.
+	// Over quota: issuance continues with a read/delete-only policy. The
+	// quota gate narrows what a credential may do — writes stop, restores keep
+	// working, and DeleteObject stays available so the organization can free
+	// space — instead of refusing credentials entirely, which would lock an
+	// over-quota org out of the only mechanism that could end the overage.
 	if err := store.UpdateStorageUsage(ctx, organizationID, 1<<40); err != nil {
 		t.Fatal(err)
 	}
-	var quotaError map[string]any
-	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, organizationPath+"/storage/credentials", nil)
-	if err != nil {
-		t.Fatal(err)
+	var restricted StorageCredentials
+	getJSON(t, client, organizationPath+"/storage/credentials", http.StatusOK, &restricted, machineAuth)
+	if restricted.AccessKeyID == "" || restricted.SecretAccessKey == "" || restricted.SessionToken == "" {
+		t.Fatalf("over-quota credentials are incomplete: %+v", restricted)
 	}
-	request.Header.Set("Authorization", machineAuth)
-	response, err := client.Do(request)
-	if err != nil {
-		t.Fatal(err)
+	policies = backend.recordedPolicies()
+	if len(policies) != 2 {
+		t.Fatalf("over quota must still issue credentials: %d AssumeRole calls", len(policies))
 	}
-	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
-	_ = json.Unmarshal(body, &quotaError)
-	if response.StatusCode != http.StatusForbidden || quotaError["code"] != "STORAGE_QUOTA_EXCEEDED" {
-		t.Fatalf("over-quota credentials: status %d body %s", response.StatusCode, body)
+	if strings.Contains(policies[1], "s3:PutObject") {
+		t.Fatalf("over-quota policy must not allow writes: %s", policies[1])
 	}
-	if len(backend.recordedPolicies()) != 1 {
-		t.Fatalf("quota did not stop issuance: %d AssumeRole calls", len(backend.recordedPolicies()))
+	if !strings.Contains(policies[1], "s3:DeleteObject") || !strings.Contains(policies[1], "s3:GetObject") || !strings.Contains(policies[1], "s3:ListBucket") {
+		t.Fatalf("over-quota policy must keep reads, lists, and deletes: %s", policies[1])
 	}
 
-	// The admin-forced reconcile resets usage to the bucket's truth, which
-	// unblocks issuance again — the bucket is the only usage authority.
+	// The admin-forced reconcile resets usage to the bucket's truth, and the
+	// next credential is write-capable again — the bucket is the only usage
+	// authority, and full credentials follow it back under quota.
 	var reconciled StorageStatus
 	postJSON(t, client, organizationPath+"/storage/reconcile", map[string]any{}, http.StatusOK, &reconciled, authHeader)
 	if reconciled.UsedStorageBytes != 120 || reconciled.OverQuota {
 		t.Fatalf("reconcile did not restore bucket truth: %+v", reconciled)
 	}
 	getJSON(t, client, organizationPath+"/storage/credentials", http.StatusOK, &credentials, machineAuth)
-	if len(backend.recordedPolicies()) != 2 {
-		t.Fatalf("issuance did not resume after reconcile: %d AssumeRole calls", len(backend.recordedPolicies()))
+	policies = backend.recordedPolicies()
+	if len(policies) != 3 {
+		t.Fatalf("issuance after reconcile: %d AssumeRole calls", len(policies))
+	}
+	if !strings.Contains(policies[2], "s3:PutObject") {
+		t.Fatalf("back-under-quota policy must allow writes again: %s", policies[2])
 	}
 
 	// Every issuance is audited with its principal — and without any secret.
+	// Audit listing is a Business-tier feature, so the org subscribes before
+	// reading its trail.
+	grantPlan(t, store, organizationID, "business")
 	var auditEvents []AuditEvent
 	getJSON(t, client, organizationPath+"/audit", http.StatusOK, &auditEvents, authHeader)
 	issued := 0

@@ -144,8 +144,16 @@ func (u *Updates) Validate(stateDir string) error {
 		{"feed_file", u.FeedFile},
 		{"trusted_keys_file", u.TrustedKeysFile},
 	} {
-		if path.value != "" && !filepath.IsAbs(path.value) {
+		if path.value == "" {
+			continue
+		}
+		if !filepath.IsAbs(path.value) {
 			return fmt.Errorf("%s must be an absolute path", path.name)
+		}
+		// The update machinery writes, replaces, and prunes under these
+		// paths, so root-like or unclean values are refused like state_dir.
+		if cleaned := filepath.Clean(path.value); cleaned != path.value || cleaned == "/" || strings.Contains(cleaned, "..") {
+			return fmt.Errorf("%s must be a cleaned absolute path under a dedicated directory, not / or a relative traversal", path.name)
 		}
 	}
 	if !u.Enabled {
@@ -233,11 +241,17 @@ func (u Updates) Fetcher() update.Fetcher {
 	return update.NewHTTPFetcher(u.DownloadTimeout, nil)
 }
 
-func applyUpdateEnvironment(configuration *Updates) {
+// applyUpdateEnvironment maps SHIFT_UPDATE_* variables onto the update block.
+// A variable that was set but cannot be parsed fails the load: silently
+// keeping the default would leave updates off (or the signature threshold at
+// one) with nothing telling the operator their setting never took effect.
+func applyUpdateEnvironment(configuration *Updates) error {
 	if value := os.Getenv("SHIFT_UPDATE_ENABLED"); value != "" {
-		if enabled, err := strconv.ParseBool(value); err == nil {
-			configuration.Enabled = enabled
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("SHIFT_UPDATE_ENABLED must be a boolean: %w", err)
 		}
+		configuration.Enabled = enabled
 	}
 	if value := os.Getenv("SHIFT_UPDATE_CHANNEL"); value != "" {
 		configuration.Channel = update.Channel(value)
@@ -255,16 +269,21 @@ func applyUpdateEnvironment(configuration *Updates) {
 		configuration.TrustedKeysFile = value
 	}
 	if value := os.Getenv("SHIFT_UPDATE_SIGNATURE_THRESHOLD"); value != "" {
-		if threshold, err := strconv.Atoi(value); err == nil {
-			configuration.SignatureThreshold = threshold
+		threshold, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("SHIFT_UPDATE_SIGNATURE_THRESHOLD must be an integer: %w", err)
 		}
+		configuration.SignatureThreshold = threshold
 	}
 	if value := os.Getenv("SHIFT_UPDATE_CHECK_INTERVAL"); value != "" {
-		if parsed, err := time.ParseDuration(value); err == nil {
-			configuration.CheckInterval = parsed
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("SHIFT_UPDATE_CHECK_INTERVAL must be a duration: %w", err)
 		}
+		configuration.CheckInterval = parsed
 	}
 	if value := os.Getenv("SHIFT_UPDATE_EXECUTABLE"); value != "" {
 		configuration.ExecutablePath = value
 	}
+	return nil
 }

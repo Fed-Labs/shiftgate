@@ -177,3 +177,32 @@ func TestMigrationActiveFor(t *testing.T) {
 		t.Fatal("a migration in flight must block the policy loop for its workload")
 	}
 }
+
+// TestCheckpointPolicyHoldsWriteGuard pins that the periodic-checkpoint
+// writer takes the same write guard the mutating handlers share: while a GC
+// sweep holds it exclusively, the policy loop must not run its
+// chunk-resolving checkpoint, and it must proceed once the guard is free.
+func TestCheckpointPolicyHoldsWriteGuard(t *testing.T) {
+	service, workloadID := policyHarness(t, &model.CheckpointPolicySpec{IntervalSeconds: 10})
+	service.gcGuard.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.applyCheckpointPolicies(context.Background())
+	}()
+	select {
+	case <-done:
+		service.gcGuard.mu.Unlock()
+		t.Fatal("the policy checkpoint ran while the GC write guard was held")
+	case <-time.After(300 * time.Millisecond):
+	}
+	service.gcGuard.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the policy checkpoint did not run after the guard was released")
+	}
+	if summaries := service.checkpoints.List(workloadID); len(summaries) != 1 {
+		t.Fatalf("the guarded policy checkpoint should have created one checkpoint, got %d", len(summaries))
+	}
+}

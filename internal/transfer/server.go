@@ -26,6 +26,22 @@ import (
 
 type Authenticator func(*http.Request) (string, error)
 
+// TransferMeter records delivered bandwidth for billing. *database.Store
+// implements it (RecordTransferBytes); the agent wires its own accumulator so
+// the increments reach the control plane's usage_records. The channel
+// vocabulary mirrors internal/database/usage.go's TransferChannel*.
+type TransferMeter interface {
+	RecordTransferBytes(ctx context.Context, organizationID, channel string, bytes int64) error
+}
+
+// Metering channels for sessions this server completes. Migration delivery is
+// egress from the origin's perspective; a held replication push is the
+// restorable copy the standby keeps.
+const (
+	TransferChannelEgress  = "egress"
+	TransferChannelRestore = "restore"
+)
+
 // ReplicationWatcher is the agent-side counterpart of a held replication
 // session. The peer server calls it after the session is durably persisted,
 // so the agent's standby supervisor can keep its duty records current; a
@@ -53,7 +69,23 @@ type Server struct {
 	logger       *slog.Logger
 	maxBodyBytes int64
 	replication  ReplicationWatcher
+	// importSlots caps concurrent chunk verification memory: each in-flight
+	// import buffers a whole encoded chunk plus its decompressed plaintext,
+	// and the peer controls how many uploads run at once. See
+	// maxConcurrentChunkImports.
+	importSlots chan struct{}
+	// meter and organizationID carry cost-side bandwidth metering: on session
+	// completion the delivered bytes are recorded for the organization this
+	// agent serves. Both are optional; without a meter nothing is recorded.
+	meter          TransferMeter
+	organizationID string
 }
+
+// maxConcurrentChunkImports bounds how many chunk uploads verify at once,
+// matching the uploader's own worker fanout: full-buffer verification of one
+// maximum chunk costs up to ~160 MiB, so the worst case is a fixed few
+// hundred MiB no matter how many parallel PUTs a peer opens.
+const maxConcurrentChunkImports = 4
 
 type ReserveRequest struct {
 	ID              string    `json:"id"`
@@ -84,8 +116,9 @@ type RestoreRequest struct {
 // retention the source asks the standby to keep, and the source's advertised
 // peer listener the standby should probe before ever failing over on its own.
 type HoldRequest struct {
-	KeepLast       int    `json:"keep_last"`
-	SourceAgentURL string `json:"source_agent_url,omitempty"`
+	KeepLast        int    `json:"keep_last"`
+	SourceAgentURL  string `json:"source_agent_url,omitempty"`
+	FencingProvider string `json:"fencing_provider,omitempty"`
 }
 
 // WithdrawRequest names the workload whose standby duty the source withdraws.
@@ -97,10 +130,32 @@ func NewServer(sessions *Sessions, keys *securestore.Manager, chunks *chunkstore
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{
+	sessions.SetLogger(logger)
+	server := &Server{
 		sessions: sessions, keys: keys, chunks: chunks, checkpoints: checkpoints,
 		restorer: restorer, inventory: inventory, authenticate: authenticate,
 		logger: logger, maxBodyBytes: 16 << 20,
+		importSlots: make(chan struct{}, maxConcurrentChunkImports),
+	}
+	// A reaped session that had restored a workload must not leave the
+	// restored copy running: the reservation is gone, and the source may
+	// still be live. Boot sweeps once through the same path later
+	// reservations do.
+	sessions.SetReapRestoreHandler(server.rollbackReapedRestore)
+	sessions.ReapExpired()
+	return server
+}
+
+// rollbackReapedRestore rolls back the restore an expired session left
+// behind. Failures are logged — the session is already retired — and the
+// operator runbook owns the manual cleanup.
+func (s *Server) rollbackReapedRestore(session Session) {
+	if s.restorer == nil || session.RestoreID == "" {
+		return
+	}
+	if _, err := s.restorer.Rollback(context.Background(), session.RestoreID, "transfer reservation expired before commit"); err != nil {
+		s.logger.Warn("could not roll back restore of an expired transfer session",
+			"session_id", session.ID, "restore_id", session.RestoreID, "error", err)
 	}
 }
 
@@ -119,6 +174,27 @@ func (s *Server) SetReplicationWatcher(watcher ReplicationWatcher) {
 	s.replication = watcher
 }
 
+// SetTransferMeter attaches the bandwidth meter and the organization the
+// agent serves. Sessions record the organization at reservation time so the
+// completion increment carries "org from the session", and both are optional:
+// without a meter the server simply records nothing.
+func (s *Server) SetTransferMeter(organizationID string, meter TransferMeter) {
+	s.organizationID = organizationID
+	s.meter = meter
+}
+
+// meterCompletion records one completed session's delivered bytes exactly
+// once — at the state transition that ends the transfer — so a retried
+// completion cannot double-bill.
+func (s *Server) meterCompletion(ctx context.Context, session Session, channel string) {
+	if s.meter == nil || session.OrganizationID == "" || session.ReceivedBytes <= 0 {
+		return
+	}
+	if err := s.meter.RecordTransferBytes(ctx, session.OrganizationID, channel, session.ReceivedBytes); err != nil {
+		s.logger.Warn("could not record transfer usage", "session_id", session.ID, "error", err)
+	}
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/peer/machine", s.machine)
@@ -133,6 +209,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/peer/transfers/{id}/hold", s.hold)
 	mux.HandleFunc("POST /v1/peer/standby/withdraw", s.withdraw)
 	mux.HandleFunc("GET /v1/peer/transfers/{id}", s.get)
+	mux.HandleFunc("GET /v1/peer/transfers/{id}/cleanup", s.getCleanup)
 	return s.withAuth(mux)
 }
 
@@ -150,7 +227,7 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 func (s *Server) machine(writer http.ResponseWriter, request *http.Request) {
 	capabilities, err := s.inventory.Inspect(request.Context())
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "INVENTORY_FAILED", err.Error())
+		s.writeInternalError(writer, http.StatusInternalServerError, "INVENTORY_FAILED", err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, capabilities)
@@ -174,9 +251,10 @@ func (s *Server) reserve(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusBadRequest, "ESTIMATE_INVALID", "estimated bytes cannot be negative")
 		return
 	}
+	s.sessions.ReapExpired()
 	capabilities, err := s.inventory.Inspect(request.Context())
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "INVENTORY_FAILED", err.Error())
+		s.writeInternalError(writer, http.StatusInternalServerError, "INVENTORY_FAILED", err)
 		return
 	}
 	var largestAvailable uint64
@@ -185,12 +263,17 @@ func (s *Server) reserve(writer http.ResponseWriter, request *http.Request) {
 			largestAvailable = storage.AvailableBytes
 		}
 	}
+	// An explicit estimate is a claim this destination can check up front.
+	// A missing estimate no longer disables anything: Reserve assigns the
+	// default reservation, and ingest is bounded per chunk by the quota and
+	// the free-space floor below.
 	if input.EstimatedBytes > 0 && uint64(input.EstimatedBytes) > largestAvailable {
 		writeError(writer, http.StatusInsufficientStorage, "STORAGE_INSUFFICIENT", "destination has insufficient free storage for the reservation")
 		return
 	}
 	session, err := s.sessions.Reserve(Session{
 		ID: input.ID, SourceMachineID: source, WorkloadID: input.WorkloadID,
+		OrganizationID: s.organizationID,
 		EstimatedBytes: input.EstimatedBytes, ExpiresAt: input.ExpiresAt,
 		Purpose: input.Purpose,
 	})
@@ -259,6 +342,21 @@ func (s *Server) importManifest(writer http.ResponseWriter, request *http.Reques
 		writeError(writer, http.StatusForbidden, "MANIFEST_IDENTITY_MISMATCH", "manifest is not bound to this transfer")
 		return
 	}
+	// The manifest ID is about to be joined into repository paths as
+	// root — a peer must never choose a path. Refuse anything that is not a
+	// flat identifier before any save, load, or delete can see it.
+	if !validCheckpointID(manifest.ID) {
+		writeError(writer, http.StatusBadRequest, "MANIFEST_INVALID", "checkpoint id is not a safe identifier")
+		return
+	}
+	// A manifest may be re-posted identically (idempotent retry), but a
+	// different one can never replace it: the checkpoint binding and the
+	// chunk authorization are scoped to the manifest that verification
+	// planned against.
+	if session.CheckpointID != "" && session.CheckpointID != manifest.ID {
+		writeError(writer, http.StatusConflict, "MANIFEST_REPLACED", "a different manifest is already bound to this transfer")
+		return
+	}
 	if err := checkpoint.VerifyManifest(manifest); err != nil {
 		writeError(writer, http.StatusBadRequest, "MANIFEST_INVALID", err.Error())
 		return
@@ -270,7 +368,7 @@ func (s *Server) importManifest(writer http.ResponseWriter, request *http.Reques
 	refs := UniqueChunks(manifest.Assets)
 	missing, err := s.chunks.Missing(refs)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "CHUNK_INVENTORY_FAILED", err.Error())
+		s.writeInternalError(writer, http.StatusInternalServerError, "CHUNK_INVENTORY_FAILED", err)
 		return
 	}
 	missingAddresses := make(map[string]bool, len(missing))
@@ -289,7 +387,7 @@ func (s *Server) importManifest(writer http.ResponseWriter, request *http.Reques
 		return nil
 	})
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err.Error())
+		s.writeInternalError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, MissingResponse{Missing: missing, DeduplicatedBytes: deduplicated})
@@ -333,9 +431,9 @@ func (s *Server) importChunk(writer http.ResponseWriter, request *http.Request) 
 		return
 	}
 	if session.CheckpointID != "" {
-		manifest, err := s.checkpoints.Load(session.CheckpointID)
+		manifest, err := s.loadSessionManifest(session)
 		if err != nil {
-			writeError(writer, http.StatusInternalServerError, "MANIFEST_LOAD_FAILED", err.Error())
+			s.writeInternalError(writer, http.StatusInternalServerError, "MANIFEST_LOAD_FAILED", err)
 			return
 		}
 		if !manifestContainsChunk(manifest, ref) {
@@ -343,21 +441,66 @@ func (s *Server) importChunk(writer http.ResponseWriter, request *http.Request) 
 			return
 		}
 	}
-	if session.EstimatedBytes > 0 && session.ReceivedBytes+ref.StoredSize > session.EstimatedBytes+(session.EstimatedBytes/20) {
-		writeError(writer, http.StatusInsufficientStorage, "TRANSFER_QUOTA_EXCEEDED", "incoming transfer exceeded its reserved size")
+	if free, freeErr := s.chunks.FreeBytes(); freeErr == nil && free < freeSpaceFloor {
+		writeError(writer, http.StatusInsufficientStorage, "STORAGE_INSUFFICIENT", "destination is below its free-space floor; chunk ingest is paused")
+		return
+	}
+	// Chunk verification buffers a whole encoded chunk plus its decompressed
+	// plaintext, and the peer decides how many uploads to run at once. A
+	// verification slot is held from before the quota gate until the import
+	// finishes, so N parallel PUTs can pin at most maxConcurrentChunkImports
+	// chunk-sized buffers instead of N of them.
+	select {
+	case s.importSlots <- struct{}{}:
+		defer func() { <-s.importSlots }()
+	case <-request.Context().Done():
+		writeError(writer, http.StatusServiceUnavailable, "CHUNK_IMPORT_BUSY", "chunk ingest stopped waiting for a verification slot")
+		return
+	}
+	// The quota gate and the attempted-byte ceiling are accounted before a
+	// single byte is stored: reservations with a zero estimate still carry
+	// the default reservation, retries and deduplicated uploads still count,
+	// and concurrent imports cannot race past the ceiling by reading stale
+	// counters. The receive bytes are reserved in the same serialized gate
+	// that checks them — two concurrent imports can no longer both pass the
+	// check and both land past the reservation — and released below when a
+	// chunk turns out to be a dedup hit or the import fails.
+	session, err = s.sessions.Update(session.ID, source, func(value *Session) error {
+		if value.ReceivedBytes+ref.StoredSize > quotaLimit(value.EstimatedBytes) {
+			return errTransferQuota
+		}
+		if value.AttemptedBytes+ref.StoredSize > attemptLimit(value.EstimatedBytes) {
+			return errTransferQuota
+		}
+		value.AttemptedBytes += ref.StoredSize
+		value.ReceivedBytes += ref.StoredSize
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errTransferQuota) {
+			writeError(writer, http.StatusInsufficientStorage, "TRANSFER_QUOTA_EXCEEDED", "incoming transfer exceeded its reserved size")
+			return
+		}
+		s.writeInternalError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err)
 		return
 	}
 	request.Body = http.MaxBytesReader(writer, request.Body, ref.StoredSize+1)
-	inserted, err := s.chunks.ImportChunkResult(request.Context(), session.WorkloadID, ref, request.Body)
-	if err != nil {
-		writeError(writer, http.StatusBadRequest, "CHUNK_IMPORT_FAILED", err.Error())
+	inserted, importErr := s.chunks.ImportChunkResult(request.Context(), session.WorkloadID, ref, request.Body)
+	if importErr != nil || !inserted {
+		if updated, updateErr := s.sessions.Update(session.ID, source, func(value *Session) error {
+			value.ReceivedBytes -= ref.StoredSize
+			return nil
+		}); updateErr != nil {
+			s.logger.Warn("could not release reserved transfer bytes", "session_id", session.ID, "error", updateErr)
+		} else {
+			session = updated
+		}
+	}
+	if importErr != nil {
+		writeError(writer, http.StatusBadRequest, "CHUNK_IMPORT_FAILED", importErr.Error())
 		return
 	}
 	if inserted {
-		session, _ = s.sessions.Update(session.ID, source, func(value *Session) error {
-			value.ReceivedBytes += ref.StoredSize
-			return nil
-		})
 		if s.diagnostics != nil {
 			// Wall time from request start through receive, decrypt, and store:
 			// the destination-side counterpart of the uploader's send duration.
@@ -378,9 +521,9 @@ func (s *Server) verify(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusConflict, "TRANSFER_STATE_INVALID", err.Error())
 		return
 	}
-	manifest, err := s.checkpoints.Load(session.CheckpointID)
+	manifest, err := s.loadSessionManifest(session)
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "MANIFEST_LOAD_FAILED", err.Error())
+		s.writeInternalError(writer, http.StatusInternalServerError, "MANIFEST_LOAD_FAILED", err)
 		return
 	}
 	for _, asset := range manifest.Assets {
@@ -394,7 +537,7 @@ func (s *Server) verify(writer http.ResponseWriter, request *http.Request) {
 		return nil
 	})
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err.Error())
+		s.writeInternalError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, session)
@@ -414,7 +557,7 @@ func (s *Server) restore(writer http.ResponseWriter, request *http.Request) {
 	if session.State == SessionRestored && session.RestoreID != "" {
 		record, getErr := s.restorer.Get(session.RestoreID)
 		if getErr != nil {
-			writeError(writer, http.StatusInternalServerError, "RESTORE_STATE_MISSING", getErr.Error())
+			s.writeInternalError(writer, http.StatusInternalServerError, "RESTORE_STATE_MISSING", getErr)
 			return
 		}
 		writeJSON(writer, http.StatusOK, record)
@@ -424,6 +567,10 @@ func (s *Server) restore(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusConflict, "TRANSFER_STATE_INVALID", err.Error())
 		return
 	}
+	if !validCheckpointID(session.CheckpointID) {
+		writeError(writer, http.StatusConflict, "TRANSFER_STATE_INVALID", "session checkpoint id is not a safe identifier")
+		return
+	}
 	timeout := time.Duration(input.TimeoutSeconds) * time.Second
 	// A migration restore is always eager: the source is frozen waiting for
 	// the destination's answer, and the migration's downtime metric must mean
@@ -431,11 +578,13 @@ func (s *Server) restore(writer http.ResponseWriter, request *http.Request) {
 	// memory had not caught up with.
 	record, err := s.restorer.Prepare(request.Context(), session.CheckpointID, checkpoint.PrepareOptions{Timeout: timeout})
 	if err != nil {
-		_, _ = s.sessions.Update(session.ID, source, func(value *Session) error {
+		if _, updateErr := s.sessions.UpdateCleanup(session.ID, source, func(value *Session) error {
 			value.State = SessionFailed
 			value.FailureReason = err.Error()
 			return nil
-		})
+		}); updateErr != nil {
+			s.logger.Warn("could not mark transfer session failed after restore error", "session_id", session.ID, "error", updateErr)
+		}
 		writeError(writer, http.StatusUnprocessableEntity, "RESTORE_FAILED", err.Error())
 		return
 	}
@@ -446,7 +595,7 @@ func (s *Server) restore(writer http.ResponseWriter, request *http.Request) {
 	})
 	if err != nil {
 		_, _ = s.restorer.Rollback(request.Context(), record.ID, "could not persist incoming transfer restore state")
-		writeError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err.Error())
+		s.writeInternalError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, record)
@@ -468,23 +617,45 @@ func (s *Server) commit(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if _, err := s.restorer.Commit(session.RestoreID); err != nil {
-		writeError(writer, http.StatusInternalServerError, "RESTORE_COMMIT_FAILED", err.Error())
+		s.writeInternalError(writer, http.StatusInternalServerError, "RESTORE_COMMIT_FAILED", err)
 		return
 	}
-	session, err = s.sessions.Update(session.ID, source, func(value *Session) error {
+	sessionID := session.ID
+	updated, updateErr := s.sessions.Update(sessionID, source, func(value *Session) error {
+		// The terminal-state check belongs inside the serialized update:
+		// two racing commits must not both perform the transition, and only
+		// the request that actually transitions may meter completion.
+		if value.State == SessionCommitted {
+			return errAlreadyCommitted
+		}
+		if err := requireState(value, SessionRestored); err != nil {
+			return fmt.Errorf("%w: %v", errTransferStateInvalid, err)
+		}
 		value.State = SessionCommitted
 		return nil
 	})
-	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err.Error())
+	switch {
+	case errors.Is(updateErr, errAlreadyCommitted):
+		if current, getErr := s.sessions.Get(sessionID, source); getErr == nil {
+			session = current
+		}
+		writeJSON(writer, http.StatusOK, session)
+		return
+	case errors.Is(updateErr, errTransferStateInvalid):
+		writeError(writer, http.StatusConflict, "TRANSFER_STATE_INVALID", updateErr.Error())
+		return
+	case updateErr != nil:
+		s.writeInternalError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", updateErr)
 		return
 	}
+	session = updated
+	s.meterCompletion(request.Context(), session, TransferChannelEgress)
 	writeJSON(writer, http.StatusOK, session)
 }
 
 func (s *Server) rollback(writer http.ResponseWriter, request *http.Request) {
 	source := peerMachine(request.Context())
-	session, err := s.sessions.Get(request.PathValue("id"), source)
+	session, err := s.sessions.GetForCleanup(request.PathValue("id"), source)
 	if err != nil {
 		writeError(writer, http.StatusNotFound, "TRANSFER_NOT_FOUND", err.Error())
 		return
@@ -495,16 +666,16 @@ func (s *Server) rollback(writer http.ResponseWriter, request *http.Request) {
 	}
 	if session.RestoreID != "" {
 		if _, err := s.restorer.Rollback(request.Context(), session.RestoreID, "source requested migration rollback"); err != nil {
-			writeError(writer, http.StatusInternalServerError, "RESTORE_ROLLBACK_FAILED", err.Error())
+			s.writeInternalError(writer, http.StatusInternalServerError, "RESTORE_ROLLBACK_FAILED", err)
 			return
 		}
 	}
-	session, err = s.sessions.Update(session.ID, source, func(value *Session) error {
+	session, err = s.sessions.UpdateCleanup(session.ID, source, func(value *Session) error {
 		value.State = SessionRolledBack
 		return nil
 	})
 	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err.Error())
+		s.writeInternalError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err)
 		return
 	}
 	writeJSON(writer, http.StatusOK, session)
@@ -551,15 +722,37 @@ func (s *Server) hold(writer http.ResponseWriter, request *http.Request) {
 			writeError(writer, http.StatusConflict, "TRANSFER_STATE_INVALID", err.Error())
 			return
 		}
-		session, err = s.sessions.Update(session.ID, source, func(value *Session) error {
+		sessionID := session.ID
+		updated, updateErr := s.sessions.Update(sessionID, source, func(value *Session) error {
+			// The terminal-state check belongs inside the serialized update:
+			// two racing holds must not both perform the transition, and only
+			// the request that actually transitions may meter completion.
+			if value.State == SessionHeld {
+				return errAlreadyHeld
+			}
+			if err := requireState(value, SessionVerified); err != nil {
+				return fmt.Errorf("%w: %v", errTransferStateInvalid, err)
+			}
 			value.State = SessionHeld
 			value.KeepLast = input.KeepLast
 			value.SourceAgentURL = input.SourceAgentURL
+			value.FencingProvider = input.FencingProvider
 			return nil
 		})
-		if err != nil {
-			writeError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", err.Error())
+		switch {
+		case errors.Is(updateErr, errAlreadyHeld):
+			if current, getErr := s.sessions.Get(sessionID, source); getErr == nil {
+				session = current
+			}
+		case errors.Is(updateErr, errTransferStateInvalid):
+			writeError(writer, http.StatusConflict, "TRANSFER_STATE_INVALID", updateErr.Error())
 			return
+		case updateErr != nil:
+			s.writeInternalError(writer, http.StatusInternalServerError, "TRANSFER_PERSIST_FAILED", updateErr)
+			return
+		default:
+			session = updated
+			s.meterCompletion(request.Context(), session, TransferChannelRestore)
 		}
 	}
 	s.replication.ReplicationHeld(session)
@@ -598,6 +791,20 @@ func (s *Server) get(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, session)
 }
 
+// getCleanup reads a session for rollback and recovery bookkeeping. Unlike get
+// it ignores the reservation expiry — tearing down what an abandoned session
+// left behind, and probing what a crashed migration may still have on the
+// destination, must stay possible after the clock runs out. The source-machine
+// binding still applies.
+func (s *Server) getCleanup(writer http.ResponseWriter, request *http.Request) {
+	session, err := s.sessions.GetForCleanup(request.PathValue("id"), peerMachine(request.Context()))
+	if err != nil {
+		writeError(writer, http.StatusNotFound, "TRANSFER_NOT_FOUND", err.Error())
+		return
+	}
+	writeJSON(writer, http.StatusOK, session)
+}
+
 func UniqueChunks(assets []model.AssetManifest) []model.ChunkRef {
 	seen := make(map[string]bool)
 	refs := make([]model.ChunkRef, 0)
@@ -611,6 +818,39 @@ func UniqueChunks(assets []model.AssetManifest) []model.ChunkRef {
 		}
 	}
 	return refs
+}
+
+// validCheckpointID reports whether a checkpoint ID may be joined into a
+// filesystem path. The manifest ID is peer-controlled input, and the
+// repository builds paths as Join(root, id, ...): an ID carrying separators
+// or dot segments would let a peer choose the path a root-owned agent writes
+// or deletes. The only IDs SHIFT mints are model.NewID() shapes; anything
+// outside the flat identifier charset is refused at this boundary before it
+// ever reaches a path join.
+func validCheckpointID(id string) bool {
+	if len(id) == 0 || len(id) > 64 {
+		return false
+	}
+	for index := 0; index < len(id); index++ {
+		char := id[index]
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9', char == '-', char == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// loadSessionManifest loads the manifest a session binds, refusing a
+// checkpoint ID that fails the flat-component check even if one reached the
+// session record by a legacy path. Every consumer that hands the ID to a
+// repository or restorer path join goes through here first.
+func (s *Server) loadSessionManifest(session Session) (model.CheckpointManifest, error) {
+	if !validCheckpointID(session.CheckpointID) {
+		return model.CheckpointManifest{}, errors.New("session checkpoint id is not a safe identifier")
+	}
+	return s.checkpoints.Load(session.CheckpointID)
 }
 
 func manifestContainsChunk(manifest model.CheckpointManifest, candidate model.ChunkRef) bool {
@@ -661,3 +901,30 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 func writeError(writer http.ResponseWriter, status int, code, message string) {
 	writeJSON(writer, status, model.ErrorResponse{Code: code, Message: message})
 }
+
+// writeInternalError reports a server-side failure without echoing internals
+// to the peer: the cause is logged here, and the response carries only a
+// stable code and message. Client-visible detail belongs in 4xx validation
+// responses, never in a 5xx body.
+func (s *Server) writeInternalError(writer http.ResponseWriter, status int, code string, err error) {
+	s.logger.Error("peer transfer request failed", "code", code, "error", err)
+	writeError(writer, status, code, "internal server error")
+}
+
+// freeSpaceFloor is the host free-space floor below which chunk ingest is
+// paused. Below it every workload on the host is one dump or restore away
+// from ENOSPC, so incoming chunks are refused while there is still room to
+// operate.
+const freeSpaceFloor = 512 << 20
+
+var (
+	errTransferQuota = errors.New("incoming transfer exceeded its reserved size")
+	// errAlreadyCommitted and errAlreadyHeld mark a terminal-state race
+	// inside the serialized session update: the request that loses the race
+	// must neither repeat the transition nor its completion metering.
+	errAlreadyCommitted = errors.New("transfer session is already committed")
+	errAlreadyHeld      = errors.New("transfer session is already held")
+	// errTransferStateInvalid wraps a state-machine refusal raised inside an
+	// update callback so the handler can answer 409 rather than 500.
+	errTransferStateInvalid = errors.New("transfer state invalid")
+)

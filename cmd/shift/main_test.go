@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"shift.dev/shift/internal/agentclient"
 	"shift.dev/shift/internal/checkpoint"
 	"shift.dev/shift/internal/migration"
 	"shift.dev/shift/internal/model"
@@ -193,5 +195,54 @@ func TestPrintPreflight(t *testing.T) {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("dry-run output missing %q:\n%s", want, rendered)
 		}
+	}
+}
+
+// TestDoctorReportJSONShape is the golden shape for `shiftgate doctor --json`
+// (master BR-03): clone-readiness fields always present with stable names so
+// the demo scripts can parse them without version negotiation.
+func TestDoctorReportJSONShape(t *testing.T) {
+	result := agentclient.DoctorResponse{
+		Healthy: true,
+		Checks: []struct {
+			Name    string `json:"name"`
+			OK      bool   `json:"ok"`
+			Message string `json:"message"`
+		}{
+			{Name: "platform", OK: true, Message: "linux/amd64"},
+			{Name: "privileges", OK: true, Message: "agent effective uid 0"},
+			{Name: "criu", OK: true, Message: "criu 3.17"},
+			{Name: "cgroup_v2", OK: true, Message: "cgroup v2 workload isolation"},
+		},
+	}
+	settings := options{stdout: io.Discard, stderr: io.Discard}
+	report := buildDoctorReport(context.Background(), settings, result)
+	if !report.CloneReady || !report.CRIUOK || !report.KernelOK {
+		t.Fatalf("clone readiness = %+v, want ready on a healthy machine", report)
+	}
+	if report.CloneHeadroomWorkers < 0 {
+		t.Fatalf("headroom = %d", report.CloneHeadroomWorkers)
+	}
+	if report.LiveMigrationPlan != "unknown" && report.LiveMigrationPlan != "yes" && report.LiveMigrationPlan != "no" {
+		t.Fatalf("live_migration_plan = %q", report.LiveMigrationPlan)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"criu_ok"`, `"kernel_ok"`, `"clone_ready"`, `"clone_headroom_workers"`, `"live_migration_plan"`, `"support_bundle"`} {
+		if !strings.Contains(string(encoded), field) {
+			t.Fatalf("doctor JSON missing %s: %s", field, encoded)
+		}
+	}
+
+	// Without CRIU: clone_ready=false and the reason names the failing check.
+	result.Checks[2].OK = false
+	report = buildDoctorReport(context.Background(), settings, result)
+	if report.CloneReady {
+		t.Fatal("clone_ready true without criu")
+	}
+	if !strings.Contains(report.CloneReadyReason, "criu") {
+		t.Fatalf("reason = %q, want it to name the criu check", report.CloneReadyReason)
 	}
 }

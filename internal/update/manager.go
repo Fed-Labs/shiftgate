@@ -417,6 +417,16 @@ func (manager *Manager) Apply(ctx context.Context, version string) (Installed, e
 			}
 			return Installed{}, err
 		}
+		if errors.Is(err, ErrTransient) {
+			// A transport or disk failure says nothing about the release: it
+			// must not burn the version on this machine. Record the failure
+			// and let the next check retry it.
+			manager.record(Event{Kind: EventFailed, FromVersion: manager.installation.Version, ToVersion: chosen.Version, Code: "INSTALL_RETRYABLE", Detail: err.Error()})
+			if persistErr := manager.persist(); persistErr != nil {
+				return Installed{}, persistErr
+			}
+			return Installed{}, err
+		}
 		manager.blockLocked(chosen.Version, err.Error())
 		manager.record(Event{Kind: EventFailed, FromVersion: manager.installation.Version, ToVersion: chosen.Version, Code: "INSTALL_FAILED", Detail: err.Error()})
 		if persistErr := manager.persist(); persistErr != nil {
@@ -424,22 +434,41 @@ func (manager *Manager) Apply(ctx context.Context, version string) (Installed, e
 		}
 		return Installed{}, err
 	}
+	// The swap is committed: state must reflect it even if the next
+	// housekeeping step fails. A version installed on disk is never reported
+	// as failed and never blocked — only a cleanup warning is attached.
 	record := installed
 	manager.state.LastInstalled = &record
 	manager.state.PendingVersion = ""
 	if !sameVersion(installed.Version, manager.installation.Version) {
 		manager.state.PendingVersion = installed.Version
 	}
-	manager.record(Event{Kind: EventInstalled, FromVersion: installed.PreviousVersion, ToVersion: installed.Version, Detail: installed.BackupID})
+	detail := installed.BackupID
+	if installed.CleanupWarning != "" {
+		if detail != "" {
+			detail += "; "
+		}
+		detail += installed.CleanupWarning
+		manager.logger.Warn("update installed with cleanup warning",
+			"component", string(installed.Component),
+			"from", installed.PreviousVersion,
+			"to", installed.Version,
+			"warning", installed.CleanupWarning)
+	}
+	manager.record(Event{Kind: EventInstalled, FromVersion: installed.PreviousVersion, ToVersion: installed.Version, Detail: detail})
 	if err := manager.persist(); err != nil {
-		return Installed{}, err
+		// The new binary is already in place. A state write that will not land
+		// right now is a cleanup warning, not an install failure; the state is
+		// in memory and is written again on the next mutation.
+		manager.logger.Warn("update state could not be persisted after install", "error", err)
+		record.CleanupWarning = strings.TrimSpace(record.CleanupWarning + "; " + err.Error())
 	}
 	manager.logger.Info("update installed",
 		"component", string(installed.Component),
 		"from", installed.PreviousVersion,
 		"to", installed.Version,
 		"backup", installed.BackupID)
-	return installed, nil
+	return record, nil
 }
 
 // choose resolves the requested version against the evaluations, returning a
@@ -656,27 +685,48 @@ func (manager *Manager) runOnce(ctx context.Context) {
 		}
 		return
 	}
-	if result.Available == nil || manager.policy == PolicyManual {
+	if manager.policy == PolicyManual {
 		return
 	}
-	if manager.policy == PolicyMandatory && !result.Available.Mandatory {
-		manager.logger.Info("update available but not mandatory",
-			"component", string(manager.installation.Component),
-			"version", result.Available.Version)
-		return
-	}
-	if _, err := manager.Apply(ctx, result.Available.Version); err != nil {
-		if errors.Is(err, ErrNotReady) {
-			manager.logger.Info("update deferred while the machine is busy",
-				"component", string(manager.installation.Component),
-				"version", result.Available.Version)
+	chosen := result.Available
+	if manager.policy == PolicyMandatory {
+		// The mandatory policy installs every applicable mandatory release,
+		// never skipping one because the feed holds a newer optional release:
+		// a mandatory security fix behind an optional feature release must
+		// still land. Only when no mandatory release is applicable does the
+		// loop leave the machine alone.
+		mandatory, found := SelectMandatory(result.Evaluations)
+		if !found {
+			if result.Available != nil {
+				manager.logger.Info("update available but not mandatory",
+					"component", string(manager.installation.Component),
+					"version", result.Available.Version)
+			}
 			return
 		}
-		if ctx.Err() == nil {
-			manager.logger.Error("automatic update failed",
+		chosen = &mandatory
+	}
+	if chosen == nil {
+		return
+	}
+	if _, err := manager.Apply(ctx, chosen.Version); err != nil {
+		switch {
+		case errors.Is(err, ErrNotReady):
+			manager.logger.Info("update deferred while the machine is busy",
 				"component", string(manager.installation.Component),
-				"version", result.Available.Version,
+				"version", chosen.Version)
+		case errors.Is(err, ErrTransient):
+			manager.logger.Warn("update failed transiently; will retry on the next check",
+				"component", string(manager.installation.Component),
+				"version", chosen.Version,
 				"error", err)
+		default:
+			if ctx.Err() == nil {
+				manager.logger.Error("automatic update failed",
+					"component", string(manager.installation.Component),
+					"version", chosen.Version,
+					"error", err)
+			}
 		}
 	}
 }

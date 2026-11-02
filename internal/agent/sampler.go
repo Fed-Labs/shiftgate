@@ -21,15 +21,26 @@ const (
 	gpuSampleInterval  = 5 * time.Minute
 )
 
+// sampleGPUUtilization is the device probe, a variable so tests can drive the
+// GPU loop without vendor hardware.
+var sampleGPUUtilization = device.SampleUtilization
+
 // runSampler publishes resource and agent-health gauges on diagnostics until
 // ctx is done. Sampling failures return an error to the caller (which logs it
 // at debug level); the previous gauge values stay in place, because a failed
-// read must not look like an idle or empty machine.
+// read must not look like an idle or empty machine. The GPU loop is joined on
+// the way out: shutdown is not over while a sampler goroutine is still
+// publishing, and a detached loop leaves frozen gauges behind it.
 func (s *Service) runSampler(ctx context.Context, diagnostics *observability.Diagnostics) {
 	if err := s.sampleHost(diagnostics); err != nil {
 		s.logger.Debug("host sampling failed", "error", err)
 	}
-	go s.sampleGPULoop(ctx, diagnostics)
+	gpuDone := make(chan struct{})
+	go func() {
+		defer close(gpuDone)
+		s.sampleGPULoop(ctx, diagnostics)
+	}()
+	defer func() { <-gpuDone }()
 	ticker := time.NewTicker(hostSampleInterval)
 	defer ticker.Stop()
 	for {
@@ -44,9 +55,10 @@ func (s *Service) runSampler(ctx context.Context, diagnostics *observability.Dia
 	}
 }
 
-// sampleGPULoop samples GPU utilization on its slower cadence.
+// sampleGPULoop samples GPU utilization on its slower cadence, keeping the
+// count of what the last pass reported so vanished devices can be retired.
 func (s *Service) sampleGPULoop(ctx context.Context, diagnostics *observability.Diagnostics) {
-	s.sampleGPUs(ctx, diagnostics)
+	reported := s.sampleGPUs(ctx, diagnostics, 0)
 	ticker := time.NewTicker(gpuSampleInterval)
 	defer ticker.Stop()
 	for {
@@ -54,7 +66,7 @@ func (s *Service) sampleGPULoop(ctx context.Context, diagnostics *observability.
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.sampleGPUs(ctx, diagnostics)
+			reported = s.sampleGPUs(ctx, diagnostics, reported)
 		}
 	}
 }
@@ -89,16 +101,28 @@ func (s *Service) sampleHost(diagnostics *observability.Diagnostics) error {
 	return nil
 }
 
-// sampleGPUs publishes per-GPU utilization and memory gauges. GPUs whose vendor
-// tool or sysfs counters are absent produce no gauges — SHIFT reports measured
-// utilization only, never a zero standing in for an unreadable sensor.
-func (s *Service) sampleGPUs(ctx context.Context, diagnostics *observability.Diagnostics) {
-	for index, sample := range device.SampleUtilization(ctx) {
+// sampleGPUs publishes per-GPU utilization and memory gauges and returns how
+// many devices it saw. GPUs whose vendor tool or sysfs counters are absent
+// produce no gauges — SHIFT reports measured utilization only, never a zero
+// standing in for an unreadable sensor. A GPU that vanished (or a tool that
+// now reports fewer devices) is the one exception: its stale gauges are
+// retired to zero so dashboards never show a phantom device frozen at its
+// last reading.
+func (s *Service) sampleGPUs(ctx context.Context, diagnostics *observability.Diagnostics, previous int) int {
+	samples := sampleGPUUtilization(ctx)
+	for index, sample := range samples {
 		prefix := "gpu_" + strconv.Itoa(index) + "_"
 		diagnostics.SetGauge(prefix+"utilization_percent", sample.UtilizationPercent)
 		diagnostics.SetGauge(prefix+"memory_used_bytes", float64(sample.MemoryUsedBytes))
 		diagnostics.SetGauge(prefix+"memory_total_bytes", float64(sample.MemoryTotalBytes))
 	}
+	for index := len(samples); index < previous; index++ {
+		prefix := "gpu_" + strconv.Itoa(index) + "_"
+		diagnostics.SetGauge(prefix+"utilization_percent", 0)
+		diagnostics.SetGauge(prefix+"memory_used_bytes", 0)
+		diagnostics.SetGauge(prefix+"memory_total_bytes", 0)
+	}
+	return len(samples)
 }
 
 type memoryUsage struct {

@@ -80,6 +80,13 @@ func (work inFlightWork) busy() error {
 	for _, session := range work.sessions() {
 		switch session.State {
 		case transfer.SessionCommitted, transfer.SessionRolledBack, transfer.SessionFailed:
+			// Terminal migration transfers are history, not work.
+		case transfer.SessionHeld:
+			// A held replication session is parked, complete, and verified:
+			// the duty record is the operational truth. It sits in HELD for
+			// its full reservation TTL, so treating it as in-flight would
+			// defer updates forever on a warm standby that receives pushes
+			// more often than the TTL — self-update would never apply there.
 		default:
 			return fmt.Errorf("incoming transfer %s for workload %s is %s", session.ID, session.WorkloadID, session.State)
 		}

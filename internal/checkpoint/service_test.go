@@ -846,7 +846,7 @@ func TestIncrementalAssetStaysDeltaOnlyAndMaterializesAncestors(t *testing.T) {
 		}
 	}
 	destination := t.TempDir()
-	if err := materializeProcessChain(context.Background(), repository, chunks, child, destination); err != nil {
+	if err := materializeProcessChain(context.Background(), repository, chunks, child, destination, RestorePolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	for _, expected := range []string{"images/pages.img", "parent-images/images/pages.img"} {

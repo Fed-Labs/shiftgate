@@ -124,3 +124,95 @@ func TestHandlerChainAnswersPreflight(t *testing.T) {
 		t.Fatalf("the full handler chain must echo the allowed origin, got %q", got)
 	}
 }
+
+// Every route the web dashboard calls with credentials:"include" must get
+// Access-Control-Allow-Credentials: without it the browser fails the whole
+// fetch as a CORS error — even though the server processed the request — and
+// signup, SSO sign-in, and account erasure read as network failures in the
+// dashboard while succeeding server-side.
+func TestCredentialedCookiePathsCarryAllowCredentials(t *testing.T) {
+	for _, path := range []string{
+		"/v1/auth/register",
+		"/v1/auth/login",
+		"/v1/auth/refresh",
+		"/v1/auth/logout",
+		"/v1/auth/sso/authorize",
+		"/v1/auth/sso/token",
+		"/v1/auth/github/authorize",
+		"/v1/auth/github/token",
+		"/v1/users/me",
+	} {
+		request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, path, nil)
+		request.Header.Set("Origin", "http://localhost:3001")
+		response, reached := performCORSRequest([]string{"http://localhost:3001"}, request)
+		if !reached {
+			t.Fatalf("%s from an allowed origin must reach the wrapped handler", path)
+		}
+		if got := response.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+			t.Fatalf("%s must allow credentialed CORS, got %q", path, got)
+		}
+	}
+}
+
+// Bearer-only API calls never ride the cookie session; they must not grow
+// Allow-Credentials, so a wildcard-adjacent misconfiguration cannot creep in
+// unnoticed.
+func TestNonCookieAPICallsDoNotAllowCredentials(t *testing.T) {
+	for _, path := range []string{"/v1/me", "/v1/organizations"} {
+		request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil)
+		request.Header.Set("Origin", "http://localhost:3001")
+		response, _ := performCORSRequest([]string{"http://localhost:3001"}, request)
+		if got := response.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+			t.Fatalf("%s must not allow credentialed CORS, got %q", path, got)
+		}
+	}
+}
+
+// Cookie-surface mutations from an origin this deployment does not list are
+// refused outright (defense in depth beyond SameSite=Strict) — but only when
+// an origin list exists; CLI requests carry no Origin and pass through.
+func TestCookiePathMutationFromUnlistedOriginIsRefused(t *testing.T) {
+	for _, path := range []string{"/v1/auth/register", "/v1/auth/login", "/v1/users/me"} {
+		request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, path, nil)
+		request.Header.Set("Origin", "http://evil.example")
+		response, reached := performCORSRequest([]string{"http://localhost:3001"}, request)
+		if reached {
+			t.Fatalf("%s from an unlisted origin must not reach the wrapped handler", path)
+		}
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("%s from an unlisted origin status = %d, want 403", path, response.Code)
+		}
+		if got := response.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Fatalf("%s refusal must carry no ACAO, got %q", path, got)
+		}
+
+		originless := httptest.NewRequestWithContext(context.Background(), http.MethodPost, path, nil)
+		response, reached = performCORSRequest([]string{"http://localhost:3001"}, originless)
+		if !reached {
+			t.Fatalf("%s without an Origin header (CLI) must reach the wrapped handler", path)
+		}
+		if response.Code == http.StatusForbidden {
+			t.Fatalf("%s without an Origin header must not be origin-refused", path)
+		}
+	}
+}
+
+// The preflight for a cookie path must also carry Allow-Credentials, or the
+// browser refuses the actual credentialed request before it is sent.
+func TestPreflightForCookiePathAllowsCredentials(t *testing.T) {
+	configuration := config.DefaultControlPlane()
+	configuration.AllowedOrigins = []string{"http://localhost:3001"}
+	server := New(configuration, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodOptions, "/v1/auth/register", nil)
+	request.Header.Set("Origin", "http://localhost:3001")
+	request.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	request.Header.Set("Access-Control-Request-Headers", "authorization, content-type")
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", recorder.Code)
+	}
+	if got := recorder.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("cookie-path preflight must allow credentialed CORS, got %q", got)
+	}
+}

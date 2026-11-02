@@ -99,15 +99,11 @@ func copyXattrs(source, destination string) error {
 		return err
 	}
 	for _, name := range splitNUL(buffer[:written]) {
-		size, err := lgetxattr(source, name, nil)
+		value, err := readXattrValue(source, name)
 		if err != nil {
 			if errors.Is(err, syscall.ENOTSUP) {
 				continue
 			}
-			return err
-		}
-		value := make([]byte, size)
-		if _, err := lgetxattr(source, name, value); err != nil {
 			return err
 		}
 		if err := lsetxattr(destination, name, value, 0); err != nil {
@@ -120,6 +116,32 @@ func copyXattrs(source, destination string) error {
 		}
 	}
 	return nil
+}
+
+// readXattrValue fetches one attribute's value, sized from the syscall's own
+// report of what it wrote rather than the earlier size probe: an attribute
+// that shrinks between the probe and the read must not smuggle trailing NULs
+// into the copy, and one that grows is retried once instead of failing the
+// clone with ERANGE.
+func readXattrValue(source, name string) ([]byte, error) {
+	size, err := lgetxattr(source, name, nil)
+	if err != nil {
+		return nil, err
+	}
+	for attempt := 0; ; attempt++ {
+		value := make([]byte, size)
+		written, err := lgetxattr(source, name, value)
+		if err != nil {
+			if errors.Is(err, syscall.ERANGE) && attempt == 0 {
+				if size, err = lgetxattr(source, name, nil); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return nil, err
+		}
+		return value[:written], nil
+	}
 }
 
 // splitNUL splits the NUL-separated list xattr syscalls return.

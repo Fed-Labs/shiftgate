@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS machines (
     machine_id TEXT NOT NULL,
     name TEXT NOT NULL,
     agent_url TEXT NOT NULL,
+    local_agent_url TEXT NOT NULL DEFAULT '',
     capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
     status TEXT NOT NULL DEFAULT 'offline' CHECK (status IN ('online', 'offline', 'draining', 'disabled')),
     last_seen_at TIMESTAMPTZ,

@@ -312,6 +312,10 @@ func openSSOTestServer(t *testing.T, sso bool) (*httptest.Server, string, string
 		Tokens       SessionTokens `json:"tokens"`
 	}
 	postJSON(t, httpServer.Client(), httpServer.URL+"/v1/auth/register", register, http.StatusCreated, &registration, "")
+	grantPlan(t, store, registration.Organization.ID, "business")
+	// Domain claims require a DNS ownership challenge in production; the
+	// fixture answers as if this organization had published its record.
+	stubSSODomainVerification(t, registration.Organization.ID)
 	return httpServer, registration.Organization.ID, "Bearer " + registration.Tokens.AccessToken, idp
 }
 

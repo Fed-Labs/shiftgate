@@ -182,6 +182,11 @@ func newLazyFixture(t *testing.T, engine Engine) lazyFixture {
 		t.Fatal(err)
 	}
 	service := NewService(stateRoot, runtimeManager, machine, linuxplatform.NewInventory(machine.Machine.ID), chunks, repository, engine, logger)
+	// Test roots live under the OS temp directory, which production policy
+	// denies outright; the explicit operator override is what admits them.
+	if err := service.SetRestorePolicy(RestorePolicy{AllowRootWorkload: true, AllowSystemTreeTargets: []string{os.TempDir()}}); err != nil {
+		t.Fatal(err)
+	}
 	restorer, err := OpenRestorer(service)
 	if err != nil {
 		t.Fatal(err)

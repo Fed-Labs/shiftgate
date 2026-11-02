@@ -245,3 +245,18 @@ func Select(evaluations []Evaluation) (Evaluation, bool) {
 	}
 	return Evaluation{}, false
 }
+
+// SelectMandatory picks the newest applicable release the publisher marked
+// mandatory, scanning past newer optional releases. The mandatory policy must
+// never skip a mandatory release just because the feed holds a newer
+// non-mandatory one: a security fix that never lands is the whole failure this
+// policy exists to prevent. Evaluations are ordered newest first, so the first
+// mandatory applicable release is the newest one.
+func SelectMandatory(evaluations []Evaluation) (Evaluation, bool) {
+	for _, evaluation := range evaluations {
+		if evaluation.Applicable && evaluation.Mandatory {
+			return evaluation, true
+		}
+	}
+	return Evaluation{}, false
+}

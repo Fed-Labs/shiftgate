@@ -217,3 +217,24 @@ func TestAgentUpdateEnvironmentOverrides(t *testing.T) {
 		t.Fatalf("environment did not override the threshold or interval: %+v", updates)
 	}
 }
+
+func TestUpdatesRejectRootLikeAndUncleanPaths(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*Updates)
+	}{
+		{"staging root", func(u *Updates) { u.StagingDir = "/" }},
+		{"backup root", func(u *Updates) { u.BackupDir = "/" }},
+		{"state file at root", func(u *Updates) { u.StateFile = "/" }},
+		{"unclean staging", func(u *Updates) { u.StagingDir = "/srv/shift/updates/../staging" }},
+		{"unclean executable", func(u *Updates) { u.ExecutablePath = "/usr/local/bin/../bin/shift-agent" }},
+	} {
+		configuration := DefaultUpdates()
+		configuration.StagingDir = "/srv/shift/updates/staging"
+		configuration.BackupDir = "/srv/shift/updates/backups"
+		testCase.mutate(&configuration)
+		if err := configuration.Validate("/srv/shift"); err == nil {
+			t.Fatalf("%s must be refused", testCase.name)
+		}
+	}
+}

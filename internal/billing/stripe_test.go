@@ -46,6 +46,8 @@ func (f *fakeStripe) handler(writer http.ResponseWriter, request *http.Request) 
 		_, _ = writer.Write([]byte(`{"id":"cs_test_1","url":"https://checkout.stripe.com/c/pay/cs_test_1"}`))
 	case "/v1/billing_portal/sessions":
 		_, _ = writer.Write([]byte(`{"url":"https://billing.stripe.com/session/portal_1"}`))
+	case "/v1/subscriptions/sub_1":
+		_, _ = writer.Write([]byte(`{"id":"sub_1","status":"active","metadata":{"plan":"business","seats":"12","interval":"month","addons":""},"items":{"data":[{"id":"si_base","quantity":1,"price":{"id":"price_business","unit_amount":9900}},{"id":"si_seats","quantity":7,"price":{"id":"price_generated_seat","unit_amount":1900}}]}}`))
 	default:
 		writer.WriteHeader(http.StatusNotFound)
 	}
@@ -138,6 +140,7 @@ func TestCreateCheckoutSessionPrefersStoredCustomer(t *testing.T) {
 		CustomerID:     "cus_1",
 		CustomerEmail:  "admin@example.com",
 		SeatQuantity:   5,
+		PerSeatBilling: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -150,6 +153,47 @@ func TestCreateCheckoutSessionPrefersStoredCustomer(t *testing.T) {
 	}
 	if form.Get("line_items[0][quantity]") != "5" {
 		t.Fatalf("seat quantity = %q", form.Get("line_items[0][quantity]"))
+	}
+}
+
+func TestCreateCheckoutSessionFlatPlanBillsBaseOnce(t *testing.T) {
+	stripe := newFakeStripe()
+	server := httptest.NewServer(http.HandlerFunc(stripe.handler))
+	defer server.Close()
+	client := NewStripeClient("sk_test_123")
+	client.baseURL = server.URL
+	if _, err := client.CreateCheckoutSession(context.Background(), CheckoutSessionRequest{
+		OrganizationID: "org_1",
+		PlanKey:        "business",
+		PriceID:        "price_business",
+		CustomerEmail:  "admin@example.com",
+		SeatQuantity:   7,
+		Interval:       "year",
+		AddOnPriceIDs:  []string{"price_addon_ha"},
+		AddOnKeys:      []string{"ha"},
+		Coupon:         "promo_founding",
+		SpendCapCents:  5000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	form := stripe.lastForm()
+	if form.Get("line_items[0][quantity]") != "1" {
+		t.Fatalf("flat plan base quantity = %q, want 1", form.Get("line_items[0][quantity]"))
+	}
+	if form.Get("metadata[interval]") != "year" {
+		t.Fatalf("interval metadata = %q", form.Get("metadata[interval]"))
+	}
+	if form.Get("metadata[addons]") != "ha" {
+		t.Fatalf("addons metadata = %q", form.Get("metadata[addons]"))
+	}
+	if form.Get("metadata[spend_cap_cents]") != "5000" {
+		t.Fatalf("spend cap metadata = %q", form.Get("metadata[spend_cap_cents]"))
+	}
+	if form.Get("line_items[1][price]") != "price_addon_ha" {
+		t.Fatalf("add-on line = %q", form.Get("line_items[1][price]"))
+	}
+	if form.Get("discounts[0][promotion_code]") != "promo_founding" {
+		t.Fatalf("coupon = %q", form.Get("discounts[0][promotion_code]"))
 	}
 }
 
@@ -208,5 +252,130 @@ func TestStripeErrorsCarryMessage(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "401") && !strings.Contains(err.Error(), "Unauthorized") {
 		t.Fatalf("error lost the status: %v", err)
+	}
+}
+
+// The purchased seat ceiling must reach the webhook (session metadata) and
+// extras must bill on a dedicated per-seat line item at SeatOverageCents —
+// never as quantity on the flat base price, which Stripe multiplies.
+func TestCreateCheckoutSessionWritesSeatCeilingAndExtrasLine(t *testing.T) {
+	stripe := newFakeStripe()
+	server := httptest.NewServer(http.HandlerFunc(stripe.handler))
+	defer server.Close()
+	client := NewStripeClient("sk_test_123")
+	client.baseURL = server.URL
+	if _, err := client.CreateCheckoutSession(context.Background(), CheckoutSessionRequest{
+		OrganizationID: "org_1",
+		PlanKey:        "business",
+		PriceID:        "price_business",
+		CustomerEmail:  "admin@example.com",
+		SuccessURL:     "https://app.example.com/billing?status=success",
+		CancelURL:      "https://app.example.com/billing?status=cancel",
+		SeatQuantity:   12,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	form := stripe.lastForm()
+	if form.Get("metadata[seats]") != "12" {
+		t.Fatalf("seat ceiling metadata = %q, want 12", form.Get("metadata[seats]"))
+	}
+	if form.Get("line_items[0][quantity]") != "1" {
+		t.Fatalf("flat base quantity = %q, want 1", form.Get("line_items[0][quantity]"))
+	}
+	// 12 purchased − 5 included = 7 extras at $19/mo each.
+	if form.Get("line_items[1][quantity]") != "7" {
+		t.Fatalf("extras quantity = %q, want 7", form.Get("line_items[1][quantity]"))
+	}
+	if form.Get("line_items[1][price_data][unit_amount]") != "1900" {
+		t.Fatalf("extras unit amount = %q, want 1900", form.Get("line_items[1][price_data][unit_amount]"))
+	}
+	if form.Get("line_items[1][price_data][recurring][interval]") != "month" {
+		t.Fatalf("extras interval = %q, want month", form.Get("line_items[1][price_data][recurring][interval]"))
+	}
+}
+
+func TestCreateCheckoutSessionExtrasFollowAddOnsAndRespectInterval(t *testing.T) {
+	stripe := newFakeStripe()
+	server := httptest.NewServer(http.HandlerFunc(stripe.handler))
+	defer server.Close()
+	client := NewStripeClient("sk_test_123")
+	client.baseURL = server.URL
+	if _, err := client.CreateCheckoutSession(context.Background(), CheckoutSessionRequest{
+		OrganizationID: "org_1",
+		PlanKey:        "business",
+		PriceID:        "price_business",
+		CustomerEmail:  "admin@example.com",
+		SuccessURL:     "https://app.example.com/billing?status=success",
+		CancelURL:      "https://app.example.com/billing?status=cancel",
+		SeatQuantity:   7,
+		Interval:       "year",
+		AddOnPriceIDs:  []string{"price_addon_ha"},
+		AddOnKeys:      []string{"ha"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	form := stripe.lastForm()
+	if form.Get("metadata[seats]") != "7" {
+		t.Fatalf("seat ceiling metadata = %q, want 7", form.Get("metadata[seats]"))
+	}
+	// The extras line follows the add-on line and bills the annual seat
+	// overage (12 × $19).
+	if form.Get("line_items[2][quantity]") != "2" {
+		t.Fatalf("extras quantity = %q, want 2", form.Get("line_items[2][quantity]"))
+	}
+	if form.Get("line_items[2][price_data][unit_amount]") != "22800" {
+		t.Fatalf("annual extras unit amount = %q, want 22800", form.Get("line_items[2][price_data][unit_amount]"))
+	}
+	if form.Get("line_items[2][price_data][recurring][interval]") != "year" {
+		t.Fatalf("extras interval = %q, want year", form.Get("line_items[2][price_data][recurring][interval]"))
+	}
+}
+
+func TestCreateCheckoutSessionNoExtrasLineWithinIncludedSeats(t *testing.T) {
+	stripe := newFakeStripe()
+	server := httptest.NewServer(http.HandlerFunc(stripe.handler))
+	defer server.Close()
+	client := NewStripeClient("sk_test_123")
+	client.baseURL = server.URL
+	if _, err := client.CreateCheckoutSession(context.Background(), CheckoutSessionRequest{
+		OrganizationID: "org_1",
+		PlanKey:        "business",
+		PriceID:        "price_business",
+		CustomerEmail:  "admin@example.com",
+		SuccessURL:     "https://app.example.com/billing?status=success",
+		CancelURL:      "https://app.example.com/billing?status=cancel",
+		SeatQuantity:   5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	form := stripe.lastForm()
+	if form.Get("metadata[seats]") != "5" {
+		t.Fatalf("seat ceiling metadata = %q, want 5", form.Get("metadata[seats]"))
+	}
+	if form.Get("line_items[1][quantity]") != "" {
+		t.Fatalf("extras line billed within the included seats: %v", form)
+	}
+}
+
+// GetSubscription reports the purchased ceiling from metadata and points the
+// seat sync at the extras line item — never the base plan price.
+func TestGetSubscriptionReadsSeatCeilingAndExtrasItem(t *testing.T) {
+	stripe := newFakeStripe()
+	server := httptest.NewServer(http.HandlerFunc(stripe.handler))
+	defer server.Close()
+	client := NewStripeClient("sk_test_123")
+	client.baseURL = server.URL
+	subscription, err := client.GetSubscription(context.Background(), "sub_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subscription.Seats != 12 {
+		t.Fatalf("seats = %d, want the 12-seat purchase from metadata", subscription.Seats)
+	}
+	if subscription.ItemID != "si_seats" {
+		t.Fatalf("seat item = %q, want the extras line si_seats, not the base price item", subscription.ItemID)
+	}
+	if subscription.Plan != "business" {
+		t.Fatalf("plan = %q, want business", subscription.Plan)
 	}
 }

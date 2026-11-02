@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"shift.dev/shift/internal/model"
+	"shift.dev/shift/internal/persistence"
 )
 
 // StatusDocumentName is the file, inside the workload's state directory, that
@@ -70,9 +71,11 @@ type StatusDocument struct {
 }
 
 // WriteStatus writes the status document into a workload's .shift directory,
-// creating it if needed, with owner-only permissions. The write is atomic: the
-// document is staged and renamed, so an application can never observe a partial
-// status file, and a crash mid-write leaves the previous one intact.
+// creating it if needed, with owner-only permissions. The write is durable in
+// the same sense as every other artifact persistence.WriteFile produces: the
+// document is staged, synced, and renamed with the directory synced, so an
+// application can never observe a partial status file and a crash mid-write
+// loses neither the previous document nor the one just published.
 func WriteStatus(root string, document StatusDocument) (string, error) {
 	if strings.TrimSpace(document.OperationID) == "" {
 		return "", fmt.Errorf("migration status requires an operation id")
@@ -106,12 +109,7 @@ func WriteStatus(root string, document StatusDocument) (string, error) {
 		return "", fmt.Errorf("create status directory: %w", err)
 	}
 	path := filepath.Join(directory, StatusDocumentName)
-	staged := path + ".tmp"
-	if err := os.WriteFile(staged, append(encoded, '\n'), 0o600); err != nil {
-		return "", fmt.Errorf("stage migration status: %w", err)
-	}
-	if err := os.Rename(staged, path); err != nil {
-		_ = os.Remove(staged)
+	if err := persistence.WriteFile(path, append(encoded, '\n'), 0o600); err != nil {
 		return "", fmt.Errorf("publish migration status: %w", err)
 	}
 	return path, nil

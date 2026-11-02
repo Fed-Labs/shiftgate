@@ -94,7 +94,10 @@ func OpenForker(service *Service) (*Forker, error) {
 	}
 	forker := &Forker{service: service, records: records, logger: service.logger}
 	if err := forker.Recover(context.Background()); err != nil {
-		return nil, err
+		// Recovery problems must never keep the agent from booting: the
+		// interrupted records stay queued and the next start retries them,
+		// while every other workload on the machine can run today.
+		forker.logger.Error("fork recovery incomplete; interrupted forks remain queued for the next start", "error", err)
 	}
 	return forker, nil
 }
@@ -125,6 +128,12 @@ func (f *Forker) Fork(parent context.Context, sourceWorkloadID string, options F
 	if err != nil {
 		return ForkRecord{}, err
 	}
+	// Defense in depth at the point of use: ingest paths gate on the trust
+	// store, and the fork is a checkpoint-into-new-root pipeline, so a
+	// manifest that is not signed by a trust anchor is refused here too.
+	if err := f.service.repository.Trust().Admit(manifest); err != nil {
+		return ForkRecord{}, fmt.Errorf("checkpoint %s: %w", manifest.ID, err)
+	}
 	filesystemAsset, ok := assetByName(manifest.Assets, "filesystem-root")
 	if !ok {
 		return ForkRecord{}, errors.New("fork point has no filesystem root asset")
@@ -144,6 +153,9 @@ func (f *Forker) Fork(parent context.Context, sourceWorkloadID string, options F
 		return ForkRecord{}, err
 	}
 	sourceRoot := filepath.Clean(manifest.Workload.RootPath)
+	if registered := f.service.registeredRoot(sourceWorkloadID); registered != "" && registered != sourceRoot {
+		return ForkRecord{}, fmt.Errorf("%w: fork point targets %s but the source workload is registered with root %s", ErrRestoreTargetDenied, sourceRoot, registered)
+	}
 	forkRoot, err := forkRootPath(sourceRoot, options.RootPath, sessionID)
 	if err != nil {
 		return ForkRecord{}, err
@@ -151,6 +163,24 @@ func (f *Forker) Fork(parent context.Context, sourceWorkloadID string, options F
 	forkSpec, err := forkSpecification(manifest.Workload, forkWorkloadID, options.Name, forkRoot, sessionID, manifest.ID)
 	if err != nil {
 		return ForkRecord{}, err
+	}
+	policy, err := f.service.activeRestorePolicy()
+	if err != nil {
+		return ForkRecord{}, err
+	}
+	if err := policy.CheckNewRoot(forkRoot, sourceRoot, forkSpec); err != nil {
+		return ForkRecord{}, err
+	}
+	// An activated fork's restore rebinds the source's listeners and claims
+	// the fork's host ports. The claim is taken before anything is copied —
+	// the way a restore takes it — so forking a port-publishing workload
+	// beside the still-running original fails here, explicitly, instead of
+	// after the full extraction and capture. A materialized-only fork runs
+	// nothing and holds nothing, so it needs no claim.
+	if options.Activate {
+		if err := reserveRestorePorts(f.service.network, forkWorkloadID, "fork", manifest.Workload, forkSpec); err != nil {
+			return ForkRecord{}, err
+		}
 	}
 	record = ForkRecord{
 		ID: sessionID, SourceWorkloadID: manifest.Workload.ID, SourceCheckpointID: manifest.ID,
@@ -161,6 +191,9 @@ func (f *Forker) Fork(parent context.Context, sourceWorkloadID string, options F
 		Generation:      forkSpec.Lineage.Generation, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	if err := f.records.Put(record.ID, record); err != nil {
+		if options.Activate && f.service.network != nil {
+			f.service.network.Deactivate(forkWorkloadID, rollbackDrainGrace)
+		}
 		return ForkRecord{}, err
 	}
 	defer func() {
@@ -170,9 +203,9 @@ func (f *Forker) Fork(parent context.Context, sourceWorkloadID string, options F
 			}
 		}
 	}()
-	// The fork's declared ports are reserved when the fork is activated —
-	// a fork that is only materialized runs nothing and holds nothing. See
-	// activate().
+	// The fork's declared ports are reserved up front, before the copies,
+	// when the fork will be activated; a fork that is only materialized runs
+	// nothing and holds nothing.
 	err = f.materialize(ctx, &record, manifest, filesystemAsset, forkSpec)
 	if err != nil {
 		return record, err
@@ -218,7 +251,8 @@ func (f *Forker) forkPoint(ctx context.Context, source model.Workload, options F
 // Chunks are re-encrypted under the fork's key namespace so that deleting or
 // rotating the source workload can never invalidate the fork's state.
 func (f *Forker) materialize(ctx context.Context, record *ForkRecord, manifest model.CheckpointManifest, filesystemAsset model.AssetManifest, forkSpec model.WorkloadSpec) error {
-	if err := os.MkdirAll(filepath.Dir(record.RootPath), 0o755); err != nil {
+	policy, err := f.service.activeRestorePolicy()
+	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(record.StagingRoot, 0o700); err != nil {
@@ -227,14 +261,14 @@ func (f *Forker) materialize(ctx context.Context, record *ForkRecord, manifest m
 	if err := os.MkdirAll(record.ImagesDirectory, 0o700); err != nil {
 		return err
 	}
-	if err := extractDirectory(ctx, f.service.chunks, manifest.Workload.ID, filesystemAsset, record.StagingRoot); err != nil {
+	if err := extractDirectory(ctx, f.service.chunks, manifest.Workload.ID, filesystemAsset, record.StagingRoot, policy); err != nil {
 		return err
 	}
 	extracted, err := validateExtractedRoot(record.StagingRoot, filepath.Base(record.SourceRootPath))
 	if err != nil {
 		return err
 	}
-	if err := materializeProcessChain(ctx, f.service.repository, f.service.chunks, manifest, record.ImagesDirectory); err != nil {
+	if err := materializeProcessChain(ctx, f.service.repository, f.service.chunks, manifest, record.ImagesDirectory, policy); err != nil {
 		return err
 	}
 	images := filepath.Join(record.ImagesDirectory, "images")
@@ -256,19 +290,39 @@ func (f *Forker) materialize(ctx context.Context, record *ForkRecord, manifest m
 	if err != nil {
 		return err
 	}
+	// Persist every mutation the moment it happens, the way Cloner.setMember
+	// does: the phase ahead is the heavy one (capture, mirror), and a crash
+	// anywhere in it must leave a record that recovery can reverse — a fork
+	// workload or fork checkpoint that only exists in memory would survive
+	// the rollback that is supposed to remove it.
 	record.CreatedWorkload = created
-	forkManifest, err := f.captureFork(ctx, manifest, forkSpec, record.ImagesDirectory)
-	if err != nil {
+	if err := f.put(record); err != nil {
 		return err
 	}
-	record.ForkCheckpointID = forkManifest.ID
-	record.PlainBytes = forkManifest.Metrics.PlainBytes
-	record.StoredBytes = forkManifest.Metrics.StoredBytes
-	record.DeduplicatedBytes = forkManifest.Metrics.DeduplicatedBytes
+	forkManifest, captureErr := f.captureFork(ctx, manifest, forkSpec, record.ImagesDirectory)
+	if forkManifest.ID != "" {
+		record.ForkCheckpointID = forkManifest.ID
+		record.PlainBytes = forkManifest.Metrics.PlainBytes
+		record.StoredBytes = forkManifest.Metrics.StoredBytes
+		record.DeduplicatedBytes = forkManifest.Metrics.DeduplicatedBytes
+		if err := f.put(record); err != nil {
+			return err
+		}
+	}
+	if captureErr != nil {
+		return captureErr
+	}
 	if _, err := f.service.runtime.MarkCheckpoint(forkSpec.ID, forkManifest.ID, false); err != nil {
 		return err
 	}
 	return f.transition(record, ForkMaterialized, "")
+}
+
+// put persists the record at its current state of mutation so a crash at any
+// later instant leaves recovery with the full truth.
+func (f *Forker) put(record *ForkRecord) error {
+	record.UpdatedAt = time.Now().UTC()
+	return f.records.Put(record.ID, *record)
 }
 
 // captureFork writes a self-contained full checkpoint owned by the fork. The
@@ -340,7 +394,10 @@ func (f *Forker) captureFork(ctx context.Context, manifest model.CheckpointManif
 	}
 	if f.service.mirror != nil {
 		if _, mirrorErr := f.service.MirrorCheckpoint(ctx, checkpointID); mirrorErr != nil {
-			return model.CheckpointManifest{}, fmt.Errorf("fork checkpoint %s persisted locally but object-store mirror failed: %w", checkpointID, mirrorErr)
+			// The checkpoint is already persisted locally: return it with the
+			// error so the caller records its id and the rollback removes it,
+			// instead of leaving an unattached checkpoint behind.
+			return forkManifest, fmt.Errorf("fork checkpoint %s persisted locally but object-store mirror failed: %w", checkpointID, mirrorErr)
 		}
 	}
 	return forkManifest, nil
@@ -354,22 +411,10 @@ func (f *Forker) activate(ctx context.Context, record *ForkRecord, manifest mode
 	if err := f.transition(record, ForkActivating, ""); err != nil {
 		return err
 	}
-	// The fork's declared host ports are reserved before the process comes
-	// up: forking a port-publishing workload on the machine where the
-	// original still runs fails here with a clear conflict instead of dying
-	// inside the CRIU restore with an address-in-use error.
-	if len(forkSpec.Ports) > 0 {
-		if f.service.network == nil {
-			return errors.New("this agent has no network layer configured; a workload with declared ports cannot be forked")
-		}
-		mappings, mappingsErr := network.MappingsFor(forkSpec)
-		if mappingsErr != nil {
-			return fmt.Errorf("resolve fork ports: %w", mappingsErr)
-		}
-		if err := f.service.network.Prepare(forkSpec.ID, mappings); err != nil {
-			return fmt.Errorf("reserve fork host ports: %w", err)
-		}
-	}
+	// The fork's host-port claim was taken before anything was copied (see
+	// Fork); the restore only has to bring the process up now, so a conflict
+	// with the still-running original is already a pre-copy error, not one
+	// discovered inside the CRIU restore.
 	images := filepath.Join(record.ImagesDirectory, "images")
 	mounts := []BindMount{}
 	if record.RootPath != record.SourceRootPath {
@@ -514,24 +559,27 @@ func (f *Forker) rollback(ctx context.Context, record *ForkRecord, reason string
 
 // Recover reverses forks that were interrupted before commit. A fork that was
 // materialized but never committed left a half-registered workload behind, so
-// removing it keeps the workload list truthful after a crash.
+// removing it keeps the workload list truthful after a crash. One stuck
+// rollback does not strand the rest: every record is attempted and the
+// collected failures are returned together at the end.
 func (f *Forker) Recover(ctx context.Context) error {
+	var problems []error
 	for _, record := range f.records.List() {
 		switch record.State {
 		case ForkPreparing, ForkMaterialized, ForkActivating, ForkRollingBack:
 			if err := f.rollback(ctx, &record, "agent restarted before the fork was committed"); err != nil {
-				return fmt.Errorf("recover fork %s: %w", record.ID, err)
+				problems = append(problems, fmt.Errorf("recover fork %s: %w", record.ID, err))
 			}
 		case ForkRunning:
 			workload, err := f.service.runtime.Get(record.ForkWorkloadID)
 			if err != nil || workload.Process == nil || !linuxplatform.ProcessAlive(workload.Process.PID, workload.Process.ProcStartTicks) {
 				if err := f.rollback(ctx, &record, "forked process missing after agent restart"); err != nil {
-					return err
+					problems = append(problems, fmt.Errorf("recover fork %s: %w", record.ID, err))
 				}
 			}
 		}
 	}
-	return nil
+	return errors.Join(problems...)
 }
 
 // forkRootPath validates an operator-supplied fork root or derives one beside
@@ -568,8 +616,11 @@ func pathContains(parent, child string) bool {
 }
 
 // forkSpecification rewrites the source specification for the fork: a new
-// identity, a new root, paths rebased onto that root, and published host ports
-// dropped because two workloads cannot occupy the same host port.
+// identity, a new root, paths and root-absolute command elements rebased onto
+// that root, and published host ports dropped because two workloads cannot
+// occupy the same host port. Leaving the command rebased to the source root
+// would make every later stop→start of the fork execute the source tree's
+// files — the fork's independence would end at its first restart.
 func forkSpecification(source model.WorkloadSpec, forkID, name, forkRoot, sessionID, checkpointID string) (model.WorkloadSpec, error) {
 	spec := source
 	spec.ID = forkID
@@ -584,6 +635,11 @@ func forkSpecification(source model.WorkloadSpec, forkID, name, forkRoot, sessio
 		return model.WorkloadSpec{}, err
 	}
 	spec.WorkingDir = rebased
+	command, err := rebaseCommand(sourceRoot, forkRoot, source.Command)
+	if err != nil {
+		return model.WorkloadSpec{}, err
+	}
+	spec.Command = command
 	spec.Paths = make([]model.PathSpec, 0, len(source.Paths))
 	for _, path := range source.Paths {
 		rebasedPath, err := rebasePath(sourceRoot, forkRoot, path.Path)
@@ -633,4 +689,31 @@ func rebasePath(sourceRoot, forkRoot, path string) (string, error) {
 		return "", fmt.Errorf("%q is outside the source workload root", path)
 	}
 	return filepath.Join(forkRoot, relative), nil
+}
+
+// rebaseCommand rewrites a command so it executes the new root's files after
+// a restart. An argv element that is a root-absolute path inside the source
+// root — the script itself or an argument like a root-absolute data file — is
+// rebased onto the new root; host-level binaries (python3, /usr/bin/...) and
+// relative arguments are left untouched, because those never belonged to the
+// workload's root in the first place.
+func rebaseCommand(sourceRoot, newRoot string, command []string) ([]string, error) {
+	rebased := make([]string, len(command))
+	for index, element := range command {
+		if !filepath.IsAbs(element) {
+			rebased[index] = element
+			continue
+		}
+		clean := filepath.Clean(element)
+		if clean != sourceRoot && !pathContains(sourceRoot, clean) {
+			rebased[index] = element
+			continue
+		}
+		moved, err := rebasePath(sourceRoot, newRoot, clean)
+		if err != nil {
+			return nil, err
+		}
+		rebased[index] = moved
+	}
+	return rebased, nil
 }

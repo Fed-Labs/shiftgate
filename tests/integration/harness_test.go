@@ -17,6 +17,7 @@ package integration
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -37,6 +38,7 @@ import (
 // requireE2E skips unless the environment can really checkpoint and restore.
 func requireE2E(t testing.TB) {
 	t.Helper()
+	recordLaneOutcome(t)
 	if os.Getenv("SHIFT_TEST_E2E") != "1" {
 		t.Skip("set SHIFT_TEST_E2E=1 to run end-to-end tests with real CRIU checkpoint/restore")
 	}
@@ -98,10 +100,10 @@ func startAgentAt(t testing.TB, name, stateDir, socketDir string) *agentProcess 
 func startAgentWith(t testing.TB, name, stateDir, socketDir string, mutate func(*config.Agent)) *agentProcess {
 	t.Helper()
 	socket := filepath.Join(socketDir, name+".sock")
-	port, err := freePort()
-	if err != nil {
-		t.Fatalf("find a free port: %v", err)
-	}
+	// The peer port is held until the agent's remote listener binds it —
+	// released immediately before Run starts — so a sibling test's port
+	// search cannot claim it in between.
+	port, releasePort := reservePort(t)
 
 	configuration := config.DefaultAgent()
 	configuration.StateDir = stateDir
@@ -111,6 +113,12 @@ func startAgentWith(t testing.TB, name, stateDir, socketDir string, mutate func(
 	configuration.ObjectStore = config.DefaultAgent().ObjectStore
 	configuration.LogLevel = "warn"
 	configuration.Updates = config.DefaultAgent().Updates
+	// Harness agents are detached (no control-plane identity), so the live
+	// migration gate has no entitlement source to consult. The suite runs
+	// live-mode scenarios on behalf of a paid-plan deployment; the config
+	// assertion is the documented detached-agent escape hatch
+	// (docs/limitations.md "Plan tiering").
+	configuration.Entitlement.LiveMigration = true
 	// Each agent gets its own cgroup root, the way two agents on two machines
 	// have theirs on two filesystems: workload cgroup paths are derived from
 	// the workload id alone, so a shared root would put both agents' trees for
@@ -128,6 +136,7 @@ func startAgentWith(t testing.TB, name, stateDir, socketDir string, mutate func(
 	}
 	runContext, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	releasePort()
 	go func() { done <- service.Run(runContext) }()
 
 	client, err := agentclient.New("unix://"+socket, 2*time.Minute)
@@ -211,6 +220,36 @@ func freePort() (int, error) {
 	}
 	defer listener.Close()
 	return listener.Addr().(*net.TCPAddr).Port, nil
+}
+
+// reservePort binds an ephemeral loopback port and holds the listener until
+// release, so no other test can claim the port in the gap before this test's
+// own consumer binds it. Callers release as late as they can — immediately
+// before the agent's peer listener or the workload's server binds — and a
+// double release is a no-op.
+func reservePort(t testing.TB) (int, func()) {
+	t.Helper()
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { _ = listener.Close() }) }
+	t.Cleanup(release)
+	return listener.Addr().(*net.TCPAddr).Port, release
+}
+
+// requirePortDead re-checks that a port chosen as a dead destination is still
+// unbound right before the probe that must be refused. A port recycled to
+// some other listener between selection and use would otherwise turn the
+// must-fail probe into a spurious success (and the test into a mystery).
+func requirePortDead(t testing.TB, port int) {
+	t.Helper()
+	connection, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 300*time.Millisecond)
+	if err == nil {
+		_ = connection.Close()
+		t.Fatalf("port %d was claimed by another process before the dead-destination probe; the probe would be answered", port)
+	}
 }
 
 // peerURL is the destination endpoint a migration from another agent uses.
@@ -325,9 +364,12 @@ func migrationTerminal(stage model.MigrationStage) bool {
 
 // waitForMigrationTerminal polls the migration until it reaches a terminal
 // stage and returns it, failing the test on the timeout instead of guessing.
-func waitForMigrationTerminal(t testing.TB, client *agentclient.Client, migrationID string) model.Migration {
+// The timeout is the caller's: it must cover the migration's own
+// TimeoutSeconds (and any latency the scenario deliberately adds), or the
+// helper fails while the migration is legitimately still working.
+func waitForMigrationTerminal(t testing.TB, client *agentclient.Client, migrationID string, timeout time.Duration) model.Migration {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Minute)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		migration, err := client.Migration(ctx, migrationID)
@@ -340,7 +382,7 @@ func waitForMigrationTerminal(t testing.TB, client *agentclient.Client, migratio
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	t.Fatalf("migration %s did not reach a terminal stage within 5m", migrationID)
+	t.Fatalf("migration %s did not reach a terminal stage within %s", migrationID, timeout)
 	return model.Migration{}
 }
 
@@ -429,4 +471,106 @@ func corruptFirstChunk(t testing.TB, root string) (string, error) {
 		return "", err
 	}
 	return chunkPath, nil
+}
+
+// counterLines reads a workload's progress log as complete non-empty lines,
+// tolerating a writer caught mid-append on its final partial line (the tail
+// is dropped; the next poll sees it whole).
+func counterLines(t testing.TB, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read counter log %s: %v", path, err)
+	}
+	text := string(data)
+	if !strings.HasSuffix(text, "\n") {
+		if cut := strings.LastIndex(text, "\n"); cut >= 0 {
+			text = text[:cut+1]
+		} else {
+			text = ""
+		}
+	}
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// assertCounterContinuity pins the evidence a counter log must carry across
+// any checkpoint, restore, migration, clone, or failover: the log is the
+// unbroken counting sequence 1, 2, 3, ... with no restart and no gap, and
+// the first line appended past the `before` lines written before the
+// operation continues at before+1. A restore that re-executed the workload
+// command instead of resuming its state re-logs 1 and breaks the sequence at
+// exactly that line; log growth alone cannot tell the two apart.
+func assertCounterContinuity(t testing.TB, path string, before int) {
+	t.Helper()
+	lines := counterLines(t, path)
+	if len(lines) <= before {
+		t.Fatalf("counter log %s has %d lines, want more than the %d written before the operation", path, len(lines), before)
+	}
+	values := make([]int, len(lines))
+	for i, line := range lines {
+		var value int
+		if _, err := fmt.Sscanf(line, "%d", &value); err != nil {
+			t.Fatalf("counter log line %d (%q) carries no counter value", i+1, line)
+		}
+		values[i] = value
+	}
+	if values[before] != before+1 {
+		t.Fatalf("counter did not continue across the operation: the first line written after it is line %d with value %d, want %d (a restarted counter re-logs 1; growth alone hides it)",
+			before+1, values[before], before+1)
+	}
+	for i, value := range values {
+		if value != i+1 {
+			t.Fatalf("counter log is not the unbroken sequence: line %d carries %d, want %d", i+1, value, i+1)
+		}
+	}
+}
+
+// tagValues reads a "writer value" log (a process tree whose workers each
+// tag their lines) into per-writer counter sequences, in write order.
+func tagValues(t testing.TB, path string) map[string][]int {
+	t.Helper()
+	sequences := make(map[string][]int)
+	for _, line := range counterLines(t, path) {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			t.Fatalf("tagged counter line %q is not \"writer value\"", line)
+		}
+		var value int
+		if _, err := fmt.Sscanf(fields[1], "%d", &value); err != nil {
+			t.Fatalf("tagged counter line %q carries no counter value", line)
+		}
+		sequences[fields[0]] = append(sequences[fields[0]], value)
+	}
+	return sequences
+}
+
+// assertTagContinuity is the per-writer form of assertCounterContinuity:
+// every writer's own counter must be its own unbroken 1, 2, 3, ... sequence,
+// and every writer must have appended past the line count (`before`) it held
+// when the operation began. A dropped-and-respawned tree re-emits the same
+// writer ids from 1 and is caught at each writer's first post-operation
+// line; whole-log growth or distinct-id counts cannot tell the two apart.
+func assertTagContinuity(t testing.TB, path string, before map[string]int) {
+	t.Helper()
+	sequences := tagValues(t, path)
+	for writer, want := range before {
+		values := sequences[writer]
+		if len(values) <= want {
+			t.Fatalf("writer %q stopped at its pre-operation count: %d lines before, %d now — want at least one line appended past it", writer, want, len(values))
+		}
+		for i, value := range values {
+			if value != i+1 {
+				t.Fatalf("writer %q counter restarted or skipped: its line %d carries %d, want %d", writer, i+1, value, i+1)
+			}
+		}
+	}
 }

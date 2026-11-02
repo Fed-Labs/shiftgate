@@ -36,16 +36,19 @@ func (o *Orchestrator) SetSourceNetwork(sourceNetwork SourceNetwork) {
 // workload's published listeners stop accepting, and connections in flight get
 // the grace period to complete before the process is frozen. Draining counts
 // toward migration downtime because the workload is unreachable from the
-// moment its forwarders stop.
-func (o *Orchestrator) drainSourceForwarders(id, workloadID string, plan model.NetworkPlan) {
+// moment its forwarders stop, so the instant the drain completed is returned
+// as the run's earliest downtime bound (zero when nothing was drained).
+func (o *Orchestrator) drainSourceForwarders(id, workloadID string, plan model.NetworkPlan) time.Time {
 	if o.sourceNetwork == nil || !plan.DrainBeforeCheckpoint || len(plan.Ports) == 0 {
-		return
+		return time.Time{}
 	}
+	drainedAt := time.Now().UTC()
 	forced := o.sourceNetwork.DrainForwarders(workloadID, network.DefaultDrainGrace)
 	_ = o.update(id, func(value *model.Migration) error {
 		appendEvent(value, fmt.Sprintf("drained source forwarding; %d connections closed after the grace period", forced), 0.12, 0, 0)
 		return nil
 	})
+	return drainedAt
 }
 
 // restoreSourceNetwork brings the source machine's SHIFT-layer forwarding back

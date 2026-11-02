@@ -78,6 +78,21 @@ func (btrfsProvider) Create(ctx context.Context, source, id string) (Snapshot, e
 	if strings.TrimSpace(id) == "" {
 		return Snapshot{}, errors.New("snapshot id is required")
 	}
+	// The id is joined into a filesystem path (".shift-snapshot-"+id), so it
+	// must be a single name component: no separators, no dot segments, and
+	// nothing outside the plain identifier charset — a caller-supplied id can
+	// never steer the wrapper outside the workload's parent directory.
+	for index := 0; index < len(id); index++ {
+		char := id[index]
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9', char == '.', char == '-', char == '_':
+		default:
+			return Snapshot{}, errors.New("snapshot id must be a plain identifier")
+		}
+	}
+	if id == "." || id == ".." || strings.Contains(id, "..") {
+		return Snapshot{}, errors.New("snapshot id must be a plain identifier")
+	}
 	source = filepath.Clean(source)
 	base := filepath.Base(source)
 	wrapper := filepath.Join(filepath.Dir(source), ".shift-snapshot-"+id)

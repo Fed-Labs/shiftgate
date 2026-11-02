@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"shift.dev/shift/internal/billing"
+	"shift.dev/shift/internal/model"
 	"shift.dev/shift/internal/scheduler"
 )
 
@@ -29,6 +30,7 @@ type Machine struct {
 	MachineID      string         `json:"machine_id"`
 	Name           string         `json:"name"`
 	AgentURL       string         `json:"agent_url"`
+	LocalAgentURL  string         `json:"local_agent_url,omitempty"`
 	Capabilities   map[string]any `json:"capabilities"`
 	Status         string         `json:"status"`
 	LastSeenAt     *time.Time     `json:"last_seen_at,omitempty"`
@@ -48,7 +50,10 @@ type Workload struct {
 	UpdatedAt      time.Time      `json:"updated_at"`
 }
 
-// MigrationJob is one migration as the control plane tracks it.
+// MigrationJob is one migration as the control plane tracks it. The relay
+// fields are the relay-route setup a Go embedder needs to observe (and, for
+// the ticket, to hand to its agent): RelayTicket is a one-use credential and
+// must be handled as a secret.
 type MigrationJob struct {
 	ID                   string         `json:"id"`
 	OrganizationID       string         `json:"organization_id"`
@@ -56,10 +61,20 @@ type MigrationJob struct {
 	SourceMachineID      string         `json:"source_machine_id"`
 	DestinationMachineID string         `json:"destination_machine_id"`
 	Mode                 string         `json:"mode"`
+	Route                string         `json:"route,omitempty"`
+	RelayEndpoint        string         `json:"relay_endpoint,omitempty"`
+	RelayTicket          string         `json:"relay_ticket,omitempty"`
 	Status               string         `json:"status"`
 	Progress             map[string]any `json:"progress"`
 	ErrorMessage         string         `json:"error_message,omitempty"`
 	CreatedBy            string         `json:"created_by"`
+	IdempotencyKey       string         `json:"idempotency_key,omitempty"`
+	AttemptCount         int            `json:"attempt_count"`
+	LeaseOwner           string         `json:"lease_owner,omitempty"`
+	LeaseExpiresAt       *time.Time     `json:"lease_expires_at,omitempty"`
+	AgentMigrationID     string         `json:"agent_migration_id,omitempty"`
+	Managed              bool           `json:"managed"`
+	CancelRequested      bool           `json:"cancel_requested"`
 	CreatedAt            time.Time      `json:"created_at"`
 	UpdatedAt            time.Time      `json:"updated_at"`
 	CompletedAt          *time.Time     `json:"completed_at,omitempty"`
@@ -86,6 +101,9 @@ type Entitlement struct {
 	UsedStorageBytes int64  `json:"used_storage_bytes"`
 	MaxMachines      int    `json:"max_machines"`
 	StripeCustomerID string `json:"stripe_customer_id,omitempty"`
+	// TrialActive reports a running 14-day Business trial (plan 2 BR-02):
+	// the client treats it as a Business entitlement for the window.
+	TrialActive bool `json:"trial_active,omitempty"`
 }
 
 // StorageStatus is the organization's platform-hosted checkpoint storage
@@ -168,13 +186,15 @@ type Checkpoint struct {
 	DeletedAt      *time.Time     `json:"deleted_at,omitempty"`
 }
 
-// CreateMachineInput registers a machine. The agent URL must be https — peers
-// and the dispatcher dial it directly.
+// CreateMachineInput registers a machine. AgentURL is the public peer URL;
+// LocalAgentURL is an optional Unix socket used by the durable control-plane
+// worker and is never inferred from the peer address.
 type CreateMachineInput struct {
-	MachineID    string         `json:"machine_id"`
-	Name         string         `json:"name"`
-	AgentURL     string         `json:"agent_url"`
-	Capabilities map[string]any `json:"capabilities"`
+	MachineID     string         `json:"machine_id"`
+	Name          string         `json:"name"`
+	AgentURL      string         `json:"agent_url"`
+	LocalAgentURL string         `json:"local_agent_url,omitempty"`
+	Capabilities  map[string]any `json:"capabilities"`
 }
 
 // MachineHeartbeatInput refreshes a machine's presence. An empty status means
@@ -200,6 +220,9 @@ type CreateMigrationInput struct {
 	SourceMachineID      string `json:"source_machine_id"`
 	DestinationMachineID string `json:"destination_machine_id"`
 	Mode                 string `json:"mode"`
+	Route                string `json:"route,omitempty"`
+	IdempotencyKey       string `json:"idempotency_key,omitempty"`
+	TimeoutSeconds       int    `json:"timeout_seconds,omitempty"`
 }
 
 // CreateCheckpointInput records a checkpoint the agent has already written.
@@ -279,6 +302,24 @@ type CreateReservationInput struct {
 	TTLSeconds      int64                 `json:"ttl_seconds,omitempty"`
 }
 
+// RelayTicket is a short-lived one-use ticket for an opaque relay leg.
+type RelayTicket struct {
+	Endpoint             string    `json:"endpoint"`
+	Token                string    `json:"token"`
+	ExpiresAt            time.Time `json:"expires_at"`
+	OrganizationID       string    `json:"organization_id"`
+	SourceMachineID      string    `json:"source_machine_id"`
+	DestinationMachineID string    `json:"destination_machine_id"`
+	MigrationID          string    `json:"migration_id"`
+}
+
+// CreateRelayTicket asks the control plane to authorize one source/destination relay pair.
+func (session *Session) CreateRelayTicket(ctx context.Context, organizationID, source, destination, migrationID string, ttlSeconds int) (RelayTicket, error) {
+	var result RelayTicket
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/relay/tickets"), map[string]any{"source_machine_id": source, "destination_machine_id": destination, "migration_id": migrationID, "ttl_seconds": ttlSeconds}, &result)
+	return result, err
+}
+
 // Machines lists the organization's registered machines.
 func (session *Session) Machines(ctx context.Context, organizationID string) ([]Machine, error) {
 	var result []Machine
@@ -293,9 +334,19 @@ func (session *Session) RegisterMachine(ctx context.Context, organizationID stri
 	return result, err
 }
 
+// MachineHeartbeatResult is the heartbeat answer: the refreshed machine
+// record plus the protocol truths the control plane reports alongside it.
+// LiveMigrationAllowed is the managed agent's licensing truth for live-mode
+// moves — the field the agent's admission gate must consume instead of any
+// local configuration assertion.
+type MachineHeartbeatResult struct {
+	Machine
+	model.HeartbeatResponse
+}
+
 // MachineHeartbeat refreshes a machine's presence and status.
-func (session *Session) MachineHeartbeat(ctx context.Context, organizationID, machineID string, input MachineHeartbeatInput) (Machine, error) {
-	var result Machine
+func (session *Session) MachineHeartbeat(ctx context.Context, organizationID, machineID string, input MachineHeartbeatInput) (MachineHeartbeatResult, error) {
+	var result MachineHeartbeatResult
 	err := session.call(ctx, "POST", organizationPath(organizationID, "/machines/"+url.PathEscape(machineID)+"/heartbeat"), input, &result)
 	return result, err
 }
@@ -339,7 +390,11 @@ func (session *Session) Migrations(ctx context.Context, organizationID string) (
 // accepted, not completed: poll Migrations or MigrationEvents for the outcome.
 func (session *Session) CreateMigration(ctx context.Context, organizationID string, input CreateMigrationInput) (MigrationJob, error) {
 	var result MigrationJob
-	err := session.call(ctx, "POST", organizationPath(organizationID, "/migrations"), input, &result)
+	headers := map[string]string{}
+	if input.IdempotencyKey != "" {
+		headers["Idempotency-Key"] = input.IdempotencyKey
+	}
+	err := session.callWithHeaders(ctx, "POST", organizationPath(organizationID, "/migrations"), input, &result, headers)
 	return result, err
 }
 
@@ -381,6 +436,91 @@ func (session *Session) RegisterCheckpoint(ctx context.Context, organizationID s
 func (session *Session) Entitlement(ctx context.Context, organizationID string) (Entitlement, error) {
 	var result Entitlement
 	err := session.call(ctx, "GET", organizationPath(organizationID, "/entitlement"), nil, &result)
+	return result, err
+}
+
+// TrialStatus is the organization's trial state.
+type TrialStatus struct {
+	OrganizationID string `json:"organization_id"`
+	Trial          bool   `json:"trial"`
+	Eligible       bool   `json:"eligible"`
+	StartedAt      string `json:"started_at,omitempty"`
+	ExpiresAt      string `json:"expires_at,omitempty"`
+	DaysLeft       int    `json:"days_left,omitempty"`
+	Converted      bool   `json:"converted,omitempty"`
+}
+
+// Trial reads the organization's trial state.
+func (session *Session) Trial(ctx context.Context, organizationID string) (TrialStatus, error) {
+	var result TrialStatus
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/trial"), nil, &result)
+	return result, err
+}
+
+// StartTrial begins the 14-day no-card Business trial. The server refuses a
+// second trial with TRIAL_ALREADY_USED.
+func (session *Session) StartTrial(ctx context.Context, organizationID string) (TrialStatus, error) {
+	var result TrialStatus
+	err := session.call(ctx, "POST", organizationPath(organizationID, "/trial"), map[string]any{}, &result)
+	return result, err
+}
+
+// UsageSummaryReport is the self-serve usage summary (storage, transfer with
+// fair-use throttle state, machines, migration health, seats, API budget).
+type UsageSummaryReport struct {
+	Period struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	} `json:"period"`
+	Storage struct {
+		UsedBytes int64   `json:"used_bytes"`
+		MaxBytes  int64   `json:"max_bytes"`
+		Pct       float64 `json:"pct"`
+	} `json:"storage"`
+	Transfer struct {
+		Bytes30d   int64            `json:"bytes_30d"`
+		LimitBytes int64            `json:"limit_bytes"`
+		ByChannel  map[string]int64 `json:"by_channel"`
+		Throttle   string           `json:"throttle"`
+		ResetsAt   string           `json:"resets_at"`
+	} `json:"transfer"`
+	Machines struct {
+		Online int `json:"online"`
+		Total  int `json:"total"`
+	} `json:"machines"`
+	Migrations map[string]int `json:"migrations_7d"`
+	Seats      struct {
+		Included  int `json:"included"`
+		Purchased int `json:"purchased"`
+		Members   int `json:"members"`
+	} `json:"seats"`
+	APIRequests struct {
+		RequestsToday int64 `json:"requests_today"`
+		DailyBudget   int   `json:"daily_budget"`
+	} `json:"api"`
+}
+
+// UsageSummaryReport reads the organization's usage summary object.
+func (session *Session) UsageSummaryReport(ctx context.Context, organizationID string) (UsageSummaryReport, error) {
+	var result UsageSummaryReport
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/usage/summary"), nil, &result)
+	return result, err
+}
+
+// ReferralStats is the organization's referral scoreboard (plan 1 BR-04).
+type ReferralStats struct {
+	Code      string `json:"code"`
+	Invited   int    `json:"invited"`
+	Activated int    `json:"activated"`
+	Rewards   int    `json:"rewards_granted"`
+	Badge     string `json:"badge,omitempty"`
+}
+
+// ReferralStats reads (and on first use creates) the organization's referral
+// code and scoreboard.
+func (session *Session) ReferralStats(ctx context.Context, organizationID string) (ReferralStats, error) {
+	var result ReferralStats
+	err := session.call(ctx, "GET", organizationPath(organizationID, "/referral"), nil, &result)
 	return result, err
 }
 

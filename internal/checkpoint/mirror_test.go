@@ -355,5 +355,8 @@ func (fixture mirrorFixture) destination(t *testing.T) (*Mirror, *chunkstore.Sto
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := repository.Trust().Pin(fixture.manifest.Security.SignerMachineID); err != nil {
+		t.Fatal(err)
+	}
 	return NewMirror(fixture.remote, chunks, repository), chunks, repository
 }

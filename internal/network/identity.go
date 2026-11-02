@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -27,16 +28,12 @@ import (
 // 100.64.0.0/10, the RFC 6598 carrier-grade NAT range. These addresses are
 // identifiers, not routes — no interface is configured with them — so they can
 // never collide with a machine's real networks the way RFC 1918 addresses
-// routinely do.
-var virtualNetworkPrefix = mustParseCIDR("100.64.0.0/10")
-
-func mustParseCIDR(value string) *net.IPNet {
-	_, network, err := net.ParseCIDR(value)
-	if err != nil {
-		panic("network: " + err.Error())
-	}
+// routinely do. The literal cannot fail to parse; a failure leaves the prefix
+// nil and every derivation reports the error instead of panicking.
+var virtualNetworkPrefix = func() *net.IPNet {
+	_, network, _ := net.ParseCIDR("100.64.0.0/10")
 	return network
-}
+}()
 
 // IdentityFor derives the virtual identity of a workload. The derivation is a
 // hash, not a registry: it is stable across machines and restarts, so every
@@ -47,12 +44,21 @@ func IdentityFor(workloadID string) (model.VirtualIdentity, error) {
 	if trimmed == "" {
 		return model.VirtualIdentity{}, fmt.Errorf("network identity requires a workload id")
 	}
+	if virtualNetworkPrefix == nil {
+		return model.VirtualIdentity{}, errors.New("virtual network prefix is unavailable")
+	}
 	sum := sha256.Sum256([]byte("shift.dev/network-identity/v1\n" + trimmed))
 	base := virtualNetworkPrefix.IP.Mask(virtualNetworkPrefix.Mask)
 	ones, bits := virtualNetworkPrefix.Mask.Size()
 	// The host part of the address is the first bits of the digest mapped
-	// onto the available host bits. Two workloads collide only if their ids
-	// hash to the same host bits, which the range makes vanishingly rare.
+	// onto the available host bits — 22 of them, the RFC 6598 prefix being
+	// what it is. Two workloads collide when their ids hash to the same
+	// host bits: unlikely at handfuls of workloads, but the birthday bound
+	// makes a pairwise collision likely around a few thousand ids, not
+	// "vanishingly rare". The address is an identifier, not a route — no
+	// interface is configured with it and nothing keys on it yet — but
+	// widen the derivation (or record detected collisions) before anything
+	// starts routing on these addresses.
 	hostBits := uint32(bits - ones)
 	host := binary.BigEndian.Uint32(sum[:4]) & (1<<hostBits - 1)
 	address := make(net.IP, len(base))

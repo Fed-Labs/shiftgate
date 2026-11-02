@@ -29,3 +29,32 @@ func TestCompatibilityFailureIncludesOnlyErrors(t *testing.T) {
 		t.Fatalf("unexpected compatibility error %q", err)
 	}
 }
+
+// FAILED is a settled outcome: recovery skips it, and the stage machine
+// refuses to drag it back through rollback — the root cause an operator reads
+// must survive agent restarts.
+func TestFailedIsTerminal(t *testing.T) {
+	for _, stage := range []model.MigrationStage{model.MigrationCompleted, model.MigrationRolledBack, model.MigrationCancelled, model.MigrationFailed} {
+		if !terminal(stage) {
+			t.Fatalf("terminal(%s) = false, want true", stage)
+		}
+	}
+	for _, stage := range []model.MigrationStage{model.MigrationCreated, model.MigrationTransfer, model.MigrationRollingBack} {
+		if terminal(stage) {
+			t.Fatalf("terminal(%s) = true, want false", stage)
+		}
+	}
+	if model.CanTransition(model.MigrationFailed, model.MigrationRollingBack) {
+		t.Fatal("FAILED must not transition back into ROLLING_BACK")
+	}
+	if !model.CanTransition(model.MigrationTransfer, model.MigrationRollingBack) {
+		t.Fatal("pre-commit stages must still be able to roll back")
+	}
+	failed := model.Migration{Stage: model.MigrationTransfer}
+	if err := failed.Transition(model.MigrationFailed, "settled", 0); err != nil {
+		t.Fatal(err)
+	}
+	if failed.CompletedAt == nil {
+		t.Fatal("FAILED must carry a completion timestamp like every terminal stage")
+	}
+}

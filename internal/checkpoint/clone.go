@@ -132,7 +132,10 @@ func OpenCloner(service *Service) (*Cloner, error) {
 	}
 	cloner := &Cloner{service: service, records: records, logger: service.logger}
 	if err := cloner.Recover(context.Background()); err != nil {
-		return nil, err
+		// Recovery problems must never keep the agent from booting: the
+		// interrupted sets stay queued and the next start retries them, while
+		// every other workload on the machine can run today.
+		cloner.logger.Error("clone recovery incomplete; interrupted sets remain queued for the next start", "error", err)
 	}
 	return cloner, nil
 }
@@ -171,6 +174,12 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 	if err != nil {
 		return CloneRecord{}, err
 	}
+	// Defense in depth at the point of use, like restore and fork: the clone
+	// is a checkpoint-into-new-root pipeline and must not run on a manifest
+	// no ingest path ever admitted.
+	if err := c.service.repository.Trust().Admit(manifest); err != nil {
+		return CloneRecord{}, fmt.Errorf("checkpoint %s: %w", manifest.ID, err)
+	}
 	destination, err := c.service.inventory.Inspect(ctx)
 	if err != nil {
 		return CloneRecord{}, err
@@ -182,10 +191,18 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 	// workload's declared ports in the shared host network namespace — two
 	// clones of a port-declaring workload would fight over the same address,
 	// and a set that silently came up unreachable would be a false success.
-	// One clone is exactly a fork's posture: it fails clearly at port
-	// reservation when the address is taken.
-	if options.Count > 1 && len(manifest.Workload.Ports) > 0 {
-		return CloneRecord{}, errors.New("this workload declares TCP ports, and every clone would rebind them on the same machine; a port-declaring workload can only be cloned one at a time (use fork semantics for a single copy)")
+	// The same is true of captured TCP state and unix sockets that no port
+	// declaration describes: every member would rebind the same addresses and
+	// socket names, and rebinding sockets is per-machine state. One clone is
+	// exactly a fork's posture: it fails clearly at port reservation when the
+	// address is taken.
+	if options.Count > 1 {
+		if len(manifest.Workload.Ports) > 0 {
+			return CloneRecord{}, errors.New("this workload declares TCP ports, and every clone would rebind them on the same machine; a port-declaring workload can only be cloned one at a time (use fork semantics for a single copy)")
+		}
+		if manifest.Engine.TCPState {
+			return CloneRecord{}, errors.New("this checkpoint captured live TCP listeners or connections, and every clone would rebind them on the same machine — rebinding sockets is per-machine state, so a checkpoint with captured TCP state can only be cloned one at a time (use fork semantics for a single copy)")
+		}
 	}
 	filesystemAsset, ok := assetByName(manifest.Assets, "filesystem-root")
 	if !ok {
@@ -202,6 +219,13 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 		return CloneRecord{}, err
 	}
 	sourceRoot := filepath.Clean(manifest.Workload.RootPath)
+	if registered := c.service.registeredRoot(manifest.Workload.ID); registered != "" && registered != sourceRoot {
+		return CloneRecord{}, fmt.Errorf("%w: clone source targets %s but the workload is registered with root %s", ErrRestoreTargetDenied, sourceRoot, registered)
+	}
+	policy, err := c.service.activeRestorePolicy()
+	if err != nil {
+		return CloneRecord{}, err
+	}
 	specs := make([]model.WorkloadSpec, options.Count)
 	members := make([]CloneMember, options.Count)
 	taken := make(map[string]bool, options.Count)
@@ -210,10 +234,17 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 		if memberErr != nil {
 			return CloneRecord{}, memberErr
 		}
-		if taken[spec.Name] {
+		// The runtime rejects colliding names case-insensitively; the
+		// pre-flight must use the same rule or the mistake slips through here
+		// and rolls the whole set back mid-flight.
+		nameKey := strings.ToLower(spec.Name)
+		if taken[nameKey] {
 			return CloneRecord{}, fmt.Errorf("clone name %q is used twice inside the set", spec.Name)
 		}
-		taken[spec.Name] = true
+		taken[nameKey] = true
+		if memberErr := policy.CheckNewRoot(spec.RootPath, sourceRoot, spec); memberErr != nil {
+			return CloneRecord{}, memberErr
+		}
 		specs[index] = spec
 		members[index] = CloneMember{Index: index + 1, WorkloadID: spec.ID, Name: spec.Name, RootPath: spec.RootPath, State: "PENDING"}
 	}
@@ -221,8 +252,17 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 	// mid-set and roll the whole set back; refusing before any work starts
 	// turns the same mistake into a millisecond error.
 	for _, existing := range c.service.runtime.List() {
-		if taken[existing.Spec.Name] {
+		if taken[strings.ToLower(existing.Spec.Name)] {
 			return CloneRecord{}, fmt.Errorf("workload name %q already exists", existing.Spec.Name)
+		}
+	}
+	// A single clone's restore rebinds the source's listeners and claims the
+	// member's host ports; the claim is taken before anything is copied, so
+	// cloning beside the still-running original fails here, explicitly,
+	// instead of after the shared extraction and the member root copy.
+	if options.Count == 1 {
+		if err := reserveRestorePorts(c.service.network, members[0].WorkloadID, "clone", manifest.Workload, specs[0]); err != nil {
+			return CloneRecord{}, err
 		}
 	}
 	setDirectory := filepath.Join(c.service.stateDir, "clones", setID)
@@ -236,10 +276,23 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if err := c.put(record); err != nil {
+		if options.Count == 1 && c.service.network != nil {
+			c.service.network.Deactivate(members[0].WorkloadID, rollbackDrainGrace)
+		}
 		return CloneRecord{}, err
 	}
 	defer func() {
 		if err != nil {
+			// Once every member is running the set is built, not half-built:
+			// a failure from here on is a cleanup or record-store hiccup, and
+			// tearing down N healthy workloads over it would apply the
+			// all-or-nothing rule to a phase where no member failed.
+			if cloneSetFullyRunning(&record) {
+				c.logger.Error("clone commit failed after every member was running; the members stay up and must be deleted through the workload API",
+					"clone_id", record.ID, "error", err)
+				record = c.snapshot(record.ID)
+				return
+			}
 			if rollbackErr := c.rollback(ctx, &record, err.Error()); rollbackErr != nil {
 				c.logger.Error("clone rollback failed", "clone_id", record.ID, "error", rollbackErr)
 			}
@@ -260,7 +313,7 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 	if err != nil {
 		return record, err
 	}
-	err = extractDirectory(ctx, c.service.chunks, manifest.Workload.ID, filesystemAsset, record.StagingRoot)
+	err = extractDirectory(ctx, c.service.chunks, manifest.Workload.ID, filesystemAsset, record.StagingRoot, policy)
 	if err != nil {
 		return record, err
 	}
@@ -268,12 +321,21 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 	if err != nil {
 		return record, err
 	}
-	err = materializeProcessChain(ctx, c.service.repository, c.service.chunks, manifest, filepath.Dir(record.ImagesRoot))
+	err = materializeProcessChain(ctx, c.service.repository, c.service.chunks, manifest, filepath.Dir(record.ImagesRoot), policy)
 	if err != nil {
 		return record, err
 	}
 	if info, statErr := os.Stat(record.ImagesRoot); statErr != nil || !info.IsDir() {
 		return record, errors.New("checkpoint process image directory is missing")
+	}
+	// Captured unix sockets that no port declaration describes would bind the
+	// same host paths and abstract names in every member; the image set is the
+	// only place that truth is recorded, so it is read here — after the one
+	// shared extraction, before a single member is cloned.
+	if options.Count > 1 {
+		if err := refuseSocketImages(record.ImagesRoot); err != nil {
+			return record, err
+		}
 	}
 	err = c.transition(&record, CloneCloning, "")
 	if err != nil {
@@ -329,9 +391,11 @@ func (c *Cloner) Clone(parent context.Context, checkpointID string, options Clon
 // cloned from — and each member's image copy, all under the set directory.
 // Member roots and processes stay: a committed clone is a normal independent
 // workload, controlled from here through the workload API like any other.
+// Staging cleanup is best-effort: once every member is running, a leftover
+// directory is a janitor problem and must never cost the set its members.
 func (c *Cloner) commit(record *CloneRecord) error {
 	if err := os.RemoveAll(record.SetDirectory); err != nil {
-		return fmt.Errorf("remove clone staging: %w", err)
+		c.logger.Warn("clone staging cleanup failed; members stay committed", "clone_id", record.ID, "error", err)
 	}
 	if c.service.diagnostics != nil {
 		for _, member := range record.Members {
@@ -343,7 +407,13 @@ func (c *Cloner) commit(record *CloneRecord) error {
 			}
 		}
 	}
-	return c.transition(record, CloneCommitted, "")
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = c.transition(record, CloneCommitted, ""); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // cloneMember materializes and restores one member of the set. Every step is
@@ -359,7 +429,7 @@ func (c *Cloner) cloneMember(ctx context.Context, record *CloneRecord, manifest 
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	stats, err := filesystem.CloneTree(extractedRoot, spec.RootPath)
+	stats, err := cloneTreeInto(extractedRoot, spec.RootPath)
 	if err != nil {
 		return fmt.Errorf("materialize clone filesystem: %w", err)
 	}
@@ -386,21 +456,6 @@ func (c *Cloner) cloneMember(ctx context.Context, record *CloneRecord, manifest 
 		return err
 	}
 	c.setMember(record, index, func(m *CloneMember) { m.CreatedWorkload = created })
-	// A single clone of a port-declaring workload reserves its ports before
-	// the process comes up — the same clear-conflict-instead-of-dying-inside-
-	// CRIU behavior a fork gets. Sets larger than one were refused up front.
-	if len(spec.Ports) > 0 {
-		if c.service.network == nil {
-			return errors.New("this agent has no network layer configured; a workload with declared ports cannot be cloned")
-		}
-		mappings, mappingsErr := network.MappingsFor(spec)
-		if mappingsErr != nil {
-			return fmt.Errorf("resolve clone ports: %w", mappingsErr)
-		}
-		if err := c.service.network.Prepare(spec.ID, mappings); err != nil {
-			return fmt.Errorf("reserve clone host ports: %w", err)
-		}
-	}
 	// The checkpointed images record the source's absolute root path, so the
 	// clone's own copy is bind mounted there inside a private mount
 	// namespace — the same mechanism a fork uses — and every clone of the set
@@ -536,14 +591,75 @@ func (c *Cloner) rollback(ctx context.Context, record *CloneRecord, reason strin
 // Recover reverses clone sets interrupted before commit. A set that was
 // mid-flight when the agent died left member workloads, roots, and a staging
 // directory behind; removing all of them keeps the workload list truthful.
+// One stuck rollback does not strand the rest: every record is attempted and
+// the collected failures are returned together at the end. A set whose
+// members were all running when the agent died is not half-built — it is a
+// completed set whose commit record never landed — so it is committed here
+// instead of having healthy workloads torn down over a record-store hiccup.
 func (c *Cloner) Recover(ctx context.Context) error {
+	var problems []error
 	for _, record := range c.records.List() {
 		switch record.State {
-		case ClonePreparing, CloneCloning, CloneRollingBack:
+		case CloneCloning:
+			if cloneSetFullyRunning(&record) {
+				if err := c.commit(&record); err != nil {
+					problems = append(problems, fmt.Errorf("recover clone %s: %w", record.ID, err))
+				}
+				continue
+			}
 			if err := c.rollback(ctx, &record, "agent restarted before the clone set was committed"); err != nil {
-				return fmt.Errorf("recover clone %s: %w", record.ID, err)
+				problems = append(problems, fmt.Errorf("recover clone %s: %w", record.ID, err))
+			}
+		case ClonePreparing, CloneRollingBack:
+			if err := c.rollback(ctx, &record, "agent restarted before the clone set was committed"); err != nil {
+				problems = append(problems, fmt.Errorf("recover clone %s: %w", record.ID, err))
 			}
 		}
+	}
+	return errors.Join(problems...)
+}
+
+// cloneSetFullyRunning reports whether every member of the set reached
+// RUNNING — the point at which the set is fully built and only commit
+// bookkeeping remains.
+func cloneSetFullyRunning(record *CloneRecord) bool {
+	if record.Count < 1 || len(record.Members) != record.Count {
+		return false
+	}
+	for _, member := range record.Members {
+		if member.State != "RUNNING" {
+			return false
+		}
+	}
+	return true
+}
+
+// refuseSocketImages rejects a multi-member clone whose top image set carries
+// captured unix sockets. CRIU names its socket images after the socket family
+// ("unixsk-...", "sk-unix-..."), so any image file naming unix sockets is
+// taken as evidence: every member's restore would bind the same host paths
+// and abstract names in the shared network namespace, and rebinding sockets
+// is per-machine state. Only the top set is inspected — parent sets of the
+// pre-copy chain carry superseded state and restore binds no sockets from
+// them.
+func refuseSocketImages(imagesRoot string) error {
+	found := ""
+	err := filepath.WalkDir(imagesRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		name := entry.Name()
+		if !entry.IsDir() && strings.HasSuffix(name, ".img") && strings.Contains(name, "unix") {
+			found = name
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("inspect checkpoint process images: %w", err)
+	}
+	if found != "" {
+		return fmt.Errorf("this checkpoint captured unix sockets (%s), and every clone would bind the same host paths and abstract names on the same machine — rebinding sockets is per-machine state, so it can only be cloned one at a time (use fork semantics for a single copy)", found)
 	}
 	return nil
 }
@@ -608,11 +724,11 @@ func memberIndex(record *CloneRecord, workloadID string) int {
 }
 
 // cloneSpecification rewrites the checkpointed specification for one member:
-// a new identity and name, a new root beside the source root, paths rebased
-// onto that root, and published host ports dropped exactly the way a fork
-// drops them. The lineage records the checkpoint every member of the set came
-// from, so a future state-merge implementation could find the common
-// ancestor from recorded facts.
+// a new identity and name, a new root beside the source root, paths and
+// root-absolute command elements rebased onto that root, and published host
+// ports dropped exactly the way a fork drops them. The lineage records the
+// checkpoint every member of the set came from, so a future state-merge
+// implementation could find the common ancestor from recorded facts.
 func cloneSpecification(source model.WorkloadSpec, setID, checkpointID string, index int, prefix string) (model.WorkloadSpec, error) {
 	spec := source
 	workloadID, err := model.NewID()
@@ -633,6 +749,11 @@ func cloneSpecification(source model.WorkloadSpec, setID, checkpointID string, i
 		return model.WorkloadSpec{}, err
 	}
 	spec.WorkingDir = rebased
+	command, err := rebaseCommand(sourceRoot, spec.RootPath, source.Command)
+	if err != nil {
+		return model.WorkloadSpec{}, err
+	}
+	spec.Command = command
 	spec.Paths = make([]model.PathSpec, 0, len(source.Paths))
 	for _, path := range source.Paths {
 		rebasedPath, err := rebasePath(sourceRoot, spec.RootPath, path.Path)

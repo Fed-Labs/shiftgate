@@ -234,7 +234,7 @@ func (s logSpanSink) Emit(span Span) {
 // no caller trace, and minting one per scrape would bury real operations.
 func TraceMiddleware(tracer *Tracer, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/metrics" || request.URL.Path == "/v1/health" {
+		if request.URL.Path == "/metrics" || request.URL.Path == "/health" || request.URL.Path == "/ready" {
 			next.ServeHTTP(writer, request)
 			return
 		}

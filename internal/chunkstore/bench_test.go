@@ -61,7 +61,10 @@ func fillRandom(buffer []byte) {
 func TestCodecRatiosAndOverhead(t *testing.T) {
 	for _, name := range benchPayloadNames {
 		payload := benchmarkPayload(name)
-		zstdBody := compress(payload)
+		zstdBody, err := compress(payload)
+		if err != nil {
+			t.Fatalf("%s: zstd: %v", name, err)
+		}
 		gzipBody, err := legacyGzipCompress(payload)
 		if err != nil {
 			t.Fatalf("%s: legacy gzip: %v", name, err)
@@ -92,12 +95,15 @@ func TestCodecRatiosAndOverhead(t *testing.T) {
 func BenchmarkChunkCodec(b *testing.B) {
 	for _, name := range benchPayloadNames {
 		payload := benchmarkPayload(name)
-		zstdBody := compress(payload)
+		zstdBody, err := compress(payload)
+		if err != nil {
+			b.Fatal(err)
+		}
 		b.Run("compress-zstd/"+name, func(b *testing.B) {
 			b.SetBytes(int64(len(payload)))
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				_ = compress(payload)
+				_, _ = compress(payload)
 			}
 		})
 		b.Run("compress-gzip/"+name, func(b *testing.B) {

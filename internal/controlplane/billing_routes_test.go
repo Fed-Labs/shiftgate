@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"shift.dev/shift/internal/billing"
 	"shift.dev/shift/internal/config"
 )
 
@@ -112,6 +113,41 @@ func TestCheckoutWithoutStripeKey(t *testing.T) {
 	}
 }
 
+// Every Stripe-touching path fails closed on a deployment without billing
+// keys, and the refusal happens before anything is parsed or persisted: this
+// webhook runs over a nil store and would panic if it touched the database
+// first. The contract's answer is 501 BILLING_DISABLED.
+func TestStripeWebhookFailsClosedWithoutConfiguration(t *testing.T) {
+	server := New(config.DefaultControlPlane(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/webhooks/stripe", strings.NewReader(`{"id":"evt_1","type":"customer.subscription.created","data":{"object":{}}}`))
+	request.Header.Set("Stripe-Signature", "t=1,v1="+strings.Repeat("00", 32))
+	recorder := httptest.NewRecorder()
+	server.handleStripeWebhook(recorder, request)
+	var body map[string]any
+	_ = json.Unmarshal(recorder.Body.Bytes(), &body)
+	if recorder.Code != http.StatusNotImplemented || body["code"] != "BILLING_DISABLED" {
+		t.Fatalf("webhook without signing key: status %d body %v", recorder.Code, body)
+	}
+}
+
+// With a signing key configured the signature is verified before anything is
+// parsed: an unsigned or forged payload is refused without a peek at its
+// contents, never applied and never half-applied.
+func TestStripeWebhookRefusesBadSignatureBeforeParsing(t *testing.T) {
+	configuration := config.DefaultControlPlane()
+	configuration.StripeWebhookKey = strings.Repeat("whsec_", 8)
+	server := New(configuration, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/webhooks/stripe", strings.NewReader(`{"id":"evt_1","type":"customer.subscription.created","data":{"object":{}}}`))
+	request.Header.Set("Stripe-Signature", "t=1,v1="+strings.Repeat("00", 32))
+	recorder := httptest.NewRecorder()
+	server.handleStripeWebhook(recorder, request)
+	var body map[string]any
+	_ = json.Unmarshal(recorder.Body.Bytes(), &body)
+	if recorder.Code != http.StatusUnauthorized || body["code"] != "WEBHOOK_SIGNATURE_INVALID" {
+		t.Fatalf("forged webhook: status %d body %v", recorder.Code, body)
+	}
+}
+
 func TestCheckoutURLValidation(t *testing.T) {
 	configuration := config.DefaultControlPlane()
 	configuration.StripeSecretKey = "sk_test_123"
@@ -130,13 +166,53 @@ func TestCheckoutURLValidation(t *testing.T) {
 	}
 }
 
-func TestCheckoutPerSeatRequiresSeats(t *testing.T) {
+func TestCheckoutFlatPlanSeatValidation(t *testing.T) {
 	configuration := config.DefaultControlPlane()
 	configuration.StripeSecretKey = "sk_test_123"
 	configuration.StripePrices = map[string]string{"business": "price_business_monthly"}
-	recorder, body := checkoutCall(t, configuration, `{"plan":"business","seats":0,"success_url":"https://app.example.com/ok","cancel_url":"https://app.example.com/cancel"}`)
+	// Business is flat with 5 seats included: zero seats means "included only"
+	// and is valid; a negative count is not; below-included is not.
+	recorder, body := checkoutCall(t, configuration, `{"plan":"business","seats":-1,"success_url":"https://app.example.com/ok","cancel_url":"https://app.example.com/cancel"}`)
 	if recorder.Code != http.StatusBadRequest || body["code"] != "CHECKOUT_SEATS_INVALID" {
-		t.Fatalf("per-seat checkout without seats: status %d body %v", recorder.Code, body)
+		t.Fatalf("negative seats: status %d body %v", recorder.Code, body)
+	}
+	recorder, body = checkoutCall(t, configuration, `{"plan":"business","seats":3,"success_url":"https://app.example.com/ok","cancel_url":"https://app.example.com/cancel"}`)
+	if recorder.Code != http.StatusBadRequest || body["code"] != "CHECKOUT_SEATS_INVALID" {
+		t.Fatalf("below-included seats: status %d body %v", recorder.Code, body)
+	}
+}
+
+func TestCheckoutIntervalValidation(t *testing.T) {
+	configuration := config.DefaultControlPlane()
+	configuration.StripeSecretKey = "sk_test_123"
+	configuration.StripePrices = map[string]string{"pro": "price_pro_monthly", "pro_annual": "price_pro_yearly"}
+	recorder, body := checkoutCall(t, configuration, `{"plan":"pro","interval":"week","success_url":"https://app.example.com/ok","cancel_url":"https://app.example.com/cancel"}`)
+	if recorder.Code != http.StatusBadRequest || body["code"] != "CHECKOUT_INTERVAL_INVALID" {
+		t.Fatalf("bogus interval: status %d body %v", recorder.Code, body)
+	}
+}
+
+func TestCheckoutCouponAllowlist(t *testing.T) {
+	configuration := config.DefaultControlPlane()
+	configuration.StripeSecretKey = "sk_test_123"
+	configuration.StripePrices = map[string]string{"pro": "price_pro_monthly"}
+	recorder, body := checkoutCall(t, configuration, `{"plan":"pro","coupon":"NOT-ALLOWED","success_url":"https://app.example.com/ok","cancel_url":"https://app.example.com/cancel"}`)
+	if recorder.Code != http.StatusBadRequest || body["code"] != "COUPON_INVALID" {
+		t.Fatalf("unlisted coupon accepted: status %d body %v", recorder.Code, body)
+	}
+	configuration.CheckoutCoupons = []string{"FOUNDING-TEAM"}
+	server := New(configuration, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if !server.couponAllowed("FOUNDING-TEAM") {
+		t.Fatal("allowlisted coupon refused")
+	}
+	if !server.couponAllowed("founding-team") {
+		t.Fatal("coupon allowlist should match case-insensitively")
+	}
+	if server.couponAllowed("SOMETHING-ELSE") {
+		t.Fatal("unlisted coupon allowed")
+	}
+	if server.couponAllowed("") {
+		t.Fatal("empty coupon allowed without allowlist entry")
 	}
 }
 
@@ -173,22 +249,27 @@ func TestPortalRequiresConfiguration(t *testing.T) {
 func TestResolveSubscriptionLimitsPrefersCatalog(t *testing.T) {
 	// A catalog plan's limits come from the catalog no matter what the
 	// webhook metadata claims — the customer's plan defines what they get,
-	// not a forged or stale metadata field.
+	// not a forged or stale metadata field. Storage follows the unit-economics
+	// revision: Pro includes 120 GiB; Business pools 500 GiB + 100 GiB/seat.
 	plan, storage, machines := resolveSubscriptionLimits(map[string]string{
 		"plan": "pro", "max_storage_bytes": "999999999999", "max_machines": "999",
 	})
 	if plan != "pro" {
 		t.Fatalf("plan = %q", plan)
 	}
-	if storage != 500*1024*1024*1024 {
-		t.Fatalf("storage = %d, want the pro catalog limit", storage)
+	if storage != 120*1024*1024*1024 {
+		t.Fatalf("storage = %d, want the pro catalog limit (120 GiB)", storage)
 	}
 	if machines != 10 {
 		t.Fatalf("machines = %d, want the pro catalog limit", machines)
 	}
 	_, storage, machines = resolveSubscriptionLimits(map[string]string{"plan": "business"})
-	if storage != 2*1024*1024*1024*1024 || machines != -1 {
-		t.Fatalf("business limits = (%d, %d), want 2 TiB and unlimited", storage, machines)
+	if storage != 600*1024*1024*1024 || machines != -1 {
+		t.Fatalf("business limits = (%d, %d), want 600 GiB (500 + 100×1 seat) and unlimited", storage, machines)
+	}
+	_, storage, _ = resolveSubscriptionLimits(map[string]string{"plan": "business", "seats": "7"})
+	if storage != 1200*1024*1024*1024 {
+		t.Fatalf("business 7-seat storage = %d, want 1200 GiB (500 + 7×100)", storage)
 	}
 }
 
@@ -238,6 +319,61 @@ func TestSafeReturnURL(t *testing.T) {
 		got, ok := safeReturnURL(testCase.value)
 		if ok != testCase.valid || got != testCase.want {
 			t.Fatalf("safeReturnURL(%q) = (%q, %v), want (%q, %v)", testCase.value, got, ok, testCase.want, testCase.valid)
+		}
+	}
+}
+
+// An oversized or negative spend cap must fail the checkout request — it
+// rides into an INTEGER column and a single bad value must never brick the
+// extras write (interval, add-on flags, trial conversion) behind the
+// customer's back.
+func TestBillingCheckoutSpendCapValidation(t *testing.T) {
+	configuration := config.DefaultControlPlane()
+	configuration.StripeSecretKey = "sk_test_123"
+	configuration.StripePrices = map[string]string{"pro": "price_pro_monthly"}
+	for _, body := range []string{
+		`{"plan":"pro","spend_cap_cents":-1,"success_url":"https://app.example.com/ok","cancel_url":"https://app.example.com/cancel"}`,
+		`{"plan":"pro","spend_cap_cents":2000000000,"success_url":"https://app.example.com/ok","cancel_url":"https://app.example.com/cancel"}`,
+	} {
+		recorder, decoded := checkoutCall(t, configuration, body)
+		if recorder.Code != http.StatusBadRequest || decoded["code"] != "CHECKOUT_SPEND_CAP_INVALID" {
+			t.Fatalf("body %s: status %d body %v, want CHECKOUT_SPEND_CAP_INVALID", body, recorder.Code, decoded)
+		}
+	}
+}
+
+// Annual checkout must refuse loudly when the annual price is unmapped —
+// never silently bill the monthly price while the entitlement row claims
+// annual prepay.
+func TestBillingCheckoutAnnualRequiresConfiguredAnnualPrice(t *testing.T) {
+	configuration := config.DefaultControlPlane()
+	configuration.StripeSecretKey = "sk_test_123"
+	configuration.StripePrices = map[string]string{"pro": "price_pro_monthly"}
+	recorder, decoded := checkoutCall(t, configuration, `{"plan":"pro","interval":"year","success_url":"https://app.example.com/ok","cancel_url":"https://app.example.com/cancel"}`)
+	if recorder.Code != http.StatusServiceUnavailable || decoded["code"] != "PLAN_PRICE_NOT_CONFIGURED" {
+		t.Fatalf("annual checkout without annual price: status %d body %v, want PLAN_PRICE_NOT_CONFIGURED", recorder.Code, decoded)
+	}
+}
+
+// The feature walls must refuse with the feature's published code and the
+// upgrade/trial door (BR-12), not a bare generic error.
+func TestBillingFeatureRefusalCarriesDoor(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	refusePlanFeature(recorder, "org_1", billing.FailoverPlanRequiredCode, billing.FailoverPlanRequiredMessage)
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusPaymentRequired {
+		t.Fatalf("status = %d, want 402", recorder.Code)
+	}
+	if body["code"] != billing.FailoverPlanRequiredCode {
+		t.Fatalf("code = %v, want %s", body["code"], billing.FailoverPlanRequiredCode)
+	}
+	for _, key := range []string{"upgrade_url", "trial_url"} {
+		url, _ := body[key].(string)
+		if url == "" {
+			t.Fatalf("refusal is missing %s: %v", key, body)
 		}
 	}
 }

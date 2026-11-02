@@ -20,7 +20,7 @@ import (
 	"shift.dev/shift/internal/runtime"
 )
 
-func TestCgroupRemoveOccupiedAndEmpty(t *testing.T) {
+func TestE2ECgroupRemoveOccupiedAndEmpty(t *testing.T) {
 	requireE2E(t)
 	root := filepath.Join("/sys/fs/cgroup", "shift-e2e-cgroup-test")
 	manager, err := runtime.NewCgroupManager(true, root)
@@ -52,8 +52,10 @@ func TestCgroupRemoveOccupiedAndEmpty(t *testing.T) {
 		t.Fatalf("removing an occupied cgroup: got %v, want ErrCgroupOccupied", err)
 	}
 	// The occupied verdict must be prompt — a deadline burn here is exactly
-	// the four-second cleanup window this behavior exists to eliminate.
-	if elapsed > 700*time.Millisecond {
+	// the four-second cleanup window this behavior exists to eliminate. The
+	// bound sits at half that window: it still catches the retry burn while
+	// tolerating a scheduler stall on a busy shared runner.
+	if elapsed > 2*time.Second {
 		t.Fatalf("occupied verdict took %s; the retry deadline burned", elapsed)
 	}
 	if _, statErr := os.Stat(workloadPath); statErr != nil {

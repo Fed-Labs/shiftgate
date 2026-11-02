@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -417,8 +418,8 @@ func TestClaimedTrustIsClampedToAvailableEvidence(t *testing.T) {
 
 func TestRestoreCompatibilityIsCheckedWhenAManifestIsSupplied(t *testing.T) {
 	offer := baseOffer("offer-1", "org-1", "workstation")
-	offer.Capabilities.Kernel = "6.12.38"
-	offer.Capabilities.Distribution = "debian"
+	offer.Capabilities.Kernel = "6.8.1"
+	offer.Capabilities.Distribution = "ubuntu-24.04"
 	offer.Capabilities.CRIU = model.CRIUCapabilities{Installed: true, Healthy: true, Version: "4.2"}
 	offer.Capabilities.Storage = []model.StorageDevice{{Mountpoint: "/", Filesystem: "ext4", TotalBytes: 512 << 30, AvailableBytes: 400 << 30}}
 
@@ -434,8 +435,8 @@ func TestRestoreCompatibilityIsCheckedWhenAManifestIsSupplied(t *testing.T) {
 		SourceMachine: model.MachineCapabilities{
 			OS:           "linux",
 			Architecture: "amd64",
-			Kernel:       "6.12.38",
-			Distribution: "debian",
+			Kernel:       "6.8.0",
+			Distribution: "ubuntu-24.04",
 			Features:     map[string]bool{"gnu_tar": true},
 		},
 	}
@@ -643,5 +644,96 @@ func TestExhaustedInventoryReturnsAnEmptyCandidateList(t *testing.T) {
 	}
 	if _, ok := placement.Best(); ok {
 		t.Fatal("an empty placement has no best candidate")
+	}
+}
+
+// TestSupportMatrixBlocksUncertifiedPlatformsForPlacement enforces
+// docs/support-matrix.json's "block for automatic operations" at the
+// placement gate: an unknown combination is never silently scheduled, and the
+// experimental override never admits unknown rows.
+func TestSupportMatrixBlocksUncertifiedPlatformsForPlacement(t *testing.T) {
+	offer := baseOffer("offer-unknown", "org-1", "nixos-box")
+	offer.Capabilities.Distribution = "nixos-24.11"
+	offer.Capabilities.CRIU = model.CRIUCapabilities{Installed: true, Healthy: true, Version: "4.2"}
+
+	manifest := model.CheckpointManifest{
+		Format:        model.StateFormatName,
+		FormatVersion: model.StateFormatVersion,
+		Workload:      model.WorkloadSpec{ID: "workload-1", RootPath: "/srv/app", Resources: model.ResourceRequirements{MemoryBytes: 4 << 30, StorageBytes: 20 << 30}},
+		SourceMachine: model.MachineCapabilities{
+			OS: "linux", Architecture: "amd64", Kernel: "6.12.38", Distribution: "nixos-24.11",
+			Features: map[string]bool{"gnu_tar": true},
+		},
+	}
+	request := baseRequest("org-1")
+	request.Manifest = &manifest
+
+	placement, err := fixedScheduler(false).Place(request, []Offer{offer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejection := rejectionFor(t, placement, "offer-unknown"); rejection.Code != RejectSupportMatrix {
+		t.Fatalf("expected %s, got %s (%s)", RejectSupportMatrix, rejection.Code, rejection.Reason)
+	}
+	if _, ok := placement.Best(); ok {
+		t.Fatal("an uncertified platform became a placement candidate")
+	}
+	// Even the experimental override never admits unknown combinations.
+	request.Constraints.AllowExperimentalPlatforms = true
+	placement, err = fixedScheduler(false).Place(request, []Offer{offer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejection := rejectionFor(t, placement, "offer-unknown"); rejection.Code != RejectSupportMatrix {
+		t.Fatalf("experimental override admitted an unknown platform: %s (%s)", rejection.Code, rejection.Reason)
+	}
+}
+
+// TestExperimentalPlatformNeedsExplicitOptIn: the untested ubuntu-22.04 row is
+// experimental_only — blocked for automatic placement by default, admitted
+// with a warning when the caller explicitly opts into the experiment.
+func TestExperimentalPlatformNeedsExplicitOptIn(t *testing.T) {
+	offer := baseOffer("offer-lts", "org-1", "lts-box")
+	offer.Capabilities.Distribution = "ubuntu-22.04"
+	offer.Capabilities.Kernel = "5.15.0-100-generic"
+	offer.Capabilities.CRIU = model.CRIUCapabilities{Installed: true, Healthy: true, Version: "3.17.1"}
+
+	manifest := model.CheckpointManifest{
+		Format:        model.StateFormatName,
+		FormatVersion: model.StateFormatVersion,
+		Workload:      model.WorkloadSpec{ID: "workload-1", RootPath: "/srv/app", Resources: model.ResourceRequirements{MemoryBytes: 4 << 30, StorageBytes: 20 << 30}},
+		SourceMachine: model.MachineCapabilities{
+			OS: "linux", Architecture: "amd64", Kernel: "5.15.0-100-generic", Distribution: "ubuntu-22.04",
+			Features: map[string]bool{"gnu_tar": true},
+		},
+	}
+	request := baseRequest("org-1")
+	request.Manifest = &manifest
+
+	placement, err := fixedScheduler(false).Place(request, []Offer{offer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejection := rejectionFor(t, placement, "offer-lts"); rejection.Code != RejectSupportMatrix {
+		t.Fatalf("expected %s by default, got %s (%s)", RejectSupportMatrix, rejection.Code, rejection.Reason)
+	}
+
+	request.Constraints.AllowExperimentalPlatforms = true
+	placement, err = fixedScheduler(false).Place(request, []Offer{offer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, ok := placement.Best()
+	if !ok {
+		t.Fatalf("opted-in experiment still refused, rejected=%+v", placement.Rejected)
+	}
+	found := false
+	for _, warning := range candidate.Warnings {
+		if strings.HasPrefix(warning, "SUPPORT_MATRIX_EXPERIMENTAL") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("experimental placement must carry the matrix warning: %+v", candidate.Warnings)
 	}
 }

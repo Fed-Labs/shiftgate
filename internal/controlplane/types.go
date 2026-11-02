@@ -52,9 +52,12 @@ type Organization struct {
 }
 
 type SessionTokens struct {
-	SessionID    string    `json:"session_id"`
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token"`
+	SessionID   string `json:"session_id"`
+	AccessToken string `json:"access_token"`
+	// RefreshToken is omitted when the session rides the httpOnly refresh
+	// cookie: the browser never sees the rotating token in script-readable
+	// form, and non-browser clients keep receiving it as before.
+	RefreshToken string    `json:"refresh_token,omitempty"`
 	TokenType    string    `json:"token_type"`
 	ExpiresAt    time.Time `json:"expires_at"`
 }
@@ -65,6 +68,7 @@ type Machine struct {
 	MachineID      string         `json:"machine_id"`
 	Name           string         `json:"name"`
 	AgentURL       string         `json:"agent_url"`
+	LocalAgentURL  string         `json:"local_agent_url,omitempty"`
 	Capabilities   map[string]any `json:"capabilities"`
 	Status         string         `json:"status"`
 	LastSeenAt     *time.Time     `json:"last_seen_at,omitempty"`
@@ -90,10 +94,20 @@ type MigrationJob struct {
 	SourceMachineID      string         `json:"source_machine_id"`
 	DestinationMachineID string         `json:"destination_machine_id"`
 	Mode                 string         `json:"mode"`
+	Route                string         `json:"route,omitempty"`
+	RelayEndpoint        string         `json:"relay_endpoint,omitempty"`
+	RelayTicket          string         `json:"relay_ticket,omitempty"`
 	Status               string         `json:"status"`
 	Progress             map[string]any `json:"progress"`
 	ErrorMessage         string         `json:"error_message,omitempty"`
 	CreatedBy            string         `json:"created_by"`
+	IdempotencyKey       string         `json:"idempotency_key,omitempty"`
+	AttemptCount         int            `json:"attempt_count"`
+	LeaseOwner           string         `json:"lease_owner,omitempty"`
+	LeaseExpiresAt       *time.Time     `json:"lease_expires_at,omitempty"`
+	AgentMigrationID     string         `json:"agent_migration_id,omitempty"`
+	Managed              bool           `json:"managed"`
+	CancelRequested      bool           `json:"cancel_requested"`
 	CreatedAt            time.Time      `json:"created_at"`
 	UpdatedAt            time.Time      `json:"updated_at"`
 	CompletedAt          *time.Time     `json:"completed_at,omitempty"`
@@ -107,6 +121,9 @@ type Entitlement struct {
 	UsedStorageBytes int64  `json:"used_storage_bytes"`
 	MaxMachines      int    `json:"max_machines"`
 	StripeCustomerID string `json:"stripe_customer_id,omitempty"`
+	// TrialActive reports a running 14-day Business trial; clients treat it
+	// as a Business entitlement for the window (plan 2 BR-02).
+	TrialActive bool `json:"trial_active,omitempty"`
 }
 
 // StorageStatus is the hosted-storage answer for one organization. When the
@@ -127,6 +144,46 @@ type StorageStatus struct {
 // StorageCredentials is one short-lived credential set scoped to a single
 // organization's prefix. The secret fields exist only in this response and in
 // the agent process that consumed it; they are never logged or audited.
+type RelayTicketRequest struct {
+	SourceMachineID      string `json:"source_machine_id"`
+	DestinationMachineID string `json:"destination_machine_id"`
+	MigrationID          string `json:"migration_id"`
+	TTLSeconds           int    `json:"ttl_seconds,omitempty"`
+}
+
+type RelayTicketResponse struct {
+	Endpoint             string    `json:"endpoint"`
+	Token                string    `json:"token"`
+	ExpiresAt            time.Time `json:"expires_at"`
+	OrganizationID       string    `json:"organization_id"`
+	SourceMachineID      string    `json:"source_machine_id"`
+	DestinationMachineID string    `json:"destination_machine_id"`
+	MigrationID          string    `json:"migration_id"`
+}
+
+type Ownership struct {
+	WorkloadID     string     `json:"workload_id"`
+	OrganizationID string     `json:"organization_id"`
+	Epoch          uint64     `json:"epoch"`
+	OwnerMachineID string     `json:"owner_machine_id"`
+	State          string     `json:"state"`
+	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"`
+	Token          string     `json:"token,omitempty"`
+}
+
+type AcquireOwnershipRequest struct {
+	WorkloadID   string `json:"workload_id"`
+	MachineID    string `json:"machine_id"`
+	LeaseSeconds int    `json:"lease_seconds"`
+}
+
+type FenceOwnershipRequest struct {
+	WorkloadID string `json:"workload_id"`
+	MachineID  string `json:"machine_id"`
+	Epoch      uint64 `json:"epoch"`
+	Token      string `json:"token"`
+}
+
 type StorageCredentials struct {
 	Endpoint        string    `json:"endpoint"`
 	Region          string    `json:"region"`
@@ -277,17 +334,30 @@ type RegisterRequest struct {
 type LoginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	// Remember asks for the full refresh-token lifetime. Without it the session
+	// is issued with the short refresh TTL, so a browser-session login ends
+	// when its refresh token expires rather than living on for weeks.
+	Remember bool `json:"remember"`
+	// SessionCookie asks for the refresh token to travel as the httpOnly
+	// shift_rt cookie instead of the response body. The web dashboard sets it
+	// alongside credentials:"include"; a browser request also triggers the
+	// cookie implicitly (Sec-Fetch-Mode: cors).
+	SessionCookie bool `json:"session_cookie"`
 }
 
 type RefreshRequest struct {
-	RefreshToken string `json:"refresh_token"`
+	// RefreshToken is optional for cookie sessions: when the shift_rt cookie
+	// is present it is the refresh credential (and wins over the body).
+	RefreshToken  string `json:"refresh_token,omitempty"`
+	SessionCookie bool   `json:"session_cookie"`
 }
 
 type CreateMachineRequest struct {
-	MachineID    string         `json:"machine_id"`
-	Name         string         `json:"name"`
-	AgentURL     string         `json:"agent_url"`
-	Capabilities map[string]any `json:"capabilities"`
+	MachineID     string         `json:"machine_id"`
+	Name          string         `json:"name"`
+	AgentURL      string         `json:"agent_url"`
+	LocalAgentURL string         `json:"local_agent_url,omitempty"`
+	Capabilities  map[string]any `json:"capabilities"`
 }
 
 type CreateWorkloadRequest struct {
@@ -298,10 +368,14 @@ type CreateWorkloadRequest struct {
 }
 
 type CreateMigrationRequest struct {
-	WorkloadID           string `json:"workload_id"`
-	SourceMachineID      string `json:"source_machine_id"`
+	WorkloadID      string `json:"workload_id"`
+	SourceMachineID string `json:"source_machine_id"`
+	// IdempotencyKey makes client retries return the original queued job.
+	IdempotencyKey       string `json:"idempotency_key,omitempty"`
 	DestinationMachineID string `json:"destination_machine_id"`
 	Mode                 string `json:"mode"`
+	Route                string `json:"route,omitempty"`
+	TimeoutSeconds       int    `json:"timeout_seconds,omitempty"`
 }
 
 type ErrorResponse struct {

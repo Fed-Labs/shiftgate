@@ -39,12 +39,18 @@ func run(arguments []string, output io.Writer) error {
 		return keygen(arguments, output)
 	case "trusted-key":
 		return trustedKey(arguments, output)
+	case "document":
+		return document(arguments, output)
 	case "sign":
 		return sign(arguments, output)
 	case "feed":
 		return feed(arguments, output)
 	case "verify":
 		return verify(arguments, output)
+	case "keys-status":
+		return keysStatus(arguments, output)
+	case "sbom":
+		return sbomCommand(arguments, output)
 	default:
 		return usage()
 	}
@@ -54,11 +60,14 @@ func usage() error {
 	return errors.New(`usage: shift-release COMMAND
 
 commands:
-  keygen     Generate a release-signing key pair
+  keygen      Generate a release-signing key pair
   trusted-key Print the trusted-key entry for a public key
-  sign       Sign one release document
-  feed       Assemble signed releases into a feed
-  verify     Verify a feed against trusted keys`)
+  document    Generate a release document from build outputs
+  sign        Sign one release document
+  feed        Assemble signed releases into a feed
+  verify      Verify a feed against trusted keys and bind its digests to shipped bytes
+  keys-status Report whether a trusted-keys file is configured or placeholder
+  sbom        Generate the release software bill of materials`)
 }
 
 // keygen generates an Ed25519 release-signing key pair. The private key is
@@ -100,16 +109,18 @@ func keygen(arguments []string, output io.Writer) error {
 	if entry.ID, err = update.TrustedKeyID(entry.PublicKeyPEM); err != nil {
 		return err
 	}
-	encoded, err := json.MarshalIndent(entry, "", "  ")
+	encoded, err := json.MarshalIndent([]update.TrustedKey{entry}, "", "  ")
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(output, "Private key written to %s\nPublic key written to %s\nTrusted-key entry:\n%s\n", *privatePath, *publicPath, encoded)
+	_, _ = fmt.Fprintf(output, "Private key written to %s\nPublic key written to %s\nTrusted-key entry (JSON array, ready for a trusted-keys file):\n%s\n", *privatePath, *publicPath, encoded)
 	return nil
 }
 
 // trustedKey prints the trusted-key entry for one public key, so an operator can
-// add a signer to a fleet configuration without hand-writing JSON.
+// add a signer to a fleet configuration without hand-writing JSON. The output
+// is a one-element JSON array — the exact shape a trusted-keys file and
+// `verify --keys` carry.
 func trustedKey(arguments []string, output io.Writer) error {
 	flags := flag.NewFlagSet("trusted-key", flag.ContinueOnError)
 	publicPath := flags.String("public-key", "", "path to the public key PEM")
@@ -128,7 +139,7 @@ func trustedKey(arguments []string, output io.Writer) error {
 	if entry.ID, err = update.TrustedKeyID(entry.PublicKeyPEM); err != nil {
 		return err
 	}
-	encoded, err := json.MarshalIndent(entry, "", "  ")
+	encoded, err := json.MarshalIndent([]update.TrustedKey{entry}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -218,14 +229,18 @@ func feed(arguments []string, output io.Writer) error {
 }
 
 // verify checks a finished feed against a trusted-key file, exactly as an
-// installer's key ring will, and prints which key signed each release. It is the
-// last step before publication and the first step when debugging a machine that
-// refuses a feed.
+// installer's key ring will, and prints which key signed each release. With
+// --artifacts and --tarball it also re-derives every signed artifact digest
+// from the bytes that actually ship, so a green verify means the signed
+// digests match the release tarball. It is the last step before publication
+// and the first step when debugging a machine that refuses a feed.
 func verify(arguments []string, output io.Writer) error {
 	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
 	feedPath := flags.String("feed", "", "path to the feed document")
 	keysPath := flags.String("keys", "", "path to the trusted-key JSON array")
 	threshold := flags.Int("threshold", 1, "how many distinct trusted signatures each release needs")
+	artifactsDir := flags.String("artifacts", "", "directory of build outputs to bind signed artifact digests to")
+	tarball := flags.String("tarball", "", "release tarball whose members must match the signed artifact digests")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -236,9 +251,12 @@ func verify(arguments []string, output io.Writer) error {
 	if err := persistence.ReadJSON(*feedPath, &document); err != nil {
 		return fmt.Errorf("read feed: %w", err)
 	}
-	var keys []update.TrustedKey
-	if err := persistence.ReadJSON(*keysPath, &keys); err != nil {
+	keys, err := readTrustedKeys(*keysPath)
+	if err != nil {
 		return fmt.Errorf("read trusted keys: %w", err)
+	}
+	if usable := countConfiguredKeys(keys); usable == 0 {
+		return fmt.Errorf("no trusted key in %s is configured: every entry is a placeholder or revoked; run the key ceremony (docs/release.md) before verifying", *keysPath)
 	}
 	ring, err := update.NewKeyRing(keys, *threshold, time.Now().UTC())
 	if err != nil {
@@ -260,7 +278,40 @@ func verify(arguments []string, output io.Writer) error {
 	if failed {
 		return errors.New("one or more releases did not meet the signature threshold")
 	}
+	if *artifactsDir != "" || *tarball != "" {
+		if err := bindDigests(document.Releases, *artifactsDir, *tarball); err != nil {
+			return fmt.Errorf("digest binding: %w", err)
+		}
+		_, _ = fmt.Fprintln(output, "digests   every signed artifact digest and self-reported version matches the shipped bytes")
+	}
 	_, _ = fmt.Fprintf(output, "All %d release(s) meet a threshold of %d.\n", len(document.Releases), *threshold)
+	return nil
+}
+
+// countConfiguredKeys counts entries that are real trust anchors rather than
+// ceremony placeholders.
+func countConfiguredKeys(keys []update.TrustedKey) int {
+	usable := 0
+	for _, key := range keys {
+		if !isPlaceholderKey(key) {
+			usable++
+		}
+	}
+	return usable
+}
+
+// unmarshalStrictJSON decodes a trusted-keys document, refusing unknown fields
+// so a typo in a key file is a configuration error rather than a silently
+// ignored setting.
+func unmarshalStrictJSON(content []byte, target any) error {
+	decoder := json.NewDecoder(strings.NewReader(string(content)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if decoder.More() {
+		return errors.New("trailing JSON data")
+	}
 	return nil
 }
 

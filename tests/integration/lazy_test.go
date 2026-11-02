@@ -84,10 +84,13 @@ func TestE2ELazyRestore(t *testing.T) {
 	t.Logf("lazy restore: time to first execution %d ms", record.TimeToFirstExecutionMS)
 
 	// The restored process resumes the counter where it left off — pages
-	// faulting in through the daemon are what let it run.
+	// faulting in through the daemon are what let it run. The sequence, not
+	// the growth, is the evidence: line baseline+1 carries baseline+1, so a
+	// workload re-executed instead of resumed would re-log 1 and fail here.
 	waitUntil(t, 60*time.Second, "lazily restored counter to write more lines", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
 
 	// Observe the daemon while it serves. Its lifetime is CRIU's own — it
 	// exits once every image page has been transferred (faults on demand,

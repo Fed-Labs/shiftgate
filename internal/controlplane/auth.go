@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/argon2"
@@ -131,3 +132,19 @@ func parseBearer(value string) (string, bool) {
 func validTokenExpiry(now, expiry time.Time) bool {
 	return expiry.After(now.Add(5 * time.Second))
 }
+
+// dummyPasswordHash is a real Argon2id hash of a throwaway value, used to give
+// unknown or disabled logins the same verification cost as known ones. The
+// pepper the login passes does not match the one it was produced with, so the
+// comparison always fails — the point is the work, not the answer. It is
+// derived once, lazily, so startup pays nothing when nobody ever fails a
+// login.
+var dummyPasswordHash = sync.OnceValue(func() string {
+	encoded, err := hashPassword("shift-timing-equalization-only-password", "shift-timing-equalization-only-pepper")
+	if err != nil {
+		// Unreachable with these fixed values; a malformed constant would
+		// silently weaken the timing defense, so fail loudly in tests/dev.
+		panic("controlplane: " + err.Error())
+	}
+	return encoded
+})

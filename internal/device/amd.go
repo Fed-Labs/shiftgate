@@ -3,7 +3,6 @@ package device
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -198,7 +197,7 @@ func detectROCm() model.GPURuntime {
 	if runtime.ToolkitPath == "" {
 		// Fall back to PATH discovery for distribution packages that install
 		// ROCm tools outside /opt/rocm.
-		if _, err := exec.LookPath("rocminfo"); err == nil {
+		if _, err := trustedLookPath("rocminfo"); err == nil {
 			runtime.ToolkitPath = "PATH"
 		}
 	}

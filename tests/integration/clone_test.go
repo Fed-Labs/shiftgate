@@ -92,10 +92,15 @@ func TestE2ECheckpointClone(t *testing.T) {
 		}
 		// The clone's own counter continues the checkpointed sequence —
 		// evidence that each member is a real continuation, not a restart.
+		// The cloned root already holds the `baseline` lines the frozen
+		// source produced; one appended line would pass a growth check, so
+		// the sequence itself is asserted: line baseline+1 carries
+		// baseline+1, and the log stays the unbroken 1..N run.
 		cloneLog := filepath.Join(member.RootPath, "progress.log")
 		waitUntil(t, 60*time.Second, fmt.Sprintf("clone %s counter to continue past the baseline", member.Name), func() (bool, string) {
 			return fileLineCount(t, cloneLog) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, cloneLog), baseline)
 		})
+		assertCounterContinuity(t, cloneLog, baseline)
 	}
 	if len(byName) != count {
 		t.Fatalf("clone member names are not unique: %d distinct of %d", len(byName), count)

@@ -17,10 +17,12 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"shift.dev/shift/internal/config"
 	"shift.dev/shift/internal/model"
 	"shift.dev/shift/internal/persistence"
+	"shift.dev/shift/internal/transfer"
 )
 
 // openReplicationSource opens the source agent: a development agent that
@@ -103,7 +105,7 @@ func pushRootCheckpoint(t *testing.T, pair *replicationPair) model.CheckpointMan
 	if summaries := pair.source.checkpoints.List(pair.workload.ID); summaries[0].ID != delta.ID {
 		t.Fatalf("test precondition: newest checkpoint is %s, want the delta %s", summaries[0].ID, delta.ID)
 	}
-	pair.source.replicator.apply(context.Background())
+	pair.source.replicator.pass(context.Background())
 	return root
 }
 
@@ -140,7 +142,7 @@ func TestReplicatorPushesTheNewestRootCheckpoint(t *testing.T) {
 	if _, err := pair.destination.repository.Load(root.ID); err != nil {
 		t.Fatalf("replicated checkpoint not loadable on the standby: %v", err)
 	}
-	pair.source.replicator.apply(context.Background())
+	pair.source.replicator.pass(context.Background())
 	again, err := pair.source.replicator.ledger.Get(pair.workload.ID)
 	if err != nil || again.LastCheckpointID != root.ID || !again.LastPushAt.Equal(entry.LastPushAt) {
 		t.Fatalf("an unchanged pass must not re-push: %+v (%v)", again, err)
@@ -157,7 +159,7 @@ func TestReplicatorWithdrawsWhenThePolicyIsRemoved(t *testing.T) {
 	if _, err := pair.source.runtime.SetFailoverPolicy(pair.workload.ID, nil); err != nil {
 		t.Fatal(err)
 	}
-	pair.source.replicator.apply(context.Background())
+	pair.source.replicator.pass(context.Background())
 	if _, err := pair.destination.standby.Duty(pair.workload.ID); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("the withdrawn duty must be gone, got %v", err)
 	}
@@ -180,7 +182,7 @@ func TestReplicatorRefusesTheWrongStandby(t *testing.T) {
 	if _, err := pair.source.runtime.SetFailoverPolicy(pair.workload.ID, wrongPin); err != nil {
 		t.Fatal(err)
 	}
-	pair.source.replicator.apply(context.Background())
+	pair.source.replicator.pass(context.Background())
 	entry, err := pair.source.replicator.ledger.Get(pair.workload.ID)
 	if err != nil {
 		t.Fatalf("a refused push must still be on the ledger: %v", err)
@@ -192,7 +194,7 @@ func TestReplicatorRefusesTheWrongStandby(t *testing.T) {
 		t.Fatalf("no duty may exist for a refused push, got %v", err)
 	}
 	// The retry backoff holds: an immediate second pass does not re-attempt.
-	pair.source.replicator.apply(context.Background())
+	pair.source.replicator.pass(context.Background())
 	again, err := pair.source.replicator.ledger.Get(pair.workload.ID)
 	if err != nil || again.LastErrorAt != entry.LastErrorAt {
 		t.Fatalf("an immediate pass must respect the retry backoff: %+v (%v)", again, err)
@@ -211,7 +213,7 @@ func TestReplicatorChangesStandbysSafely(t *testing.T) {
 		&model.FailoverPolicySpec{AgentURL: unreachablePeer}); err != nil {
 		t.Fatal(err)
 	}
-	pair.source.replicator.apply(context.Background())
+	pair.source.replicator.pass(context.Background())
 	// The old standby was released before anything else happened.
 	if _, err := pair.destination.standby.Duty(pair.workload.ID); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("the old standby's duty must be withdrawn, got %v", err)
@@ -238,11 +240,117 @@ func TestReplicatorHoldsBackWhileAMigrationIsInFlight(t *testing.T) {
 	pair := newReplicationPair(t)
 	fabricateCheckpoint(t, pair.source, pair.workload, "checkpoint-root-1", "")
 	pair.source.replicator.migrationInFlight = func(string) bool { return true }
-	pair.source.replicator.apply(context.Background())
+	pair.source.replicator.pass(context.Background())
 	if _, err := pair.source.replicator.ledger.Get(pair.workload.ID); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("a migration in flight must hold replication back, got %v", err)
 	}
 	if _, err := pair.destination.standby.Duty(pair.workload.ID); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("no duty may appear while a migration is in flight, got %v", err)
+	}
+}
+
+// hungPeer is a listener that accepts connections and never answers: the
+// boundary case of a standby partitioned mid-conversation, with an
+// established connection and no data ever coming back.
+func hungPeer(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+	return "https://" + listener.Addr().String()
+}
+
+// dialHungPeer redirects every peer dial at a listener that never answers.
+func dialHungPeer(pair *replicationPair, url string) {
+	original := pair.source.replicator.peerClient
+	pair.source.replicator.peerClient = func(string) (*transfer.Client, error) {
+		return original(url)
+	}
+}
+
+// TestReplicatorApplyDoesNotBlockTheScheduler: one hung standby must never
+// stall periodic checkpoints for any workload on the machine. apply returns
+// immediately, the push runs on its own goroutine under the push budget, and
+// the failure lands on the ledger instead of hanging for the peer client's
+// day-long fallback.
+func TestReplicatorApplyDoesNotBlockTheScheduler(t *testing.T) {
+	pair := newReplicationPair(t)
+	fabricateCheckpoint(t, pair.source, pair.workload, "checkpoint-root-1", "")
+	dialHungPeer(pair, hungPeer(t))
+	pair.source.replicator.pushTimeout = 2 * time.Second
+
+	start := time.Now()
+	pair.source.replicator.apply(context.Background())
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("apply blocked its caller for %s", elapsed)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for pair.source.replicator.passing.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("the replication pass outlived its push budget")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	entry, err := pair.source.replicator.ledger.Get(pair.workload.ID)
+	if err != nil {
+		t.Fatalf("the failed push must be on the ledger: %v", err)
+	}
+	if entry.LastError == "" {
+		t.Fatalf("the hung push must be recorded as a failure: %+v", entry)
+	}
+}
+
+// TestReplicatorPushIsBoundedByAPeerTimeout: every call inside a push runs
+// under the per-peer budget, so a black-holed standby costs one bounded
+// attempt — not the 24 hours the peer client falls back to without a
+// deadline. The pass as a whole finishes in budget, not a day.
+func TestReplicatorPushIsBoundedByAPeerTimeout(t *testing.T) {
+	pair := newReplicationPair(t)
+	fabricateCheckpoint(t, pair.source, pair.workload, "checkpoint-root-1", "")
+	dialHungPeer(pair, hungPeer(t))
+	pair.source.replicator.pushTimeout = time.Second
+
+	start := time.Now()
+	pair.source.replicator.pass(context.Background())
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("a hung peer held the pass for %s", elapsed)
+	}
+	entry, err := pair.source.replicator.ledger.Get(pair.workload.ID)
+	if err != nil || entry.LastError == "" {
+		t.Fatalf("the timed-out push must be a ledger failure, got %+v err %v", entry, err)
+	}
+}
+
+// TestReplicatorHoldConfirmationCatchesADegradedHold: a standby that cannot
+// persist its duty degrades the hold, and the source's post-hold
+// confirmation must see it — the ledger records the failure and retries
+// rather than claiming a green push for a protection that does not exist.
+func TestReplicatorHoldConfirmationCatchesADegradedHold(t *testing.T) {
+	pair := newReplicationPair(t)
+	fabricateCheckpoint(t, pair.source, pair.workload, "checkpoint-root-1", "")
+	pair.destination.standby.duties = failingDutyStore{dutyStore: pair.destination.standby.duties}
+
+	pair.source.replicator.pass(context.Background())
+
+	entry, err := pair.source.replicator.ledger.Get(pair.workload.ID)
+	if err != nil {
+		t.Fatalf("the failed push must be on the ledger: %v", err)
+	}
+	if entry.LastCheckpointID != "" || entry.LastError == "" {
+		t.Fatalf("a degraded hold must be a recorded failure, not a green push: %+v", entry)
+	}
+	if _, err := pair.destination.standby.Duty(pair.workload.ID); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("a hold whose duty could not be persisted must leave no duty, got %v", err)
 	}
 }

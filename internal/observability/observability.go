@@ -18,15 +18,48 @@ type Metrics struct {
 	startedAt      time.Time
 	requests       atomic.Uint64
 	errors         atomic.Uint64
-	requestNanos   atomic.Uint64
 	activeRequests atomic.Int64
 	diagnostics    *Diagnostics
-	mu             sync.RWMutex
-	byStatus       map[int]uint64
+	// httpDuration is the request-latency histogram behind
+	// shift_http_request_duration_seconds. Its own _sum and _count series are
+	// the only writers of those names: a second pair would render duplicate
+	// samples and break every Prometheus scrape.
+	httpDuration *Histogram
+	mu           sync.RWMutex
+	byStatus     map[int]uint64
+	gauges       map[string]gaugeSource
+}
+
+type gaugeSource struct {
+	help string
+	fn   func() float64
 }
 
 func NewMetrics() *Metrics {
-	return &Metrics{startedAt: time.Now(), byStatus: make(map[int]uint64)}
+	return &Metrics{
+		startedAt:    time.Now(),
+		byStatus:     make(map[int]uint64),
+		gauges:       make(map[string]gaugeSource),
+		httpDuration: NewHistogram("shift_http_request_duration_seconds", "control-plane HTTP request latency in seconds", LatencyBuckets),
+	}
+}
+
+// RegisterGauge publishes a computed gauge on the metrics endpoint. The
+// function is scraped at render time, so pool and queue gauges never need
+// write-side bookkeeping. Names that would break the exposition format are
+// ignored rather than smuggled into the scrape.
+func (m *Metrics) RegisterGauge(name, help string, fn func() float64) {
+	if !validMetricName(name) {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gauges[name] = gaugeSource{help: help, fn: fn}
+}
+
+// ObserveDuration records one request-latency sample.
+func (m *Metrics) ObserveDuration(seconds float64) {
+	m.httpDuration.Observe(seconds)
 }
 
 // SetDiagnostics attaches the operational series so the metrics handler
@@ -42,12 +75,23 @@ func (m *Metrics) Handler() http.Handler {
 		_, _ = fmt.Fprintf(writer, "shift_http_requests_total %d\n", m.requests.Load())
 		_, _ = fmt.Fprintf(writer, "shift_http_errors_total %d\n", m.errors.Load())
 		_, _ = fmt.Fprintf(writer, "shift_http_active_requests %d\n", m.activeRequests.Load())
-		_, _ = fmt.Fprintf(writer, "shift_http_request_duration_seconds_total %f\n", float64(m.requestNanos.Load())/float64(time.Second))
+		m.httpDuration.RenderTo(writer)
 		m.mu.RLock()
 		for status, count := range m.byStatus {
 			_, _ = fmt.Fprintf(writer, "shift_http_responses_total{status=%q} %d\n", strconv.Itoa(status), count)
 		}
+		gauges := make(map[string]gaugeSource, len(m.gauges))
+		for name, source := range m.gauges {
+			gauges[name] = source
+		}
 		m.mu.RUnlock()
+		for name, source := range gauges {
+			if source.help != "" {
+				_, _ = fmt.Fprintf(writer, "# HELP shift_%s %s\n", name, source.help)
+			}
+			_, _ = fmt.Fprintf(writer, "# TYPE shift_%s gauge\n", name)
+			_, _ = fmt.Fprintf(writer, "shift_%s %f\n", name, source.fn())
+		}
 		if m.diagnostics != nil {
 			m.diagnostics.RenderTo(writer)
 		}
@@ -69,7 +113,7 @@ func (m *Metrics) Middleware(logger *slog.Logger, next http.Handler) http.Handle
 		defer func() {
 			m.activeRequests.Add(-1)
 			duration := time.Since(started)
-			m.requestNanos.Add(uint64(duration))
+			m.httpDuration.Observe(duration.Seconds())
 			m.mu.Lock()
 			m.byStatus[capture.status]++
 			m.mu.Unlock()

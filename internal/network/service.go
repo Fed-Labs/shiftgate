@@ -20,6 +20,9 @@ type Coordinator struct {
 	table  *NATTable
 	logger *slog.Logger
 
+	claimsMu      sync.Mutex
+	claimsVersion uint64
+
 	mu         sync.Mutex
 	forwarders map[string][]*Forwarder
 }
@@ -30,16 +33,21 @@ type Coordinator struct {
 // early would silently turn a graceful drain into a reset.
 const DefaultDrainGrace = 15 * time.Second
 
-// NewCoordinator creates a coordinator. The logger may be nil.
+// NewCoordinator creates a coordinator. The logger may be nil. The
+// coordinator starts from the port claims the runtime layer rebuilt at
+// startup — see RebuildReservations — so a fresh table is never emptier than
+// the machine it describes.
 func NewCoordinator(logger *slog.Logger) *Coordinator {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Coordinator{
+	coordinator := &Coordinator{
 		table:      NewNATTable(),
 		logger:     logger,
 		forwarders: make(map[string][]*Forwarder),
 	}
+	coordinator.syncStartupClaims()
+	return coordinator
 }
 
 // Prepare validates and reserves the workload's network resources without
@@ -47,6 +55,7 @@ func NewCoordinator(logger *slog.Logger) *Coordinator {
 // conflict fails the migration before a checkpoint is taken rather than after
 // the transfer. If it returns an error the table is untouched.
 func (coordinator *Coordinator) Prepare(workloadID string, mappings []model.PortMapping) error {
+	coordinator.syncStartupClaims()
 	return coordinator.table.Reserve(workloadID, mappings)
 }
 
@@ -55,7 +64,10 @@ func (coordinator *Coordinator) Prepare(workloadID string, mappings []model.Port
 // by then the process's own listeners are up, so a forwarder that cannot reach
 // its upstream is a real fault, not a startup race. On failure everything this
 // call started is stopped again and the reservations are released, leaving the
-// machine as it was.
+// machine as it was: a failed activation must not keep host ports claimed on
+// behalf of forwarding that does not exist. When the failure is that another
+// activation of the same workload stands, that activation keeps its
+// reservations — they belong to the forwarders actually carrying traffic.
 func (coordinator *Coordinator) Activate(ctx context.Context, workloadID string, mappings []model.PortMapping) error {
 	coordinator.mu.Lock()
 	if _, exists := coordinator.forwarders[workloadID]; exists {
@@ -74,6 +86,7 @@ func (coordinator *Coordinator) Activate(ctx context.Context, workloadID string,
 			for _, started := range pending {
 				started.Stop()
 			}
+			coordinator.table.Release(workloadID)
 			return fmt.Errorf("workload %s: %w", workloadID, err)
 		}
 		pending = append(pending, forwarder)
@@ -85,7 +98,8 @@ func (coordinator *Coordinator) Activate(ctx context.Context, workloadID string,
 	coordinator.mu.Lock()
 	if _, exists := coordinator.forwarders[workloadID]; exists {
 		// Another actor activated the same workload between the two
-		// locks. Undo ours; the first activation stands.
+		// locks. Undo ours; the first activation stands — and keeps the
+		// reservations this call must not release.
 		coordinator.mu.Unlock()
 		for _, started := range pending {
 			started.Stop()

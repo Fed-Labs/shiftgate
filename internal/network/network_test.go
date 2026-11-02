@@ -488,3 +488,203 @@ func TestDrainForwardersKeepsReservations(t *testing.T) {
 	}
 	coordinator.Deactivate("workload-drain", 0)
 }
+
+// TestForwarderSurvivesCanceledActivationContext: every production caller
+// activates a forwarder with a context it cancels the moment the activating
+// call returns — restore, API start, fork, clone. The forwarder's contract is
+// to serve until Stop or Drain, so a canceled activation context must not
+// kill the upstream dials: before the fix, the first forwarded connection
+// after cancellation was accepted and reset.
+func TestForwarderSurvivesCanceledActivationContext(t *testing.T) {
+	containerPort := freePort(t)
+	closeUpstream := echoListener(t, containerPort)
+	defer closeUpstream()
+	mapping := model.PortMapping{Protocol: ProtocolTCP, ContainerPort: containerPort, HostPort: freePort(t)}
+	forwarder := NewForwarder(mapping, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	activation, cancel := context.WithCancel(context.Background())
+	if err := forwarder.Start(activation); err != nil {
+		t.Fatalf("start forwarder: %v", err)
+	}
+	defer forwarder.Stop()
+	cancel()
+
+	for attempt := 0; attempt < 3; attempt++ {
+		connection, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)))
+		if err != nil {
+			t.Fatalf("dial forwarded port after activation returned: %v", err)
+		}
+		payload := []byte("still-forwarding")
+		if _, err := connection.Write(payload); err != nil {
+			t.Fatalf("write through forwarder: %v", err)
+		}
+		if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		buffer := make([]byte, len(payload))
+		if _, err := io.ReadFull(connection, buffer); err != nil {
+			t.Fatalf("connection %d was reset: %v", attempt, err)
+		}
+		connection.Close()
+	}
+}
+
+// TestForwarderReachesIPv6OnlyUpstream: a workload whose listener binds only
+// ::1 is reachable through the forwarder, which must try both loopback
+// families instead of hard-coding 127.0.0.1.
+func TestForwarderReachesIPv6OnlyUpstream(t *testing.T) {
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), ProtocolTCP, "[::1]:0")
+	if err != nil {
+		t.Skip("IPv6 loopback unavailable")
+	}
+	upstreamPort := listener.Addr().(*net.TCPAddr).Port
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(connection net.Conn) {
+				defer connection.Close()
+				io.Copy(connection, connection)
+			}(connection)
+		}
+	}()
+	defer func() { listener.Close(); <-done }()
+
+	mapping := model.PortMapping{Protocol: ProtocolTCP, ContainerPort: upstreamPort, HostPort: freePort(t)}
+	forwarder := NewForwarder(mapping, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := forwarder.Start(context.Background()); err != nil {
+		t.Fatalf("start forwarder: %v", err)
+	}
+	defer forwarder.Stop()
+
+	connection, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)))
+	if err != nil {
+		t.Fatalf("dial forwarded port: %v", err)
+	}
+	defer connection.Close()
+	if _, err := connection.Write([]byte("v6")); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 2)
+	if _, err := io.ReadFull(connection, buffer); err != nil {
+		t.Fatalf("IPv6-only upstream unreachable: %v", err)
+	}
+}
+
+// TestForwarderDrainAbortsPendingDials: a connection still inside the
+// upstream dial must not stretch Drain past its grace period — the dial runs
+// under the forwarder's lifecycle and dies with it.
+func TestForwarderDrainAbortsPendingDials(t *testing.T) {
+	mapping := model.PortMapping{Protocol: ProtocolTCP, ContainerPort: 65000, HostPort: freePort(t)}
+	forwarder := NewForwarder(mapping, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// A TEST-NET-1 address: the dial hangs until it is canceled or times out.
+	forwarder.upstream = []string{"192.0.2.1:65000"}
+	if err := forwarder.Start(context.Background()); err != nil {
+		t.Fatalf("start forwarder: %v", err)
+	}
+	defer forwarder.Stop()
+
+	connection, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(mapping.HostPort)))
+	if err != nil {
+		t.Fatalf("dial forwarded port: %v", err)
+	}
+	defer connection.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	started := time.Now()
+	forwarder.Drain(50 * time.Millisecond)
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Drain overshot its bound waiting on a dial: %s", elapsed)
+	}
+}
+
+// TestNATTableReserveRejectsDuplicatesInOneCall: Reserve's contract says it
+// fails without modifying the table when a port is taken — including by an
+// earlier mapping in the same call, which used to be silently overwritten.
+func TestNATTableReserveRejectsDuplicatesInOneCall(t *testing.T) {
+	table := NewNATTable()
+	first := model.PortMapping{Protocol: ProtocolTCP, ContainerPort: 8080, HostPort: 18080}
+	second := model.PortMapping{Protocol: ProtocolTCP, ContainerPort: 8081, HostPort: 18080}
+	if err := table.Reserve("w1", []model.PortMapping{first, second}); err == nil {
+		t.Fatal("a duplicate host port within one reservation must be refused")
+	}
+	if _, taken := table.Lookup(18080); taken {
+		t.Fatal("a refused reservation must leave the table untouched")
+	}
+}
+
+// TestNATTableManyWorkersReserveUniquePorts: cloning many workers is only
+// safe when each claims a distinct host port — a collision is refused up
+// front, not discovered at bind time.
+func TestNATTableManyWorkersReserveUniquePorts(t *testing.T) {
+	table := NewNATTable()
+	for i := 0; i < 32; i++ {
+		mapping := model.PortMapping{Protocol: ProtocolTCP, ContainerPort: 20000 + i, HostPort: 21000 + i}
+		if err := table.Reserve("worker-"+strconv.Itoa(i), []model.PortMapping{mapping}); err != nil {
+			t.Fatalf("worker %d could not claim its own port: %v", i, err)
+		}
+	}
+	clash := model.PortMapping{Protocol: ProtocolTCP, ContainerPort: 20000, HostPort: 21000}
+	if err := table.Reserve("worker-33", []model.PortMapping{clash}); err == nil {
+		t.Fatal("a worker must not steal another worker's host port")
+	}
+}
+
+// TestCoordinatorActivateFailureReleasesReservations: when activation cannot
+// bind, everything it started is undone and the ports are released — a failed
+// activation leaves the machine as it was, per the contract, instead of
+// pinning ports against forwarding that does not exist.
+func TestCoordinatorActivateFailureReleasesReservations(t *testing.T) {
+	hostPort := freePort(t)
+	held, err := (&net.ListenConfig{}).Listen(context.Background(), ProtocolTCP, net.JoinHostPort("127.0.0.1", strconv.Itoa(hostPort)))
+	if err != nil {
+		t.Fatalf("hold host port: %v", err)
+	}
+	defer held.Close()
+
+	coordinator := NewCoordinator(nil)
+	mapping := model.PortMapping{Protocol: ProtocolTCP, ContainerPort: 9000, HostPort: hostPort}
+	if err := coordinator.Prepare("w-fail", []model.PortMapping{mapping}); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Activate(context.Background(), "w-fail", []model.PortMapping{mapping}); err == nil {
+		t.Fatal("activation over an occupied host port must fail")
+	}
+	if err := coordinator.Prepare("w-next", []model.PortMapping{mapping}); err != nil {
+		t.Fatalf("a failed activation must release its reservations: %v", err)
+	}
+}
+
+// TestRebuildReservationsSurvivesCoordinatorStartup: the runtime layer
+// records the port claims of surviving workloads at manager open, and a
+// coordinator constructed afterwards starts from them — the NAT table is
+// in-memory and would otherwise be emptier than the machine after a restart.
+func TestRebuildReservationsSurvivesCoordinatorStartup(t *testing.T) {
+	defer RebuildReservations(nil)
+	mapping := model.PortMapping{Protocol: ProtocolTCP, ContainerPort: 9000, HostPort: 22000}
+	RebuildReservations([]model.Workload{{
+		Spec: model.WorkloadSpec{ID: "survivor", Ports: []model.PortSpec{
+			{Protocol: "tcp", ContainerPort: mapping.ContainerPort, HostPort: mapping.HostPort},
+		}},
+		Status: model.WorkloadRunning,
+	}})
+	coordinator := NewCoordinator(nil)
+	if err := coordinator.Prepare("rival", []model.PortMapping{mapping}); err == nil {
+		t.Fatal("a rebuilt claim must block the port for anyone but its holder")
+	}
+	if err := coordinator.Prepare("survivor", []model.PortMapping{mapping}); err != nil {
+		t.Fatalf("the claim holder must re-reserve its own mapping: %v", err)
+	}
+
+	RebuildReservations(nil)
+	fresh := NewCoordinator(nil)
+	if err := fresh.Prepare("rival", []model.PortMapping{mapping}); err != nil {
+		t.Fatalf("cleared claims must release the machine: %v", err)
+	}
+}

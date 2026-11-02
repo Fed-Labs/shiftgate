@@ -33,6 +33,10 @@ func run() error {
 	var stripeSecretKey string
 	var stripePriceFlags stripePriceValues
 	var logLevel string
+	var agentTLSCert string
+	var agentTLSKey string
+	var agentTLSPeerCA string
+	var agentTLSServerName string
 	var showVersion bool
 	var printDefault bool
 	flag.StringVar(&configPath, "config", "", "path to control-plane JSON configuration")
@@ -44,6 +48,10 @@ func run() error {
 	flag.StringVar(&stripeSecretKey, "stripe-secret-key", "", "Stripe secret API key for outbound checkout and portal sessions")
 	flag.Var(&stripePriceFlags, "stripe-price", "Stripe price id for a plan, as plan=price_id (repeatable)")
 	flag.StringVar(&logLevel, "log-level", "", "debug, info, warn, or error")
+	flag.StringVar(&agentTLSCert, "agent-tls-cert", "", "control-plane client certificate PEM for remote agent dispatch")
+	flag.StringVar(&agentTLSKey, "agent-tls-key", "", "control-plane client private key PEM for remote agent dispatch")
+	flag.StringVar(&agentTLSPeerCA, "agent-tls-peer-ca", "", "CA bundle used to authenticate remote agent certificates")
+	flag.StringVar(&agentTLSServerName, "agent-tls-server-name", "", "optional TLS server name for remote agent dispatch")
 	flag.BoolVar(&showVersion, "version", false, "print version")
 	flag.BoolVar(&printDefault, "print-default-config", false, "print default JSON configuration")
 	flag.Parse()
@@ -58,35 +66,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if databaseURL != "" {
-		configuration.DatabaseURL = databaseURL
-	}
-	if listen != "" {
-		configuration.Listen = listen
-	}
-	if tokenPepper != "" {
-		configuration.TokenPepper = tokenPepper
-	}
-	if passwordPepper != "" {
-		configuration.PasswordPepper = passwordPepper
-	}
-	if stripeWebhookKey != "" {
-		configuration.StripeWebhookKey = stripeWebhookKey
-	}
-	if stripeSecretKey != "" {
-		configuration.StripeSecretKey = stripeSecretKey
-	}
-	if len(stripePriceFlags.values) > 0 {
-		if configuration.StripePrices == nil {
-			configuration.StripePrices = map[string]string{}
-		}
-		for plan, priceID := range stripePriceFlags.values {
-			configuration.StripePrices[plan] = priceID
-		}
-	}
-	if logLevel != "" {
-		configuration.LogLevel = logLevel
-	}
+	(controlPlaneOverrides{
+		databaseURL:        databaseURL,
+		listen:             listen,
+		tokenPepper:        tokenPepper,
+		passwordPepper:     passwordPepper,
+		stripeWebhookKey:   stripeWebhookKey,
+		stripeSecretKey:    stripeSecretKey,
+		stripePrices:       stripePriceFlags.values,
+		logLevel:           logLevel,
+		agentTLSCert:       agentTLSCert,
+		agentTLSKey:        agentTLSKey,
+		agentTLSPeerCA:     agentTLSPeerCA,
+		agentTLSServerName: agentTLSServerName,
+	}).apply(&configuration)
 	if err := configuration.Validate(); err != nil {
 		return err
 	}
@@ -98,6 +91,71 @@ func run() error {
 	}
 	defer server.Close()
 	return server.Run(ctx)
+}
+
+// controlPlaneOverrides carries the command-line flag values that take
+// precedence over file and environment configuration: flags beat the
+// environment, which beats the config file. Overrides are applied after
+// LoadControlPlaneUnvalidated and before Validate, so a flag alone can supply
+// the database URL (the loader must not reject an empty one — that check
+// lives in Validate).
+type controlPlaneOverrides struct {
+	databaseURL        string
+	listen             string
+	tokenPepper        string
+	passwordPepper     string
+	stripeWebhookKey   string
+	stripeSecretKey    string
+	stripePrices       map[string]string
+	logLevel           string
+	agentTLSCert       string
+	agentTLSKey        string
+	agentTLSPeerCA     string
+	agentTLSServerName string
+}
+
+func (overrides controlPlaneOverrides) apply(configuration *config.ControlPlane) {
+	if overrides.databaseURL != "" {
+		configuration.DatabaseURL = overrides.databaseURL
+	}
+	if overrides.listen != "" {
+		configuration.Listen = overrides.listen
+	}
+	if overrides.tokenPepper != "" {
+		configuration.TokenPepper = overrides.tokenPepper
+	}
+	if overrides.passwordPepper != "" {
+		configuration.PasswordPepper = overrides.passwordPepper
+	}
+	if overrides.stripeWebhookKey != "" {
+		configuration.StripeWebhookKey = overrides.stripeWebhookKey
+	}
+	if overrides.stripeSecretKey != "" {
+		configuration.StripeSecretKey = overrides.stripeSecretKey
+	}
+	if len(overrides.stripePrices) > 0 {
+		if configuration.StripePrices == nil {
+			configuration.StripePrices = map[string]string{}
+		}
+		for plan, priceID := range overrides.stripePrices {
+			configuration.StripePrices[plan] = priceID
+		}
+	}
+	if overrides.logLevel != "" {
+		configuration.LogLevel = overrides.logLevel
+	}
+	if overrides.agentTLSCert != "" {
+		configuration.AgentTLS.CertificateFile = overrides.agentTLSCert
+	}
+	if overrides.agentTLSKey != "" {
+		configuration.AgentTLS.PrivateKeyFile = overrides.agentTLSKey
+	}
+	if overrides.agentTLSPeerCA != "" {
+		configuration.AgentTLS.PeerCAFile = overrides.agentTLSPeerCA
+	}
+	if overrides.agentTLSServerName != "" {
+		configuration.AgentTLS.ServerName = overrides.agentTLSServerName
+	}
 }
 
 // stripePriceValues collects repeated -stripe-price plan=price_id flags.

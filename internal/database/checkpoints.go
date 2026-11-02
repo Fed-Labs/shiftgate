@@ -73,9 +73,10 @@ func (store *Store) CreateCheckpointForAgent(ctx context.Context, record Checkpo
 	return store.CreateCheckpoint(ctx, record, audit)
 }
 
-func (store *Store) Checkpoints(ctx context.Context, organizationID, workloadID string) ([]CheckpointRecord, error) {
-	rows, err := store.pool.Query(ctx, `SELECT id,organization_id,workload_id,machine_id,kind,COALESCE(parent_id,''),manifest,plain_bytes,stored_bytes,chunk_count,status,created_at,deleted_at
-		FROM checkpoints WHERE organization_id=$1 AND ($2='' OR workload_id=$2) ORDER BY created_at DESC`, organizationID, workloadID)
+func (store *Store) Checkpoints(ctx context.Context, organizationID, workloadID string, page Page) ([]CheckpointRecord, error) {
+	query := `SELECT id,organization_id,workload_id,machine_id,kind,COALESCE(parent_id,''),manifest,plain_bytes,stored_bytes,chunk_count,status,created_at,deleted_at
+		FROM checkpoints WHERE organization_id=$1 AND ($2='' OR workload_id=$2) ORDER BY created_at DESC` + page.clause()
+	rows, err := store.pool.Query(ctx, query, organizationID, workloadID)
 	if err != nil {
 		return nil, err
 	}

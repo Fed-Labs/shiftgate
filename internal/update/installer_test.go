@@ -435,3 +435,32 @@ func TestInstallerRequiresAbsolutePaths(t *testing.T) {
 		t.Fatal("an installer without a fetcher must be refused")
 	}
 }
+
+// TestInstallSucceedsWithACleanupWarningAfterTheSwap: once the rename has
+// committed the new binary, a housekeeping failure (here: the backup root is
+// no longer a directory, so pruning cannot run) must surface as a cleanup
+// warning on the install record — never as an install failure that blocks the
+// version while the machine is already running the new release.
+func TestInstallSucceedsWithACleanupWarningAfterTheSwap(t *testing.T) {
+	fixture := newInstallerFixture(t, nil, nil, 0)
+	backupsRoot := filepath.Join(fixture.root, "backups")
+	if err := os.RemoveAll(backupsRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupsRoot, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload := versionScript("shift-agent", "1.1.0")
+	release, artifact := fixture.publish("1.1.0", payload)
+
+	installed, err := fixture.installer.Install(context.Background(), release, artifact, "")
+	if err != nil {
+		t.Fatalf("post-swap cleanup trouble must not fail the install: %v", err)
+	}
+	if installed.CleanupWarning == "" {
+		t.Fatal("the cleanup warning must be recorded on the install record")
+	}
+	if fixture.installed(t) != string(payload) {
+		t.Fatal("the committed binary must be in place")
+	}
+}

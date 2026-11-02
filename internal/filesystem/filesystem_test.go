@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -319,5 +320,74 @@ func TestCopyXattrsRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(copied, value) {
 		t.Fatalf("copied xattr = %q, want %q", copied, value)
+	}
+}
+
+// TestCloneFileFallbackFailureLeavesNoPartialFile: when the byte-copy
+// fallback fails mid-way, the partially written destination must not be
+// left behind — callers assume the destination is either absent or a
+// complete copy. /proc/self/mem is a regular file whose reads fail with EIO,
+// which drives the fallback's copy error deterministically.
+func TestCloneFileFallbackFailureLeavesNoPartialFile(t *testing.T) {
+	if _, err := os.Open("/proc/self/mem"); err != nil {
+		t.Skipf("cannot open /proc/self/mem: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "copy")
+	if _, err := CloneFile("/proc/self/mem", target); err == nil {
+		t.Fatal("cloning an unreadable file must fail")
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatal("a failed fallback copy must remove its partial destination")
+	}
+}
+
+// TestCloneFileCreatesACompleteCopy: the success paths (reflink clone or
+// byte fallback) must leave a byte-exact, complete destination and no
+// intermediates behind.
+func TestCloneFileCreatesACompleteCopy(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	content := bytes.Repeat([]byte("durable\n"), 1000)
+	if err := os.WriteFile(source, content, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target")
+	if _, err := CloneFile(source, target); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatal("cloned file differs from the source")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("clone left unexpected files behind: %v", entries)
+	}
+}
+
+// TestSnapshotCreateRefusesUnsafeIDs: the snapshot id is joined into a
+// filesystem path, so ids carrying separators or dot segments must be
+// refused before any directory is created — a caller-supplied id can never
+// steer the snapshot wrapper outside the workload's parent.
+func TestSnapshotCreateRefusesUnsafeIDs(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "root")
+	if err := os.Mkdir(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	provider := btrfsProvider{}
+	for _, id := range []string{"../escape", "a/b", "/abs", "..", ".", "x..y", "a\\b", "x y"} {
+		if _, err := provider.Create(context.Background(), source, id); err == nil || !strings.Contains(err.Error(), "plain identifier") {
+			t.Fatalf("snapshot id %q must be refused, got %v", id, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(root, "escape")); !os.IsNotExist(err) {
+		t.Fatal("a refused id must not create anything outside the parent")
 	}
 }

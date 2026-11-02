@@ -312,3 +312,135 @@ func mustCredentials(t *testing.T, loop *hostedStorageLoop, controlPlane *httpte
 	}
 	return credentials
 }
+
+// countingHandler counts warnings by message, to pin the throttle.
+type countingHandler struct {
+	mu    sync.Mutex
+	warns map[string]int
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *countingHandler) Handle(_ context.Context, record slog.Record) error {
+	if record.Level == slog.LevelWarn {
+		h.mu.Lock()
+		if h.warns == nil {
+			h.warns = map[string]int{}
+		}
+		h.warns[record.Message]++
+		h.mu.Unlock()
+	}
+	return nil
+}
+
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *countingHandler) count(message string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.warns[message]
+}
+
+// TestHostedStorageQuotaKeepsTheCredentialCadence: quota suspends issuance,
+// not the installed credentials. They keep serving until they expire, so the
+// refresh cadence must stay credential-lifetime-based — forcing the
+// credentials-not-OK ten-second retry here is what made the
+// "keeping current credentials until they expire" path unreachable.
+func TestHostedStorageQuotaKeepsTheCredentialCadence(t *testing.T) {
+	fake := &fakeControlPlane{mode: "issue"}
+	controlPlane := httptest.NewServer(fake)
+	defer controlPlane.Close()
+	storage := httptest.NewServer(&tinyFakeS3{})
+	defer storage.Close()
+	loop, deferred := newHostedLoop(t, controlPlane, fake, storage)
+	ctx := context.Background()
+
+	loop.fetchAndApply(ctx)
+	if !loop.credentialsOK {
+		t.Fatal("the first issuance must mark the credentials usable")
+	}
+	fake.setMode("quota")
+	loop.fetchAndApply(ctx)
+
+	loop.mu.Lock()
+	usable := loop.credentialsOK
+	wait := loop.refreshDelay()
+	loop.mu.Unlock()
+	if !usable {
+		t.Fatal("quota must not mark still-valid credentials unusable")
+	}
+	if wait <= 10*time.Second {
+		t.Fatalf("quota must keep the lifetime-based cadence, refresh is in %s", wait)
+	}
+	if !deferred.Available() {
+		t.Fatal("quota refusal uninstalled the working store")
+	}
+}
+
+// TestHostedStorageRepeatedWarningsAreThrottled: the loop retries every ten
+// seconds while it has nothing usable. One misconfiguration is one warning,
+// not one every ten seconds forever.
+func TestHostedStorageRepeatedWarningsAreThrottled(t *testing.T) {
+	handler := &countingHandler{}
+	fake := &fakeControlPlane{mode: "not-configured"}
+	controlPlane := httptest.NewServer(fake)
+	defer controlPlane.Close()
+	storage := httptest.NewServer(&tinyFakeS3{})
+	defer storage.Close()
+	fake.mu.Lock()
+	fake.endpoint = storage.URL
+	fake.mu.Unlock()
+	deferred := objectstore.NewDeferred()
+	loop := newHostedStorageLoop(hostedStorageConfig{
+		controlURL:   controlPlane.URL,
+		organization: "org_1",
+		apiKey:       "agent-key",
+		stateDir:     t.TempDir(),
+	}, deferred, slog.New(handler))
+	ctx := context.Background()
+
+	for pass := 0; pass < 5; pass++ {
+		loop.fetchAndApply(ctx)
+	}
+	if got := handler.count("control plane does not host checkpoint storage; this agent's object-store backend should be s3 or local"); got != 1 {
+		t.Fatalf("the repeated warning must be throttled to one, got %d", got)
+	}
+}
+
+// TestHostedStorageIssuedConfigRotationRebuildsTheClient: credentials are
+// only half of an issuance — endpoint, region, bucket, and prefix are the
+// other half. A rotation of the issued location must move the mirror to the
+// new place instead of silently keeping the old one.
+func TestHostedStorageIssuedConfigRotationRebuildsTheClient(t *testing.T) {
+	fake := &fakeControlPlane{mode: "issue"}
+	controlPlane := httptest.NewServer(fake)
+	defer controlPlane.Close()
+	first := &tinyFakeS3{}
+	firstStorage := httptest.NewServer(first)
+	defer firstStorage.Close()
+	second := &tinyFakeS3{}
+	secondStorage := httptest.NewServer(second)
+	defer secondStorage.Close()
+	loop, deferred := newHostedLoop(t, controlPlane, fake, firstStorage)
+	ctx := context.Background()
+
+	loop.fetchAndApply(ctx)
+	if _, err := deferred.Put(ctx, "checkpoints/cp/manifest", strings.NewReader("1"), 1, ""); err != nil {
+		t.Fatalf("Put to the first location: %v", err)
+	}
+	if first.lastAuthorization() == "" {
+		t.Fatal("the first location never saw traffic")
+	}
+
+	fake.mu.Lock()
+	fake.endpoint = secondStorage.URL
+	fake.mu.Unlock()
+	loop.fetchAndApply(ctx)
+	if _, err := deferred.Put(ctx, "checkpoints/cp/manifest", strings.NewReader("2"), 1, ""); err != nil {
+		t.Fatalf("Put after rotation: %v", err)
+	}
+	if second.lastAuthorization() == "" {
+		t.Fatal("the rotated location never saw traffic — the client kept the old endpoint")
+	}
+}

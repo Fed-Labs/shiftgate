@@ -64,6 +64,23 @@ type CheckoutSessionRequest struct {
 	SuccessURL     string
 	CancelURL      string
 	SeatQuantity   int
+	// PerSeatBilling marks legacy per-seat plans whose base line quantity is
+	// the seat count. Flat-with-included plans bill the base price once and
+	// track extra seats on the subscription item instead.
+	PerSeatBilling bool
+	// Interval is "month" or "year"; it is recorded in session metadata so
+	// the webhook and invoice display can report the billing interval.
+	Interval string
+	// AddOnPriceIDs are extra line items (HA Pack, SourceGuard Assurance);
+	// AddOnKeys mirrors them into metadata so the webhook can set the
+	// entitlement capability flags.
+	AddOnPriceIDs []string
+	AddOnKeys     []string
+	// Coupon is an optional Stripe promotion code to apply at checkout.
+	Coupon string
+	// SpendCapCents is the monthly overage spend cap recorded in metadata
+	// (0 = plan default).
+	SpendCapCents int64
 }
 
 // CheckoutSession is the created Stripe session; URL is where the browser
@@ -118,8 +135,57 @@ func (c *StripeClient) CreateCheckoutSession(ctx context.Context, request Checko
 	form.Set("cancel_url", request.CancelURL)
 	form.Set("metadata[organization_id]", request.OrganizationID)
 	form.Set("metadata[plan]", request.PlanKey)
+	interval := request.Interval
+	if interval == "" {
+		interval = "month"
+	}
+	form.Set("metadata[interval]", interval)
+	// The purchased seat ceiling travels in session metadata (copied to the
+	// subscription): it is the value the webhook stores in entitlements.seats
+	// and the only record that survives quantity syncs. For flat-with-included
+	// plans it is included + extra; for legacy per-seat plans it is the seat
+	// quantity.
+	if request.SeatQuantity > 0 {
+		form.Set("metadata[seats]", strconv.Itoa(request.SeatQuantity))
+	}
+	if len(request.AddOnKeys) > 0 {
+		form.Set("metadata[addons]", strings.Join(request.AddOnKeys, ","))
+	}
+	if request.SpendCapCents > 0 {
+		form.Set("metadata[spend_cap_cents]", strconv.FormatInt(request.SpendCapCents, 10))
+	}
+	// The base line always bills the flat plan price once. Legacy per-seat
+	// plans carry the seat quantity on that line; flat-with-included plans
+	// bill extra seats as a dedicated per-seat line item below (extras only,
+	// at SeatOverageCents), so seat growth can never multiply the base fee and
+	// the seat sync later updates that line, not the plan price.
 	form.Set("line_items[0][price]", request.PriceID)
-	form.Set("line_items[0][quantity]", strconv.Itoa(quantity))
+	if request.PerSeatBilling {
+		form.Set("line_items[0][quantity]", strconv.Itoa(quantity))
+	} else {
+		form.Set("line_items[0][quantity]", "1")
+	}
+	for index, addOnPriceID := range request.AddOnPriceIDs {
+		form.Set(fmt.Sprintf("line_items[%d][price]", index+1), addOnPriceID)
+		form.Set(fmt.Sprintf("line_items[%d][quantity]", index+1), "1")
+	}
+	if plan, ok := FindPlan(request.PlanKey); ok && plan.IncludedSeats > 0 && !request.PerSeatBilling {
+		if extras := request.SeatQuantity - plan.IncludedSeats; extras > 0 {
+			if unitAmount := SeatOverageUnitAmount(plan, interval); unitAmount > 0 {
+				index := 1 + len(request.AddOnPriceIDs)
+				form.Set(fmt.Sprintf("line_items[%d][quantity]", index), strconv.Itoa(extras))
+				form.Set(fmt.Sprintf("line_items[%d][price_data][currency]", index), "usd")
+				form.Set(fmt.Sprintf("line_items[%d][price_data][unit_amount]", index), strconv.FormatInt(unitAmount, 10))
+				form.Set(fmt.Sprintf("line_items[%d][price_data][recurring][interval]", index), interval)
+				form.Set(fmt.Sprintf("line_items[%d][price_data][product_data][name]", index), "Extra seats")
+			}
+		}
+	}
+	if request.Coupon != "" {
+		form.Set("discounts[0][promotion_code]", request.Coupon)
+	} else {
+		form.Set("allow_promotion_codes", "true")
+	}
 	if request.CustomerID != "" {
 		form.Set("customer", request.CustomerID)
 	} else {
@@ -136,6 +202,150 @@ func (c *StripeClient) CreateCheckoutSession(ctx context.Context, request Checko
 		return CheckoutSession{}, errors.New("stripe returned a checkout session without a url")
 	}
 	return session, nil
+}
+
+// UpdateSubscriptionQuantity sets the billed quantity of one subscription
+// item — the seat count of a per-seat plan. The control plane calls it when
+// organization membership changes so Stripe's invoice quantity and the
+// enforced seat ceiling cannot drift apart. Proration is left off: quantity
+// changes ride the next invoice rather than generating surprise mid-cycle
+// charges.
+func (c *StripeClient) UpdateSubscriptionQuantity(ctx context.Context, subscriptionItemID string, quantity int) error {
+	if !c.Enabled() {
+		return errors.New("stripe billing is not configured")
+	}
+	if subscriptionItemID == "" {
+		return errors.New("stripe subscription item id is required to update quantity")
+	}
+	if quantity < 1 {
+		return errors.New("subscription quantity must be at least one")
+	}
+	form := url.Values{}
+	form.Set("quantity", strconv.Itoa(quantity))
+	form.Set("proration_behavior", "none")
+	return c.post(ctx, "/v1/subscription_items/"+url.PathEscape(subscriptionItemID), form, nil)
+}
+
+// ReportMeteredUsage reports one metered quantity against a subscription item
+// (storage GB-months or transfer GB above the included allotment). Stripe
+// aggregates usage records per billing period on the metered price; the
+// control plane's daily rollup calls this only for active paid subscriptions
+// and only for the excess over plan-included amounts. Free organizations
+// never emit meter events.
+func (c *StripeClient) ReportMeteredUsage(ctx context.Context, subscriptionItemID string, quantity int64, timestamp time.Time) error {
+	if !c.Enabled() {
+		return errors.New("stripe billing is not configured")
+	}
+	if subscriptionItemID == "" {
+		return errors.New("stripe subscription item id is required to report usage")
+	}
+	if quantity < 0 {
+		return errors.New("metered usage cannot be negative")
+	}
+	form := url.Values{}
+	form.Set("quantity", strconv.FormatInt(quantity, 10))
+	form.Set("action", "increment")
+	if !timestamp.IsZero() {
+		form.Set("timestamp", strconv.FormatInt(timestamp.UTC().Unix(), 10))
+	}
+	return c.post(ctx, "/v1/subscription_items/"+url.PathEscape(subscriptionItemID)+"/usage_records", form, nil)
+}
+
+// StripeSubscription is the subset of subscription state the reconciliation
+// job needs: status, plan metadata, the purchased seat ceiling, and the
+// subscription item the seat-quantity sync updates.
+type StripeSubscription struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	ItemID string `json:"-"`
+	Seats  int    `json:"-"`
+	Plan   string `json:"-"`
+	AddOns string `json:"-"`
+}
+
+// GetSubscription fetches one subscription's current state from Stripe. The
+// reconciliation job uses it to heal entitlement drift in both directions.
+func (c *StripeClient) GetSubscription(ctx context.Context, subscriptionID string) (StripeSubscription, error) {
+	if !c.Enabled() {
+		return StripeSubscription{}, errors.New("stripe billing is not configured")
+	}
+	if subscriptionID == "" {
+		return StripeSubscription{}, errors.New("stripe subscription id is required")
+	}
+	var raw struct {
+		ID       string            `json:"id"`
+		Status   string            `json:"status"`
+		Metadata map[string]string `json:"metadata"`
+		Items    struct {
+			Data []struct {
+				ID       string `json:"id"`
+				Quantity int    `json:"quantity"`
+				Price    struct {
+					ID         string `json:"id"`
+					UnitAmount int64  `json:"unit_amount"`
+				} `json:"price"`
+			} `json:"data"`
+		} `json:"items"`
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/subscriptions/"+url.PathEscape(subscriptionID), nil)
+	if err != nil {
+		return StripeSubscription{}, err
+	}
+	response, err := c.client.Do(request)
+	if err != nil {
+		return StripeSubscription{}, fmt.Errorf("stripe subscription fetch: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return StripeSubscription{}, fmt.Errorf("stripe subscription fetch: read response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return StripeSubscription{}, fmt.Errorf("stripe /v1/subscriptions/%s responded %s: %s", subscriptionID, response.Status, stripeErrorMessage(body))
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return StripeSubscription{}, fmt.Errorf("stripe subscription fetch: decode response: %w", err)
+	}
+	subscription := StripeSubscription{ID: raw.ID, Status: raw.Status, Plan: raw.Metadata["plan"], AddOns: raw.Metadata["addons"]}
+	// The seat ceiling of record is the session's seats metadata. The item id
+	// is the dedicated extra-seat line (the last line matching the seat
+	// overage amount — add-ons may share the unit price), falling back to the
+	// first item for legacy subscriptions whose base line carries the seat
+	// quantity.
+	if parsed, err := strconv.Atoi(raw.Metadata["seats"]); err == nil && parsed > 0 {
+		subscription.Seats = parsed
+	}
+	seatPlan, _ := FindPlan(raw.Metadata["plan"])
+	seatUnit := SeatOverageUnitAmount(seatPlan, raw.Metadata["interval"])
+	seatItemID := ""
+	for _, item := range raw.Items.Data {
+		if seatUnit > 0 && item.Price.UnitAmount == seatUnit {
+			seatItemID = item.ID
+		}
+	}
+	if seatItemID != "" {
+		subscription.ItemID = seatItemID
+	} else if len(raw.Items.Data) > 0 {
+		subscription.ItemID = raw.Items.Data[0].ID
+	}
+	if subscription.Seats == 0 && len(raw.Items.Data) > 0 {
+		subscription.Seats = raw.Items.Data[0].Quantity
+	}
+	return subscription, nil
+}
+
+// PauseSubscription pauses collection on a subscription (dunning save offer).
+// Entitlements drop to free-tier limits while paused; data is preserved.
+func (c *StripeClient) PauseSubscription(ctx context.Context, subscriptionID string) error {
+	if !c.Enabled() {
+		return errors.New("stripe billing is not configured")
+	}
+	if subscriptionID == "" {
+		return errors.New("stripe subscription id is required")
+	}
+	form := url.Values{}
+	form.Set("pause_collection[behavior]", "keep_as_draft")
+	return c.post(ctx, "/v1/subscriptions/"+url.PathEscape(subscriptionID), form, nil)
 }
 
 // post sends one form-encoded request and decodes the JSON response into out.

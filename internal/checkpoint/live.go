@@ -80,6 +80,10 @@ type LiveSession struct {
 	frozen            bool
 	freezeStartedAt   time.Time
 	closed            bool
+	// passFailed marks a session whose pre-copy chain is incomplete: a pass
+	// errored after it may have armed memory tracking or dumped pages that
+	// are now in no retained set. Nothing may run against that chain again.
+	passFailed bool
 }
 
 // BeginLive opens an iterative pre-copy session on a running (or paused)
@@ -169,9 +173,10 @@ func (l *LiveSession) PassLimit() int { return l.passLimit }
 func (l *LiveSession) KeyVersion() uint32 { return l.keyVersion }
 
 // CanPass reports whether pre-copy passes are possible: only a workload that
-// was running when the session began has anything to pre-copy. A paused
-// workload goes straight to Finalize — its final dump parents nothing.
-func (l *LiveSession) CanPass() bool { return l.originallyRunning && !l.closed }
+// was running when the session began has anything to pre-copy, and a session
+// whose chain a failed pass left incomplete has nothing safe left to run. A
+// paused workload goes straight to Finalize — its final dump parents nothing.
+func (l *LiveSession) CanPass() bool { return l.originallyRunning && !l.closed && !l.passFailed }
 
 // FreezeStartedAt reports the instant Finalize froze the workload — zero when
 // it never did. It stays readable after the session closes, so a caller whose
@@ -184,9 +189,20 @@ func (l *LiveSession) FreezeStartedAt() time.Time { return l.freezeStartedAt }
 // packages that pass's image set as its own asset — a live migration
 // transfers the asset's chunks immediately, before the next pass runs, which
 // is what keeps the later frozen window down to the final delta.
+//
+// A failed pass is terminal for the session. Each PreDump arms memory
+// tracking and writes only the delta since the previous pass, so an attempt
+// that fails after its PreDump has already cleared the workload's dirty bits
+// has taken pages that are now in no retained set; retrying would write only
+// pages dirtied since the abandoned attempt and silently drop the rest. Once
+// a pass fails, every further Pass and the Finalize refuse, and the caller
+// must Abort — never finalize — the session.
 func (l *LiveSession) Pass(parent context.Context) (PreCopyPass, error) {
 	if l.closed {
 		return PreCopyPass{}, errors.New("live checkpoint session is closed")
+	}
+	if l.passFailed {
+		return PreCopyPass{}, errors.New("pre-copy pass failed earlier in this session and the image chain is incomplete; abort the session")
 	}
 	if !l.originallyRunning {
 		return PreCopyPass{}, errors.New("pre-copy passes require a workload that was running when the session began")
@@ -199,6 +215,7 @@ func (l *LiveSession) Pass(parent context.Context) (PreCopyPass, error) {
 	pass := len(l.passImages) + 1
 	images := filepath.Join(l.staging, fmt.Sprintf("precopy-%d", pass))
 	if err := os.MkdirAll(images, 0o700); err != nil {
+		l.passFailed = true
 		return PreCopyPass{}, err
 	}
 	previous := ""
@@ -210,25 +227,36 @@ func (l *LiveSession) Pass(parent context.Context) (PreCopyPass, error) {
 		TCPState: l.options.TCPState, ShellJob: true, FileLocks: true,
 		ExternalUNIX: true, ManageCgroups: "soft",
 	}); err != nil {
+		l.passFailed = true
 		return PreCopyPass{}, fmt.Errorf("criu pre-dump pass %d: %w", pass, err)
 	}
 	result, err := captureDirectory(ctx, l.service.chunks, l.workload.Spec.ID,
 		fmt.Sprintf("process-state-precopy-%d", pass), l.staging,
 		[]string{filepath.Base(images)}, []string{"work"}, 20)
 	if err != nil {
+		l.passFailed = true
 		return PreCopyPass{}, err
 	}
 	if err := l.requireKeyVersion(result.Asset); err != nil {
+		l.passFailed = true
 		return PreCopyPass{}, err
 	}
 	l.passImages = append(l.passImages, images)
 	l.passAssets = append(l.passAssets, result.Asset)
 	l.deduplicated += result.DeduplicatedBytes
-	delta := directoryBytes(images)
+	delta, deltaErr := passImageBytes(images)
 	more := len(l.passImages) < l.passLimit
-	if pass == 1 {
+	switch {
+	case deltaErr != nil:
+		// An unreadable image set understates the delta, and an understated
+		// delta trips convergence early — the frozen window then carries far
+		// more than the caller was promised. Never converge on a partial sum;
+		// run another pass instead.
+		l.service.logger.Warn("pre-copy delta could not be measured; running another pass",
+			"workload_id", l.workload.Spec.ID, "pass", pass, "error", deltaErr)
+	case pass == 1:
 		l.baseline = delta
-	} else if l.baseline > 0 && delta <= int64(l.convergence*float64(l.baseline)) {
+	case l.baseline > 0 && delta <= int64(l.convergence*float64(l.baseline)):
 		l.service.logger.Debug("pre-copy converged before the pass cap",
 			"workload_id", l.workload.Spec.ID, "pass", pass,
 			"delta_bytes", delta, "baseline_bytes", l.baseline)
@@ -238,6 +266,35 @@ func (l *LiveSession) Pass(parent context.Context) (PreCopyPass, error) {
 		Index: pass, DeltaBytes: delta, Asset: result.Asset,
 		KeyVersion: l.keyVersion, More: more,
 	}, nil
+}
+
+// passImageBytes sums the regular files of one pre-dump pass's image set —
+// the dirty-memory delta the pass carried — skipping CRIU's "work" scratch
+// directory. Unlike a walk that keeps whatever it summed before an error, a
+// failure here is reported: the caller must never make a convergence decision
+// on a partial sum.
+func passImageBytes(root string) (int64, error) {
+	total := int64(0)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == "work" && path == filepath.Join(root, "work") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, err
 }
 
 // requireKeyVersion rejects a packaged asset whose chunks are encrypted under
@@ -261,10 +318,16 @@ func (l *LiveSession) requireKeyVersion(asset model.AssetManifest) error {
 // The manifest's own asset carries only the final image set; each pass's set
 // travels as the asset Pass already packaged, which is what lets the passes
 // be transferred before the freeze. On success — or failure — the session is
-// closed; a failure thaws a workload this Finalize froze.
+// closed; a failure thaws a workload this Finalize froze. A session whose
+// pre-copy chain a failed pass left incomplete is refused: freezing over a
+// chain with missing pages would produce a checkpoint that restores silently
+// corrupt.
 func (l *LiveSession) Finalize(parent context.Context) (manifest model.CheckpointManifest, err error) {
 	if l.closed {
 		return model.CheckpointManifest{}, errors.New("live checkpoint session is closed")
+	}
+	if l.passFailed {
+		return model.CheckpointManifest{}, errors.New("a pre-copy pass failed earlier in this session; finalizing would freeze the workload over an incomplete image chain — abort the session instead")
 	}
 	l.closed = true
 	defer func() {
@@ -455,27 +518,30 @@ func (l *LiveSession) Finalize(parent context.Context) (manifest model.Checkpoin
 	}
 	// The checkpoint exists now, so this instant's file index becomes the
 	// baseline the next checkpoint's changed-file accounting diffs against.
+	// From here on a failure returns the saved manifest with the error: the
+	// checkpoint is real and the caller must be able to mark, reap, or mirror
+	// it instead of hunting for an id that only the error string names.
 	err = os.MkdirAll(filepath.Join(l.service.stateDir, "indices"), 0o700)
 	if err != nil {
-		return model.CheckpointManifest{}, err
+		return manifest, err
 	}
 	err = filesystem.SaveIndex(indexPath, currentIndex)
 	if err != nil {
-		return model.CheckpointManifest{}, fmt.Errorf("persist changed-file index: %w", err)
+		return manifest, fmt.Errorf("persist changed-file index: %w", err)
 	}
 	if l.service.mirror != nil {
 		if _, mirrorErr := l.service.MirrorCheckpoint(ctx, l.checkpointID); mirrorErr != nil {
-			return model.CheckpointManifest{}, fmt.Errorf("checkpoint %s persisted locally but object-store mirror failed: %w", l.checkpointID, mirrorErr)
+			return manifest, fmt.Errorf("checkpoint %s persisted locally but object-store mirror failed: %w", l.checkpointID, mirrorErr)
 		}
 	}
 	if l.originallyRunning && l.options.LeaveRunning && l.frozen {
 		if _, err = l.service.runtime.Resume(l.workload.Spec.ID); err != nil {
-			return model.CheckpointManifest{}, fmt.Errorf("checkpoint stored but source could not resume: %w", err)
+			return manifest, fmt.Errorf("checkpoint stored but source could not resume: %w", err)
 		}
 		l.frozen = false
 	}
 	if _, err = l.service.runtime.MarkCheckpoint(l.workload.Spec.ID, l.checkpointID, l.originallyRunning && l.options.LeaveRunning); err != nil {
-		return model.CheckpointManifest{}, err
+		return manifest, err
 	}
 	l.service.logger.Info("live checkpoint created", "checkpoint_id", l.checkpointID, "workload_id", l.workload.Spec.ID,
 		"passes", len(l.passImages), "plain_bytes", metrics.PlainBytes, "stored_bytes", metrics.StoredBytes)

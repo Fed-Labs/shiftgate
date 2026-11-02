@@ -38,7 +38,7 @@ func existingPaths(candidates []string) []string {
 // nvidia-smi there is no driver, and SHIFT reports no NVIDIA devices rather
 // than probing PCI ids it cannot verify.
 func detectNVIDIA(parent context.Context) []model.GPUDevice {
-	path, err := exec.LookPath("nvidia-smi")
+	path, err := trustedLookPath("nvidia-smi")
 	if err != nil {
 		return nil
 	}
@@ -177,7 +177,7 @@ func parseNvidiaSMICUDAVersion(output string) string {
 // this is recorded for visibility and destination comparison, never required.
 func detectCUDA(parent context.Context) model.GPURuntime {
 	runtime := model.GPURuntime{Name: "CUDA"}
-	if path, err := exec.LookPath("nvcc"); err == nil {
+	if path, err := trustedLookPath("nvcc"); err == nil {
 		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 		defer cancel()
 		output, err := exec.CommandContext(ctx, path, "--version").Output()
@@ -250,9 +250,9 @@ func cudaToolkitDirectory() (directory, version string) {
 }
 
 // commandOutput runs a command and returns its trimmed stdout, or "" if the
-// command is missing or fails.
+// command is missing, untrusted, or fails.
 func commandOutput(ctx context.Context, name string, arguments ...string) string {
-	path, err := exec.LookPath(name)
+	path, err := trustedLookPath(name)
 	if err != nil {
 		return ""
 	}

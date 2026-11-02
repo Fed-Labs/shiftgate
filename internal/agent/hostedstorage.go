@@ -56,10 +56,18 @@ type hostedStorageLoop struct {
 
 	mu            sync.Mutex
 	installed     *objectstore.S3
+	installedConf *issuedStorageConfig
 	expiration    time.Time
 	lastQuota     bool
 	credentialsOK bool
+	warnLast      map[string]time.Time
 }
+
+// hostedWarnInterval is how long a repeated identical warning stays quiet.
+// The credential loop retries every ten seconds while it has nothing usable;
+// without throttling, one misconfiguration is a warning every ten seconds
+// forever.
+const hostedWarnInterval = 15 * time.Minute
 
 // issuedStorageConfig is the non-secret location configuration a credential
 // response carried.
@@ -136,38 +144,52 @@ func (loop *hostedStorageLoop) refreshDelay() time.Duration {
 // apply installs the credentials: the first successful fetch constructs the
 // S3 client and swaps it into the deferred store; later fetches rotate the
 // credentials on that client, keeping in-flight operations on the generation
-// they resolved.
+// they resolved. A fetch whose issued location changed — endpoint, region,
+// bucket, prefix, or path style — rebuilds the client too: credentials are
+// only half of the issuance, and a rotated location with a stale client
+// would keep mirroring into the old bucket.
 func (loop *hostedStorageLoop) apply(credentials objectstore.STSCredentials) error {
 	loop.mu.Lock()
 	installed := loop.installed
 	issued := loop.issuedConfig
+	installedConf := loop.installedConf
 	loop.mu.Unlock()
-	if installed == nil {
-		if issued == nil {
-			return errors.New("hosted storage loop has no issued configuration to build a client from")
-		}
-		client, err := objectstore.OpenS3(objectstore.S3Config{
-			Endpoint:        issued.Endpoint,
-			Region:          issued.Region,
-			Bucket:          issued.Bucket,
-			AccessKeyID:     credentials.AccessKeyID,
-			SecretAccessKey: credentials.SecretAccessKey,
-			SessionToken:    credentials.SessionToken,
-			Prefix:          issued.Prefix,
-			StateDir:        loop.configuration.stateDir,
-			ForcePathStyle:  issued.ForcePathStyle,
-		})
-		if err != nil {
-			return err
-		}
-		loop.store.Swap(client)
-		loop.mu.Lock()
-		loop.installed = client
-		loop.mu.Unlock()
+	if issued == nil {
+		return errors.New("hosted storage loop has no issued configuration to build a client from")
+	}
+	if installed != nil && sameIssuedLocation(installedConf, issued) {
+		installed.SetCredentials(credentials.AccessKeyID, credentials.SecretAccessKey, credentials.SessionToken)
 		return nil
 	}
-	installed.SetCredentials(credentials.AccessKeyID, credentials.SecretAccessKey, credentials.SessionToken)
+	client, err := objectstore.OpenS3(objectstore.S3Config{
+		Endpoint:        issued.Endpoint,
+		Region:          issued.Region,
+		Bucket:          issued.Bucket,
+		AccessKeyID:     credentials.AccessKeyID,
+		SecretAccessKey: credentials.SecretAccessKey,
+		SessionToken:    credentials.SessionToken,
+		Prefix:          issued.Prefix,
+		StateDir:        loop.configuration.stateDir,
+		ForcePathStyle:  issued.ForcePathStyle,
+	})
+	if err != nil {
+		return err
+	}
+	loop.store.Swap(client)
+	loop.mu.Lock()
+	loop.installed = client
+	loop.installedConf = issued
+	loop.mu.Unlock()
 	return nil
+}
+
+// sameIssuedLocation reports whether the live client was built for the same
+// storage location an issuance names.
+func sameIssuedLocation(installed, issued *issuedStorageConfig) bool {
+	if installed == nil || issued == nil {
+		return false
+	}
+	return *installed == *issued
 }
 
 // fetchAndApply performs one credential round trip and applies the result.
@@ -179,8 +201,14 @@ func (loop *hostedStorageLoop) fetchAndApply(ctx context.Context) {
 			loop.mu.Lock()
 			wasQuota := loop.lastQuota
 			loop.lastQuota = true
-			loop.credentialsOK = false
 			loop.mu.Unlock()
+			// Quota suspends issuance, not the installed credentials: they
+			// stay valid until they expire and keep serving (and keep the
+			// lifetime-based refresh cadence). credentialsOK deliberately
+			// keeps its previous value — clearing it would route the loop
+			// into the ten-second retry branch and make the
+			// "keeping current credentials until they expire" path
+			// unreachable exactly when it matters.
 			if !wasQuota {
 				loop.logger.Warn("hosted storage quota exceeded; mirroring is suspended until space is freed or the plan is upgraded", "error", err)
 			}
@@ -188,15 +216,15 @@ func (loop *hostedStorageLoop) fetchAndApply(ctx context.Context) {
 			loop.mu.Lock()
 			loop.credentialsOK = false
 			loop.mu.Unlock()
-			loop.logger.Warn("control plane does not host checkpoint storage; this agent's object-store backend should be s3 or local", "error", err)
+			loop.warnThrottled("not-configured", "control plane does not host checkpoint storage; this agent's object-store backend should be s3 or local", err)
 		default:
 			loop.mu.Lock()
 			usable := loop.credentialsOK && time.Until(loop.expiration) > 0
 			loop.mu.Unlock()
 			if usable {
-				loop.logger.Warn("hosted storage refresh failed; keeping current credentials until they expire", "error", err)
+				loop.warnThrottled("refresh-failed", "hosted storage refresh failed; keeping current credentials until they expire", err)
 			} else {
-				loop.logger.Warn("hosted storage credentials are not available", "error", err)
+				loop.warnThrottled("no-credentials", "hosted storage credentials are not available", err)
 			}
 		}
 		return
@@ -211,6 +239,24 @@ func (loop *hostedStorageLoop) fetchAndApply(ctx context.Context) {
 	loop.credentialsOK = true
 	loop.mu.Unlock()
 	loop.logger.Debug("hosted storage credentials applied", "expiration", credentials.Expiration.Format(time.RFC3339))
+}
+
+// warnThrottled logs a warning for a condition at most once per
+// hostedWarnInterval. The credential loop retries on a short cadence while
+// it has nothing usable; the same warning every pass is noise, not signal.
+func (loop *hostedStorageLoop) warnThrottled(kind, message string, err error) {
+	loop.mu.Lock()
+	if loop.warnLast == nil {
+		loop.warnLast = map[string]time.Time{}
+	}
+	now := time.Now()
+	if last, seen := loop.warnLast[kind]; seen && now.Sub(last) < hostedWarnInterval {
+		loop.mu.Unlock()
+		return
+	}
+	loop.warnLast[kind] = now
+	loop.mu.Unlock()
+	loop.logger.Warn(message, "error", err)
 }
 
 // fetch performs the HTTP round trip to the control plane's credential

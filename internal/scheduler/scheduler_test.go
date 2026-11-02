@@ -149,3 +149,25 @@ func TestPartnerVisibilityWorksWhilePublicTradingIsDisabled(t *testing.T) {
 		t.Fatal("a partner offer must be marked as cross-organization")
 	}
 }
+
+// TestFailedReservationReleasesCapacity: a FAILED hold is dead — counting it
+// until expiry pins an offer's resources to work that will never run.
+func TestFailedReservationReleasesCapacity(t *testing.T) {
+	now := testNow
+	expiry := now.Add(time.Hour)
+	reservations := []Reservation{
+		{ID: "r1", Requested: Resources{CPUCount: 4}, State: ReservationActive, ExpiresAt: expiry},
+		{ID: "r2", Requested: Resources{CPUCount: 3}, State: ReservationFailed, ExpiresAt: expiry},
+		{ID: "r3", Requested: Resources{CPUCount: 2}, State: ReservationExpired, ExpiresAt: expiry},
+	}
+	committed := CommittedFrom(reservations, now)
+	if committed.CPUCount != 4 {
+		t.Fatalf("FAILED and EXPIRED holds still pinned capacity: %+v", committed)
+	}
+	if !ReservationFailed.Terminal() {
+		t.Fatal("FAILED must be terminal for capacity purposes")
+	}
+	if (Reservation{State: ReservationFailed, ExpiresAt: expiry}).Expired(now) {
+		t.Fatal("a terminal FAILED reservation must not report as expiring")
+	}
+}

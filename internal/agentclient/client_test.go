@@ -3,18 +3,29 @@ package agentclient
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"crypto/tls"
 
 	"shift.dev/shift/internal/checkpoint"
 	"shift.dev/shift/internal/model"
@@ -71,6 +82,48 @@ func TestClientReturnsDecodedValues(t *testing.T) {
 	}
 }
 
+func TestHTTPSClientUsesConfiguredMTLS(t *testing.T) {
+	directory := t.TempDir()
+	caCert, caKey := testCertificateAuthority(t, directory)
+	serverCert, serverKey := testLeafCertificate(t, directory, caCert, caKey, "agent.example", true)
+	clientCert, clientKey := testLeafCertificate(t, directory, caCert, caKey, "control.example", false)
+	serverTLS, err := tls.LoadX509KeyPair(serverCert, serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPEM, err := os.ReadFile(caCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCAs := x509.NewCertPool()
+	if !clientCAs.AppendCertsFromPEM(caPEM) {
+		t.Fatal("append client CA")
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_ = json.NewEncoder(writer).Encode(map[string]string{"status": "ok"})
+	}))
+	server.TLS = &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{serverTLS}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: clientCAs}
+	server.StartTLS()
+	defer server.Close()
+	client, err := NewWithTLS(server.URL, time.Second, TLSOptions{CertificateFile: clientCert, PrivateKeyFile: clientKey, PeerCAFile: caCert, ServerName: "agent.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Health(context.Background())
+	if err != nil {
+		t.Fatalf("mTLS request failed: %v", err)
+	}
+	if result["status"] != "ok" {
+		t.Fatalf("unexpected health response: %#v", result)
+	}
+}
+
+func TestHTTPSClientRequiresMTLSConfiguration(t *testing.T) {
+	if _, err := NewWithTLS("https://agent.example:8443", time.Second, TLSOptions{}); err == nil || !strings.Contains(err.Error(), "client certificate") {
+		t.Fatalf("missing HTTPS mTLS configuration returned %v", err)
+	}
+}
+
 func TestClientDecodesAPIErrors(t *testing.T) {
 	client := testClient(func(_ *http.Request) (*http.Response, error) {
 		return testResponse(http.StatusNotFound, model.ErrorResponse{Code: "WORKLOAD_NOT_FOUND", Message: "missing workload"}), nil
@@ -124,5 +177,85 @@ func testResponse(status int, value any) *http.Response {
 		Status:     fmt.Sprintf("%d", status),
 		Header:     make(http.Header),
 		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+}
+
+func testCertificateAuthority(t *testing.T, directory string) (string, string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate := &x509.Certificate{SerialNumber: newSerial(t), Subject: pkix.Name{CommonName: "shift test CA"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature}
+	der, err := x509.CreateCertificate(rand.Reader, certificate, certificate, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath := filepath.Join(directory, "ca.pem"), filepath.Join(directory, "ca-key.pem")
+	writePEM(t, certPath, "CERTIFICATE", der)
+	writePEM(t, keyPath, "EC PRIVATE KEY", mustMarshalECKey(t, key))
+	return certPath, keyPath
+}
+
+func testLeafCertificate(t *testing.T, directory, caCert, caKey, name string, server bool) (string, string) {
+	t.Helper()
+	caKeyBytes, err := os.ReadFile(caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caBlock, _ := pem.Decode(caKeyBytes)
+	parentKey, err := x509.ParseECPrivateKey(caBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caBytes, err := os.ReadFile(caCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caBlock, _ = pem.Decode(caBytes)
+	parent, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate := &x509.Certificate{SerialNumber: newSerial(t), Subject: pkix.Name{CommonName: name}, DNSNames: []string{name}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
+	if server {
+		certificate.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, certificate, parent, &key.PublicKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath := filepath.Join(directory, name+".pem"), filepath.Join(directory, name+"-key.pem")
+	writePEM(t, certPath, "CERTIFICATE", der)
+	writePEM(t, keyPath, "EC PRIVATE KEY", mustMarshalECKey(t, key))
+	return certPath, keyPath
+}
+
+func newSerial(t *testing.T) *big.Int {
+	t.Helper()
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 120))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return serial
+}
+
+func mustMarshalECKey(t *testing.T, key *ecdsa.PrivateKey) []byte {
+	t.Helper()
+	encoded, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func writePEM(t *testing.T, path, kind string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: kind, Bytes: data}), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

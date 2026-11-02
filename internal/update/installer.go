@@ -1,6 +1,7 @@
 package update
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -21,6 +22,18 @@ import (
 // ErrNotReady reports that the machine is doing work an update must not
 // interrupt. It is not a failure: the caller retries later.
 var ErrNotReady = errors.New("machine is not ready for an update")
+
+// ErrBadRelease reports a deterministic failure: the release itself cannot be
+// installed on this machine (a digest mismatch, a binary that will not run, or
+// a binary that reports the wrong version). Retrying cannot help, so the
+// manager blocks the version locally.
+var ErrBadRelease = errors.New("release cannot be installed on this machine")
+
+// ErrTransient reports a failure that says nothing about the release: a
+// network blip while fetching, or disk trouble while staging or swapping. The
+// same release may install cleanly on a later attempt, so the manager records
+// the failure without blocking and retries on the next check.
+var ErrTransient = errors.New("transient install failure")
 
 // selfTestTimeout bounds the version self-check of a staged binary. A binary
 // that cannot answer within this window is treated as broken and never installed.
@@ -80,6 +93,11 @@ type Installed struct {
 	ExecutablePath  string    `json:"executable_path"`
 	BackupID        string    `json:"backup_id,omitempty"`
 	SHA256          string    `json:"sha256"`
+	// CleanupWarning records a post-swap housekeeping problem (a backup that
+	// could not be pruned, a state file that could not be written). The new
+	// binary is in place either way: a cleanup warning is never an install
+	// failure and never blocks the version.
+	CleanupWarning string `json:"cleanup_warning,omitempty"`
 }
 
 // InstallerConfig configures an installer.
@@ -148,7 +166,9 @@ func NewInstaller(configuration InstallerConfig) (*Installer, error) {
 		installer.now = time.Now
 	}
 	if installer.selfTest == nil {
-		installer.selfTest = versionSelfTest
+		installer.selfTest = func(ctx context.Context, path string) (Version, error) {
+			return ProbeVersion(ctx, path, string(installer.component))
+		}
 	}
 	for _, directory := range []string{installer.stagingRoot, installer.backupRoot} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -166,24 +186,27 @@ func (installer *Installer) ExecutablePath() string {
 // Install downloads, verifies, self-tests, and swaps in one artifact. Nothing is
 // swapped until the staged binary has proved that it runs and reports the version
 // the signed release promised, and the previous binary is preserved first, so a
-// failure at any step leaves the machine running what it ran before.
+// failure at any step leaves the machine running what it ran before. Failures
+// are typed: a deterministic failure (ErrBadRelease) proves the release is bad
+// here, while a transient one (ErrTransient) may succeed on a retry and must
+// never permanently block the version.
 func (installer *Installer) Install(ctx context.Context, release Release, artifact Artifact, currentVersion string) (Installed, error) {
 	expected, err := release.SemanticVersion()
 	if err != nil {
-		return Installed{}, err
+		return Installed{}, fmt.Errorf("%w: %s", ErrBadRelease, err.Error())
 	}
 	if artifact.Component != installer.component {
-		return Installed{}, fmt.Errorf("artifact is for component %s, this installer manages %s", artifact.Component, installer.component)
+		return Installed{}, fmt.Errorf("%w: artifact is for component %s, this installer manages %s", ErrBadRelease, artifact.Component, installer.component)
 	}
 	if err := artifact.Validate(); err != nil {
-		return Installed{}, err
+		return Installed{}, fmt.Errorf("%w: %s", ErrBadRelease, err.Error())
 	}
 	if err := installer.gate.Ready(ctx); err != nil {
 		return Installed{}, fmt.Errorf("%w: %s", ErrNotReady, err.Error())
 	}
 	stagingDir, err := os.MkdirTemp(installer.stagingRoot, "stage-")
 	if err != nil {
-		return Installed{}, fmt.Errorf("create staging directory: %w", err)
+		return Installed{}, fmt.Errorf("%w: create staging directory: %s", ErrTransient, err.Error())
 	}
 	defer func() { _ = os.RemoveAll(stagingDir) }()
 
@@ -193,10 +216,10 @@ func (installer *Installer) Install(ctx context.Context, release Release, artifa
 	}
 	reported, err := installer.selfTest(ctx, staged)
 	if err != nil {
-		return Installed{}, fmt.Errorf("staged %s binary failed its self-check: %w", installer.component, err)
+		return Installed{}, fmt.Errorf("%w: staged %s binary failed its self-check: %s", ErrBadRelease, installer.component, err.Error())
 	}
 	if !reported.SameRelease(expected) {
-		return Installed{}, fmt.Errorf("staged binary reports version %s, the release promises %s", reported, expected)
+		return Installed{}, fmt.Errorf("%w: staged binary reports version %s, the release promises %s", ErrBadRelease, reported, expected)
 	}
 	// The gate is checked again: verifying and downloading takes time, and work
 	// may have started on the machine while it ran.
@@ -205,14 +228,15 @@ func (installer *Installer) Install(ctx context.Context, release Release, artifa
 	}
 	backup, err := installer.backupCurrent(currentVersion)
 	if err != nil {
-		return Installed{}, err
+		return Installed{}, fmt.Errorf("%w: %s", ErrTransient, err.Error())
 	}
 	if err := installer.swap(staged); err != nil {
-		return Installed{}, err
+		return Installed{}, fmt.Errorf("%w: %s", ErrTransient, err.Error())
 	}
-	if err := installer.pruneBackups(); err != nil {
-		return Installed{}, err
-	}
+	// Everything below this line runs after the new binary is committed. A
+	// failure here never reports the install as failed and never blocks the
+	// version: the machine is already running (or staged to run) the new
+	// release, and only housekeeping is outstanding.
 	installed := Installed{
 		Component:       installer.component,
 		Version:         expected.String(),
@@ -224,16 +248,21 @@ func (installer *Installer) Install(ctx context.Context, release Release, artifa
 	if backup != nil {
 		installed.BackupID = backup.ID
 	}
+	if err := installer.pruneBackups(); err != nil {
+		installed.CleanupWarning = "backup pruning failed after the swap: " + err.Error()
+	}
 	return installed, nil
 }
 
 // stage downloads the artifact, checks both recorded digests, and returns the
-// path of a verified executable inside the staging directory.
+// path of a verified executable inside the staging directory. Delivery
+// failures are transient (a truncated or interrupted transfer may succeed on a
+// retry); everything the signed digests already settle is deterministic.
 func (installer *Installer) stage(ctx context.Context, stagingDir string, artifact Artifact) (string, error) {
 	downloadPath := filepath.Join(stagingDir, "download")
 	download, err := os.OpenFile(downloadPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", fmt.Errorf("create download file: %w", err)
+		return "", fmt.Errorf("%w: create download file: %s", ErrTransient, err.Error())
 	}
 	digest := sha256.New()
 	fetchErr := installer.fetcher.Fetch(ctx, artifact, io.MultiWriter(download, digest))
@@ -241,37 +270,45 @@ func (installer *Installer) stage(ctx context.Context, stagingDir string, artifa
 	closeErr := download.Close()
 	switch {
 	case fetchErr != nil:
-		return "", fetchErr
+		// A transport failure — including a body that stops short of the size
+		// the signed release records — is retryable: the truncation is
+		// detected here, and a later fetch may deliver the full artifact.
+		if errors.Is(fetchErr, ErrTransient) || errors.Is(fetchErr, ErrBadRelease) {
+			return "", fetchErr
+		}
+		return "", fmt.Errorf("%w: %s", ErrTransient, fetchErr.Error())
 	case syncErr != nil:
-		return "", fmt.Errorf("sync download: %w", syncErr)
+		return "", fmt.Errorf("%w: sync download: %s", ErrTransient, syncErr.Error())
 	case closeErr != nil:
-		return "", fmt.Errorf("close download: %w", closeErr)
+		return "", fmt.Errorf("%w: close download: %s", ErrTransient, closeErr.Error())
 	}
 	if actual := hex.EncodeToString(digest.Sum(nil)); actual != artifact.SHA256 {
-		return "", fmt.Errorf("downloaded artifact digest %s does not match the signed %s", actual, artifact.SHA256)
+		// The full promised length arrived and the bytes are wrong: the
+		// artifact itself is not what the release signed. Deterministic.
+		return "", fmt.Errorf("%w: downloaded artifact digest %s does not match the signed %s", ErrBadRelease, actual, artifact.SHA256)
 	}
 	binaryPath := filepath.Join(stagingDir, "binary")
 	switch artifact.Format {
 	case FormatBinary:
 		if err := os.Rename(downloadPath, binaryPath); err != nil {
-			return "", fmt.Errorf("stage binary: %w", err)
+			return "", fmt.Errorf("%w: stage binary: %s", ErrTransient, err.Error())
 		}
 	case FormatGzip:
 		if err := decompressGzip(downloadPath, binaryPath); err != nil {
-			return "", err
+			return "", fmt.Errorf("%w: %s", ErrBadRelease, err.Error())
 		}
 	default:
-		return "", fmt.Errorf("unsupported artifact format %q", artifact.Format)
+		return "", fmt.Errorf("%w: unsupported artifact format %q", ErrBadRelease, artifact.Format)
 	}
 	binaryDigest, err := fileDigest(binaryPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %s", ErrTransient, err.Error())
 	}
 	if binaryDigest != artifact.BinarySHA256 {
-		return "", fmt.Errorf("staged executable digest %s does not match the signed %s", binaryDigest, artifact.BinarySHA256)
+		return "", fmt.Errorf("%w: staged executable digest %s does not match the signed %s", ErrBadRelease, binaryDigest, artifact.BinarySHA256)
 	}
 	if err := os.Chmod(binaryPath, executableMode); err != nil {
-		return "", fmt.Errorf("mark staged binary executable: %w", err)
+		return "", fmt.Errorf("%w: mark staged binary executable: %s", ErrTransient, err.Error())
 	}
 	return binaryPath, nil
 }
@@ -435,25 +472,62 @@ func (installer *Installer) pruneBackups() error {
 	return nil
 }
 
-// versionSelfTest runs a staged binary with --version and reads the version it
-// prints. This is the check that keeps a broken update from bricking a machine:
-// a binary that will not start, or that reports the wrong version, is never
-// swapped in.
-func versionSelfTest(ctx context.Context, path string) (Version, error) {
-	testContext, cancel := context.WithTimeout(ctx, selfTestTimeout)
-	defer cancel()
-	command := exec.CommandContext(testContext, path, "--version")
-	command.Env = append(os.Environ(), "SHIFT_SELF_TEST=1")
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return Version{}, fmt.Errorf("run %s --version: %w", filepath.Base(path), err)
-	}
-	for _, field := range strings.Fields(string(output)) {
-		if version, err := ParseVersion(strings.Trim(field, "\"',()")); err == nil {
+// ProbeVersion runs one artifact's version self-report and parses it. The
+// artifact is executed with --version; when that yields no parseable version
+// and component names the command-line tool, the `version` subcommand is tried
+// as well, because shiftgate spells it that way. Only stdout is parsed — a
+// banner or warning on stderr is noise, and a date-shaped token in front of
+// the real version must never be mistaken for it: the version is the last
+// field the binary prints on stdout. This is the check that keeps a broken
+// update from bricking a machine: a binary that will not start, or that
+// reports the wrong version, is never swapped in.
+func ProbeVersion(ctx context.Context, path, component string) (Version, error) {
+	reported, runErr := runVersionProbe(ctx, path, "--version")
+	if runErr == nil {
+		if version, err := parseVersionReport(reported); err == nil {
 			return version, nil
 		}
 	}
+	if component == string(ComponentCLI) {
+		if reported, runErr = runVersionProbe(ctx, path, "version"); runErr == nil {
+			if version, err := parseVersionReport(reported); err == nil {
+				return version, nil
+			}
+		}
+	}
+	if runErr != nil {
+		return Version{}, runErr
+	}
 	return Version{}, errors.New("binary printed no recognizable version")
+}
+
+// runVersionProbe executes one version invocation and returns its stdout. The
+// standard error stream is captured separately and discarded: parseVersionReport
+// must only ever see what the binary prints deliberately.
+func runVersionProbe(ctx context.Context, path string, argument string) (string, error) {
+	testContext, cancel := context.WithTimeout(ctx, selfTestTimeout)
+	defer cancel()
+	command := exec.CommandContext(testContext, path, argument)
+	command.Env = append(os.Environ(), "SHIFT_SELF_TEST=1")
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		return "", fmt.Errorf("run %s %s: %w", filepath.Base(path), argument, err)
+	}
+	return stdout.String(), nil
+}
+
+// parseVersionReport reads the version out of a binary's --version output. The
+// version is the last whitespace-separated field: the format every SHIFT
+// binary prints is "name version", and taking the last field is what keeps a
+// leading banner (a date, a build id) from being accepted as the version.
+func parseVersionReport(output string) (Version, error) {
+	fields := strings.Fields(output)
+	if len(fields) == 0 {
+		return Version{}, errors.New("no version printed")
+	}
+	return ParseVersion(strings.Trim(fields[len(fields)-1], "\"',():"))
 }
 
 func decompressGzip(sourcePath, targetPath string) error {
@@ -471,9 +545,17 @@ func decompressGzip(sourcePath, targetPath string) error {
 	if err != nil {
 		return fmt.Errorf("create decompressed artifact: %w", err)
 	}
-	if _, err := io.Copy(target, io.LimitReader(reader, maxArtifactBytes)); err != nil {
+	// The decompressed size is bounded too, and the bound is checked rather
+	// than enforced by silent truncation: a compressed bomb must fail loudly,
+	// not half-write an executable whose digest then misleads the diagnosis.
+	written, err := io.Copy(target, io.LimitReader(reader, maxArtifactBytes+1))
+	if err != nil {
 		_ = target.Close()
 		return fmt.Errorf("decompress artifact: %w", err)
+	}
+	if written > maxArtifactBytes {
+		_ = target.Close()
+		return fmt.Errorf("decompressed artifact exceeds %d bytes", maxArtifactBytes)
 	}
 	if err := target.Sync(); err != nil {
 		_ = target.Close()

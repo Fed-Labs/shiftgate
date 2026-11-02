@@ -13,8 +13,11 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -301,5 +304,81 @@ func TestArtifactValidationAcceptsFileURLs(t *testing.T) {
 		if !accepted && err == nil {
 			t.Fatalf("%s must be refused", name)
 		}
+	}
+}
+
+// TestProbeVersionReadsTheVersionNotTheNoise: a banner or date-shaped token
+// printed before the version must never be mistaken for the version (the
+// fail-closed self-check would then refuse a good binary), and stderr noise is
+// ignored entirely.
+func TestProbeVersionReadsTheVersionNotTheNoise(t *testing.T) {
+	directory := t.TempDir()
+	script := filepath.Join(directory, "shift-agent")
+	noisy := "#!/bin/sh\n" +
+		"echo 'built 2026.10.21' >&2\n" +
+		"echo 'warning: experimental kernel'\n" +
+		"echo 'shift-agent 0.2.0'\n"
+	writeExecutable(t, script, []byte(noisy))
+	reported, err := ProbeVersion(context.Background(), script, string(ComponentAgent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reported.SameRelease(Version{Major: 0, Minor: 2, Patch: 0}) {
+		t.Fatalf("parsed %s from noisy output, want 0.2.0", reported)
+	}
+
+	// stderr only is not a version self-report at all.
+	stderrOnly := filepath.Join(directory, "stderr-only")
+	writeExecutable(t, stderrOnly, []byte("#!/bin/sh\necho 'shift-agent 9.9.9' >&2\nexit 0\n"))
+	if _, err := ProbeVersion(context.Background(), stderrOnly, string(ComponentAgent)); err == nil {
+		t.Fatal("a version printed only on stderr must not be accepted")
+	}
+
+	// The command-line tool spells its self-report as a subcommand.
+	cli := filepath.Join(directory, "shiftgate")
+	writeExecutable(t, cli, []byte("#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'SHIFT 0.2.0'; exit 0; fi\nexit 2\n"))
+	reported, err = ProbeVersion(context.Background(), cli, string(ComponentCLI))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reported.SameRelease(Version{Major: 0, Minor: 2, Patch: 0}) {
+		t.Fatalf("parsed %s from the cli version subcommand, want 0.2.0", reported)
+	}
+
+	// A binary that prints nothing recognizable fails closed.
+	quiet := filepath.Join(directory, "quiet")
+	writeExecutable(t, quiet, []byte("#!/bin/sh\nexit 0\n"))
+	if _, err := ProbeVersion(context.Background(), quiet, string(ComponentAgent)); err == nil {
+		t.Fatal("a binary with no recognizable version must be refused")
+	}
+}
+
+// TestHTTPFetcherRefusesTruncatedDelivery: a body that stops short of the size
+// the signed release records (or announces a different size) is detected as a
+// truncated delivery and refused before anything is installed — the digest
+// check must never be the first place a truncation surfaces.
+func TestHTTPFetcherRefusesTruncatedDelivery(t *testing.T) {
+	payload := versionScript("shift-agent", "1.2.3")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Query().Get("lie") == "1" {
+			writer.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			_, _ = writer.Write(payload[:len(payload)/2])
+			return
+		}
+		_, _ = writer.Write(payload[:len(payload)/2])
+	}))
+	defer server.Close()
+	fetcher := NewHTTPFetcher(0, server.Client())
+	artifact := Artifact{
+		Component: ComponentAgent, OS: "linux", Architecture: "amd64",
+		URL: server.URL + "/agent", Format: FormatBinary,
+		SizeBytes: int64(len(payload)), SHA256: digestOf(payload), BinarySHA256: digestOf(payload),
+	}
+	if err := fetcher.Fetch(context.Background(), artifact, io.Discard); err == nil {
+		t.Fatal("a body shorter than the signed size must be refused")
+	}
+	artifact.URL = server.URL + "/agent?lie=1"
+	if err := fetcher.Fetch(context.Background(), artifact, io.Discard); err == nil {
+		t.Fatal("a stream that stops after promising the full size must be refused")
 	}
 }

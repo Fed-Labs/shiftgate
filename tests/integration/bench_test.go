@@ -327,7 +327,7 @@ func benchMigration(b *testing.B, iteration int, mode model.MigrationMode, passe
 	if err != nil {
 		b.Fatal(err)
 	}
-	migration := waitForMigrationTerminal(b, source.client, created.ID)
+	migration := waitForMigrationTerminal(b, source.client, created.ID, 5*time.Minute)
 	b.StopTimer()
 	if migration.Stage != model.MigrationCompleted {
 		b.Fatalf("migration ended in %s (%s: %s)", migration.Stage, migration.FailureCode, migration.FailureReason)

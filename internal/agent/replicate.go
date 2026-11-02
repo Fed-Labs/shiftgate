@@ -8,7 +8,10 @@ package agent
 // restore. Incremental checkpoints (those with a parent) are deliberately
 // not replicated: a delta is unrestorable without its ancestors, while each
 // periodic root stands alone, so the standby's newest root is at most one
-// checkpoint interval behind the source.
+// checkpoint interval behind the source. Every push runs on its own
+// goroutine under a bounded per-peer budget: the checkpoint scheduler that
+// drives these passes must never wait on a standby's network I/O, and no
+// call may fall through to the peer client's day-long no-deadline fallback.
 
 import (
 	"context"
@@ -17,6 +20,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"shift.dev/shift/internal/checkpoint"
@@ -38,6 +42,22 @@ const replicationRetryDelay = 30 * time.Second
 // counting against the standby's reservation bookkeeping.
 const replicationSessionTTL = 30 * time.Minute
 
+const (
+	// replicationPushTimeout bounds one push to one standby. It sits just
+	// under the session TTL the push reserves: past that the standby reaps
+	// the session anyway, and without a budget every call inside the push
+	// falls through to the peer client's 24-hour no-deadline fallback — one
+	// black-holed standby would pin its goroutine for a day.
+	replicationPushTimeout = 25 * time.Minute
+	// replicationCallTimeout bounds one control call inside a push: the
+	// identity probe, reserve, key and manifest imports, verify, hold, and
+	// the post-hold confirmation.
+	replicationCallTimeout = 2 * time.Minute
+	// replicationChunkTimeout bounds one chunk upload attempt; retries ride
+	// the same budget per attempt and the push budget over all.
+	replicationChunkTimeout = 10 * time.Minute
+)
+
 // failoverReplicator drives replication from the policy loop. It owns the
 // ledger; everything else it borrows from the service.
 type failoverReplicator struct {
@@ -57,6 +77,30 @@ type failoverReplicator struct {
 	migrationInFlight func(workloadID string) bool
 	logger            *slog.Logger
 	mu                sync.Mutex
+	// passing is the single-flight latch around one replication pass: the
+	// scheduler may tick while a previous push is still in flight, and the
+	// answer is to skip, never to queue a second pass behind a hung one.
+	passing atomic.Bool
+	// pushTimeout overrides replicationPushTimeout in tests.
+	pushTimeout time.Duration
+	// guard is the agent's shared write guard (Service.gcGuard). A push
+	// holds it shared while it reads chunks, so an online garbage-collection
+	// sweep cannot delete state out from under a long replication read.
+	// Optional: a replicator without one behaves as before.
+	guard *gcWriteGuard
+}
+
+// SetWriteGuard attaches the agent's shared checkpoint/transfer write guard.
+func (r *failoverReplicator) SetWriteGuard(guard *gcWriteGuard) {
+	r.guard = guard
+}
+
+// pushBudget is the wall-clock budget for one peer push.
+func (r *failoverReplicator) pushBudget() time.Duration {
+	if r.pushTimeout > 0 {
+		return r.pushTimeout
+	}
+	return replicationPushTimeout
 }
 
 // Entries lists the replication ledger, oldest update first.
@@ -66,11 +110,26 @@ func (r *failoverReplicator) Entries() []model.ReplicationEntry {
 	return entries
 }
 
-// apply is one replication pass: first withdrawals, then due pushes. Both
-// halves reconcile the ledger against the workload specs — the spec is the
-// operator's intent, the ledger is what has actually been pushed, and the
-// two must not drift apart silently.
+// apply schedules one replication pass on its own goroutine and returns
+// immediately. The checkpoint-policy scheduler calls it from its ticker, and
+// a hung or slow standby must never delay periodic checkpoints for any
+// workload on the machine — the pass runs behind a single-flight latch and
+// every peer call it makes carries a deadline.
 func (r *failoverReplicator) apply(ctx context.Context) {
+	if !r.passing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer r.passing.Store(false)
+		r.pass(ctx)
+	}()
+}
+
+// pass runs one replication pass synchronously: first withdrawals, then due
+// pushes. Both halves reconcile the ledger against the workload specs — the
+// spec is the operator's intent, the ledger is what has actually been
+// pushed, and the two must not drift apart silently.
+func (r *failoverReplicator) pass(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.reconcileWithdrawals(ctx)
@@ -151,7 +210,10 @@ func (r *failoverReplicator) replicateDue(ctx context.Context) {
 				continue
 			}
 		}
-		if err := r.replicate(ctx, workload.Spec, policy, root); err != nil {
+		pushCtx, cancel := context.WithTimeout(ctx, r.pushBudget())
+		err = r.replicate(pushCtx, workload.Spec, policy, root)
+		cancel()
+		if err != nil {
 			r.logger.Warn("failover replication failed",
 				"workload_id", workload.Spec.ID, "workload_name", workload.Spec.Name,
 				"checkpoint_id", root.ID, "standby", policy.AgentURL, "error", err)
@@ -187,7 +249,11 @@ func (r *failoverReplicator) recordError(entry model.ReplicationEntry, cause err
 // attempt interrupted by a crash or a network cut simply re-pushes — the
 // manifest import overwrites the same record, and the chunks the standby
 // already holds are negotiated away, so a retry costs only what is missing.
-func (r *failoverReplicator) replicate(ctx context.Context, spec model.WorkloadSpec, policy *model.FailoverPolicySpec, root checkpoint.Summary) error {
+func (r *failoverReplicator) replicate(ctx context.Context, spec model.WorkloadSpec, policy *model.FailoverPolicySpec, root checkpoint.Summary) (err error) {
+	if r.guard != nil {
+		r.guard.mu.RLock()
+		defer r.guard.mu.RUnlock()
+	}
 	peer, err := r.peerClient(policy.AgentURL)
 	if err != nil {
 		return err
@@ -199,7 +265,9 @@ func (r *failoverReplicator) replicate(ctx context.Context, spec model.WorkloadS
 	// The identity pin runs before anything leaves: a mistyped URL must
 	// fail here, not deposit a workload's encrypted state on the wrong
 	// host — the key would follow the chunks on the next line.
-	machine, err := peer.Machine(ctx)
+	machine, err := peerCall(ctx, func(callCtx context.Context) (model.MachineCapabilities, error) {
+		return peer.Machine(callCtx)
+	})
 	if err != nil {
 		return fmt.Errorf("reach standby: %w", err)
 	}
@@ -213,11 +281,13 @@ func (r *failoverReplicator) replicate(ctx context.Context, spec model.WorkloadS
 	if err != nil {
 		return err
 	}
-	if _, err := peer.Reserve(ctx, transfer.ReserveRequest{
-		ID: sessionID, SourceMachineID: r.identity.Machine.ID, WorkloadID: spec.ID,
-		EstimatedBytes: manifest.Metrics.StoredBytes,
-		ExpiresAt:      time.Now().Add(replicationSessionTTL),
-		Purpose:        transfer.PurposeReplication,
+	if _, err := peerCall(ctx, func(callCtx context.Context) (transfer.Session, error) {
+		return peer.Reserve(callCtx, transfer.ReserveRequest{
+			ID: sessionID, SourceMachineID: r.identity.Machine.ID, WorkloadID: spec.ID,
+			EstimatedBytes: manifest.Metrics.StoredBytes,
+			ExpiresAt:      time.Now().Add(replicationSessionTTL),
+			Purpose:        transfer.PurposeReplication,
+		})
 	}); err != nil {
 		return fmt.Errorf("reserve: %w", err)
 	}
@@ -225,21 +295,36 @@ func (r *failoverReplicator) replicate(ctx context.Context, spec model.WorkloadS
 	if err != nil {
 		return fmt.Errorf("export workload key: %w", err)
 	}
-	if err := peer.ImportKey(ctx, sessionID, spec.ID, manifest.Security.KeyVersion, dataKey); err != nil {
+	if err := peerCallVoid(ctx, func(callCtx context.Context) error {
+		return peer.ImportKey(callCtx, sessionID, spec.ID, manifest.Security.KeyVersion, dataKey)
+	}); err != nil {
 		return fmt.Errorf("import key: %w", err)
 	}
-	missing, err := peer.ImportManifest(ctx, sessionID, manifest)
+	missing, err := peerCall(ctx, func(callCtx context.Context) (transfer.MissingResponse, error) {
+		return peer.ImportManifest(callCtx, sessionID, manifest)
+	})
 	if err != nil {
 		return fmt.Errorf("import manifest: %w", err)
 	}
 	if err := r.uploadChunks(ctx, peer, sessionID, missing.Missing); err != nil {
 		return fmt.Errorf("upload chunks: %w", err)
 	}
-	if _, err := peer.Verify(ctx, sessionID); err != nil {
+	if _, err := peerCall(ctx, func(callCtx context.Context) (transfer.Session, error) {
+		return peer.Verify(callCtx, sessionID)
+	}); err != nil {
 		return fmt.Errorf("verify: %w", err)
 	}
-	if _, err := peer.Hold(ctx, sessionID, policy.KeepLast, r.advertisedURL); err != nil {
+	if _, err := peerCall(ctx, func(callCtx context.Context) (transfer.Session, error) {
+		return peer.HoldWithFencing(callCtx, sessionID, policy.KeepLast, r.advertisedURL, policy.FencingProvider)
+	}); err != nil {
 		return fmt.Errorf("hold: %w", err)
+	}
+	// The hold's answer is the standby's in-flight copy; re-read the session
+	// it actually stored. A standby that could not persist its duty has
+	// degraded the hold — the ledger must record that failure and retry
+	// rather than claim a protection that does not exist.
+	if err := confirmHold(ctx, peer, sessionID); err != nil {
+		return err
 	}
 	// The ledger is written after the hold, not before: a crash between the
 	// two re-pushes the same checkpoint next pass, and the standby's
@@ -251,6 +336,41 @@ func (r *failoverReplicator) replicate(ctx context.Context, spec model.WorkloadS
 		StandbyURL: policy.AgentURL, StandbyMachineID: machine.MachineID,
 		KeepLast: policy.KeepLast, LastCheckpointID: root.ID, LastPushAt: now, UpdatedAt: now,
 	})
+}
+
+// peerCall runs one peer round trip under the control-call deadline, nested
+// inside the push budget the caller already carries. Without a per-call
+// deadline the peer client falls back to a 24-hour timeout for callers
+// without one — the hang this file must never reproduce.
+func peerCall[T any](ctx context.Context, call func(context.Context) (T, error)) (T, error) {
+	callCtx, cancel := context.WithTimeout(ctx, replicationCallTimeout)
+	defer cancel()
+	return call(callCtx)
+}
+
+// peerCallVoid is peerCall for round trips with no response body of note.
+func peerCallVoid(ctx context.Context, call func(context.Context) error) error {
+	callCtx, cancel := context.WithTimeout(ctx, replicationCallTimeout)
+	defer cancel()
+	return call(callCtx)
+}
+
+// confirmHold re-reads the session the hold produced. The hold response is
+// the standby's in-flight copy, taken before its duty record landed; the
+// stored session is where a duty-persist failure surfaces as a degraded
+// state. Anything but HELD means the push did not take — the source's
+// ledger records it and the next pass retries.
+func confirmHold(ctx context.Context, peer *transfer.Client, sessionID string) error {
+	session, err := peerCall(ctx, func(callCtx context.Context) (transfer.Session, error) {
+		return peer.Get(callCtx, sessionID)
+	})
+	if err != nil {
+		return fmt.Errorf("confirm hold: %w", err)
+	}
+	if session.State != transfer.SessionHeld {
+		return fmt.Errorf("standby did not keep the hold: session is %s", session.State)
+	}
+	return nil
 }
 
 // uploadChunks pushes the chunks the standby is missing, four at a time
@@ -280,7 +400,9 @@ func (r *failoverReplicator) uploadChunks(ctx context.Context, peer *transfer.Cl
 			for ref := range jobs {
 				var err error
 				for attempt := 0; attempt < 3; attempt++ {
-					err = peer.UploadChunk(ctx, sessionID, ref, r.chunks)
+					attemptCtx, attemptCancel := context.WithTimeout(ctx, replicationChunkTimeout)
+					err = peer.UploadChunk(attemptCtx, sessionID, ref, r.chunks)
+					attemptCancel()
 					if err == nil || ctx.Err() != nil {
 						break
 					}

@@ -124,11 +124,12 @@ func TestE2EHostedStorageCheckpoint(t *testing.T) {
 	env := requireHosted(t)
 	machineID := fmt.Sprintf("e2e-hosted-%d", os.Getpid())
 	stateDir := t.TempDir()
-	peerPort, err := freePort()
-	if err != nil {
-		t.Fatalf("find a free port: %v", err)
-	}
+	// Held until the mutate hook below installs it as the agent's remote
+	// listener and the service binds it — a freePort-style close-then-use
+	// gap is exactly where another test's port search could steal it.
+	peerPort, releasePeerPort := reservePort(t)
 	agentProc := startAgentWith(t, "hosted-agent", stateDir, t.TempDir(), func(configuration *config.Agent) {
+		releasePeerPort()
 		configuration.RemoteListen = fmt.Sprintf("tcp://127.0.0.1:%d", peerPort)
 		configuration.ObjectStore = objectstore.Config{
 			Enabled:  true,

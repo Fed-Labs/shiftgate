@@ -42,6 +42,7 @@ const (
 	RejectEncryption             = "ENCRYPTED_STATE_REQUIRED"
 	RejectGPUSharing             = "GPU_SHARING_FORBIDDEN"
 	RejectCompatibility          = "RESTORE_INCOMPATIBLE"
+	RejectSupportMatrix          = "SUPPORT_MATRIX_NOT_CERTIFIED"
 )
 
 // Constraints are the caller's hard requirements. An empty Constraints means
@@ -61,6 +62,11 @@ type Constraints struct {
 	IncludeOtherOrganizations bool      `json:"include_other_organizations,omitempty"`
 	StateIsEncrypted          bool      `json:"state_is_encrypted,omitempty"`
 	SharesGPU                 bool      `json:"shares_gpu,omitempty"`
+	// AllowExperimentalPlatforms admits placement on platforms the support
+	// matrix grades experimental_only (untested but named rows). It never
+	// admits unknown or unsupported combinations: those are blocked for
+	// automatic operations, and this scheduler is one.
+	AllowExperimentalPlatforms bool `json:"allow_experimental_platforms,omitempty"`
 }
 
 // Weights tune the relative importance of each scoring dimension. They are
@@ -218,6 +224,10 @@ type Config struct {
 	StaleAfter           time.Duration
 	Weights              Weights
 	Now                  func() time.Time
+	// Checker runs restore-compatibility and support-matrix admission. The
+	// zero value uses the default compatibility policy and the shipped
+	// support matrix.
+	Checker compatibility.Checker
 }
 
 // DefaultConfig returns the production defaults.
@@ -240,7 +250,7 @@ func New(configuration Config) *Scheduler {
 		configuration.Now = func() time.Time { return time.Now().UTC() }
 	}
 	configuration.Weights = configuration.Weights.normalized()
-	return &Scheduler{config: configuration}
+	return &Scheduler{config: configuration, checker: configuration.Checker}
 }
 
 // TradingEnabled reports whether public compute trading is switched on.
@@ -493,6 +503,19 @@ func (scheduler *Scheduler) evaluate(request Request, offer Offer, now time.Time
 		candidate.Compatibility = &report
 		if !report.Compatible {
 			return Candidate{}, reject(RejectCompatibility, firstErrorIssue(report))
+		}
+		// Support-matrix admission: placement is an unattended operation, so
+		// a platform the matrix blocks for automatic operations never becomes
+		// a candidate. Unknown and unsupported combinations are refused
+		// outright; experimental rows are refused unless the caller explicitly
+		// opts into an experiment, mirroring shift-verify's --allow-experimental.
+		decision := scheduler.checker.SupportDecision(offer.Capabilities)
+		if !decision.AllowAutomatic {
+			experimental := decision.Action == compatibility.ActionExperimentalOnly && request.Constraints.AllowExperimentalPlatforms
+			if !experimental {
+				return Candidate{}, reject(RejectSupportMatrix, "support matrix "+decision.Status+": "+decision.Reason)
+			}
+			candidate.Warnings = append(candidate.Warnings, "SUPPORT_MATRIX_EXPERIMENTAL: "+decision.Reason)
 		}
 		for _, issue := range report.Issues {
 			if issue.Severity != "error" {

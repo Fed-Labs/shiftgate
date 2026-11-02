@@ -3,6 +3,7 @@ package observability
 import (
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"sync"
 	"time"
@@ -35,6 +36,8 @@ type Diagnostics struct {
 	transferBytes map[string]int64
 	transferNanos time.Duration
 
+	throughput *Histogram
+
 	gauges map[string]float64
 }
 
@@ -45,6 +48,7 @@ func NewDiagnostics() *Diagnostics {
 		checkpoints:   make(map[string]uint64),
 		restores:      make(map[string]uint64),
 		transferBytes: make(map[string]int64),
+		throughput:    NewHistogram("shift_transfer_throughput_bytes_per_second", "observed chunk-transfer throughput in bytes per second", ThroughputBuckets),
 		gauges:        make(map[string]float64),
 	}
 }
@@ -55,7 +59,7 @@ func NewDiagnostics() *Diagnostics {
 func (d *Diagnostics) MigrationFinished(outcome string, duration, downtime time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.migrations[outcome]++
+	d.migrations[normalizeOutcome(outcome)]++
 	d.duration += duration
 	d.downtime += downtime
 	d.lastDuration = duration
@@ -66,14 +70,14 @@ func (d *Diagnostics) MigrationFinished(outcome string, duration, downtime time.
 func (d *Diagnostics) CheckpointFinished(outcome string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.checkpoints[outcome]++
+	d.checkpoints[normalizeOutcome(outcome)]++
 }
 
 // RestoreFinished records one restore outcome.
 func (d *Diagnostics) RestoreFinished(outcome string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.restores[outcome]++
+	d.restores[normalizeOutcome(outcome)]++
 }
 
 // Transferred accumulates transferred bytes and elapsed transfer time per
@@ -83,19 +87,60 @@ func (d *Diagnostics) Transferred(direction string, bytes int64, elapsed time.Du
 	if bytes <= 0 {
 		return
 	}
+	direction = normalizeDirection(direction)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.transferBytes[direction] += bytes
 	d.transferNanos += elapsed
+	if elapsed > 0 {
+		d.throughput.Observe(float64(bytes) / elapsed.Seconds())
+	}
 }
 
 // SetGauge records a point-in-time value such as workload count or available
 // memory. Names are lowercase with underscores, without the shift_ prefix the
 // renderer adds.
 func (d *Diagnostics) SetGauge(name string, value float64) {
+	if !validMetricName(name) {
+		return
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.gauges[name] = value
+}
+
+// OutcomeOther is the bucket every unrecognized outcome lands in. Label
+// values come from callers' strings; without a vocabulary an arbitrary string
+// would mint a new series per distinct value and grow the map without bound.
+const OutcomeOther = "other"
+
+// normalizeOutcome clamps a caller-supplied outcome to the series vocabulary.
+func normalizeOutcome(outcome string) string {
+	switch outcome {
+	case OutcomeSuccess, OutcomeFailure, OutcomeCancelled:
+		return outcome
+	default:
+		return OutcomeOther
+	}
+}
+
+// normalizeDirection clamps a transfer direction to the series vocabulary.
+func normalizeDirection(direction string) string {
+	switch direction {
+	case "upload", "download":
+		return direction
+	default:
+		return OutcomeOther
+	}
+}
+
+var metricNamePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// validMetricName rejects names that would break the exposition format or
+// smuggle label sets: gauges are keyed by name, and a name containing braces
+// or newlines would inject series the caller did not earn.
+func validMetricName(name string) bool {
+	return metricNamePattern.MatchString(name)
 }
 
 // RenderTo writes every series in Prometheus text format. Migration success
@@ -140,6 +185,7 @@ func (d *Diagnostics) RenderTo(writer io.Writer) {
 	for _, name := range sortedKeys(d.gauges) {
 		writeSeries(name, "", d.gauges[name])
 	}
+	d.throughput.RenderTo(writer)
 }
 
 // sortedKeys returns a map's keys in sorted order so rendered output is

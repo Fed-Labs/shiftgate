@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"time"
 
@@ -21,6 +22,51 @@ import (
 )
 
 const maxEncryptedManifestBytes = int64(8 << 20)
+
+// idShape is the only form a checkpoint or workload id may take: a single
+// path-safe component of alphanumerics, dots, underscores, and dashes. Ids
+// are joined into filesystem paths by this repository (and by the chunk
+// store), so a separator, a leading dot, or a bare "." / ".." is a traversal
+// primitive, never an id. Peer-supplied manifests reach Save unvalidated
+// upstream; this boundary refuses them regardless of what any caller admits.
+var idShape = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+// reservedRepositoryNames are the files the repository itself owns inside its
+// root; a checkpoint id may never collide with them.
+var reservedRepositoryNames = map[string]bool{
+	"index.enc.json":       true,
+	"trusted-sources.json": true,
+}
+
+// validateID enforces the id shape for one checkpoint or workload id.
+func validateID(id, what string) error {
+	if id == "" {
+		return fmt.Errorf("%s is required", what)
+	}
+	if !idShape.MatchString(id) {
+		return fmt.Errorf("invalid %s %q: ids must be single path-safe components matching %s", what, id, idShape)
+	}
+	if reservedRepositoryNames[id] {
+		return fmt.Errorf("invalid %s %q: reserved repository name", what, id)
+	}
+	return nil
+}
+
+// checkpointDir resolves a validated checkpoint id to its directory under the
+// repository root and proves the join cannot escape that root. Every path sink
+// (Save, Load, Delete) routes through here, so even a validation regression
+// cannot turn an id into an out-of-tree write or RemoveAll.
+func (r *Repository) checkpointDir(id string) (string, error) {
+	if err := validateID(id, "checkpoint id"); err != nil {
+		return "", err
+	}
+	root := filepath.Clean(r.root)
+	dir := filepath.Join(root, id)
+	if filepath.Dir(dir) != root || filepath.Base(dir) != id || !pathContains(root, dir) {
+		return "", fmt.Errorf("checkpoint id %q escapes the repository root", id)
+	}
+	return dir, nil
+}
 
 type Summary struct {
 	ID           string               `json:"id"`
@@ -48,6 +94,7 @@ type Repository struct {
 	root  string
 	keys  *securestore.Manager
 	index *securestore.EncryptedCollection[Summary]
+	trust *TrustStore
 }
 
 func OpenRepository(root string, keys *securestore.Manager) (*Repository, error) {
@@ -55,10 +102,25 @@ func OpenRepository(root string, keys *securestore.Manager) (*Repository, error)
 	if err != nil {
 		return nil, err
 	}
-	return &Repository{root: root, keys: keys, index: index}, nil
+	trust, err := OpenTrustStore(filepath.Join(root, "trusted-sources.json"))
+	if err != nil {
+		return nil, err
+	}
+	return &Repository{root: root, keys: keys, index: index, trust: trust}, nil
+}
+
+// Trust is the repository's signer-admission policy for non-peer ingest.
+func (r *Repository) Trust() *TrustStore {
+	return r.trust
 }
 
 func (r *Repository) Save(manifest model.CheckpointManifest) error {
+	if err := validateID(manifest.ID, "checkpoint id"); err != nil {
+		return err
+	}
+	if err := validateID(manifest.Workload.ID, "workload id"); err != nil {
+		return err
+	}
 	if err := VerifyManifest(manifest); err != nil {
 		return err
 	}
@@ -83,7 +145,11 @@ func (r *Repository) Save(manifest model.CheckpointManifest) error {
 		Nonce:         base64.RawStdEncoding.EncodeToString(nonce),
 		Ciphertext:    base64.RawStdEncoding.EncodeToString(ciphertext),
 	}
-	path := filepath.Join(r.root, manifest.ID, "manifest.enc.json")
+	directory, err := r.checkpointDir(manifest.ID)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(directory, "manifest.enc.json")
 	if existing, err := r.Load(manifest.ID); err == nil {
 		if existing.ManifestSHA256 == manifest.ManifestSHA256 {
 			return nil
@@ -130,11 +196,15 @@ func (r *Repository) DecodeEncryptedManifest(checkpointID string, encoded []byte
 }
 
 func (r *Repository) loadEncryptedManifest(id string) (model.CheckpointManifest, []byte, error) {
+	directory, err := r.checkpointDir(id)
+	if err != nil {
+		return model.CheckpointManifest{}, nil, err
+	}
 	summary, err := r.index.Get(id)
 	if err != nil {
 		return model.CheckpointManifest{}, nil, err
 	}
-	encoded, err := readBoundedFile(filepath.Join(r.root, id, "manifest.enc.json"), maxEncryptedManifestBytes)
+	encoded, err := readBoundedFile(filepath.Join(directory, "manifest.enc.json"), maxEncryptedManifestBytes)
 	if err != nil {
 		return model.CheckpointManifest{}, nil, err
 	}
@@ -152,8 +222,8 @@ func (r *Repository) loadEncryptedManifest(id string) (model.CheckpointManifest,
 }
 
 func (r *Repository) decodeEncryptedManifest(checkpointID string, encoded []byte) (model.CheckpointManifest, encryptedManifest, error) {
-	if checkpointID == "" {
-		return model.CheckpointManifest{}, encryptedManifest{}, errors.New("checkpoint id is required")
+	if err := validateID(checkpointID, "checkpoint id"); err != nil {
+		return model.CheckpointManifest{}, encryptedManifest{}, err
 	}
 	if len(encoded) == 0 || int64(len(encoded)) > maxEncryptedManifestBytes {
 		return model.CheckpointManifest{}, encryptedManifest{}, errors.New("encrypted checkpoint manifest exceeds size limit")
@@ -164,6 +234,9 @@ func (r *Repository) decodeEncryptedManifest(checkpointID string, encoded []byte
 	}
 	if envelope.FormatVersion != 1 || envelope.WorkloadID == "" || envelope.CheckpointID != checkpointID || envelope.KeyVersion == 0 {
 		return model.CheckpointManifest{}, encryptedManifest{}, errors.New("invalid encrypted checkpoint manifest envelope")
+	}
+	if err := validateID(envelope.WorkloadID, "workload id"); err != nil {
+		return model.CheckpointManifest{}, encryptedManifest{}, err
 	}
 	dataKey, err := r.keys.WorkloadKey(envelope.WorkloadID, envelope.KeyVersion)
 	if err != nil {
@@ -212,8 +285,9 @@ func (r *Repository) List(workloadID string) []Summary {
 // by garbage collection rather than here; removing the manifest is what makes a
 // checkpoint unreachable.
 func (r *Repository) Delete(id string) error {
-	if id == "" {
-		return errors.New("checkpoint id is required")
+	directory, err := r.checkpointDir(id)
+	if err != nil {
+		return err
 	}
 	if _, err := r.index.Get(id); err != nil {
 		return err
@@ -221,7 +295,7 @@ func (r *Repository) Delete(id string) error {
 	if err := r.index.Delete(id); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(filepath.Join(r.root, id)); err != nil {
+	if err := os.RemoveAll(directory); err != nil {
 		return fmt.Errorf("remove checkpoint directory: %w", err)
 	}
 	return nil
@@ -244,6 +318,12 @@ func SignManifest(manifest *model.CheckpointManifest, signer *identity.Identity)
 }
 
 func VerifyManifest(manifest model.CheckpointManifest) error {
+	if err := validateID(manifest.ID, "checkpoint id"); err != nil {
+		return err
+	}
+	if err := validateID(manifest.Workload.ID, "workload id"); err != nil {
+		return err
+	}
 	if manifest.Format != model.StateFormatName || manifest.FormatVersion != model.StateFormatVersion {
 		return errors.New("unsupported checkpoint state format")
 	}

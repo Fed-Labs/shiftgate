@@ -102,7 +102,7 @@ func TestSCIMUserStore(t *testing.T) {
 	// Membership is the tenant boundary: another organization's caller sees
 	// none of these users (its own members aside).
 	other := testOrganization(t, store, "scim-other")
-	strangers, err := store.SCIMUsers(ctx, other, nil)
+	strangers, _, err := store.SCIMUsers(ctx, other, nil, Page{Limit: MaxPageLimit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestSCIMUserStore(t *testing.T) {
 	}
 
 	// Filters run through the parameterized renderer.
-	filtered, err := store.SCIMUsers(ctx, organizationID, []SCIMClause{{Attribute: "email", Operator: "sw", Value: "scim-one-" + run}})
+	filtered, _, err := store.SCIMUsers(ctx, organizationID, []SCIMClause{{Attribute: "email", Operator: "sw", Value: "scim-one-" + run}}, Page{Limit: MaxPageLimit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestSCIMUserStore(t *testing.T) {
 	// (dbtest-scim-…): the external-id presence clause is what narrows the
 	// conjunction to provisioned accounts. The listing is scoped to this
 	// run's fresh organization, so other runs' users cannot appear.
-	both, err := store.SCIMUsers(ctx, organizationID, []SCIMClause{{Attribute: "email", Operator: "co", Value: "scim"}, {Attribute: "external_id", Operator: "pr"}})
+	both, _, err := store.SCIMUsers(ctx, organizationID, []SCIMClause{{Attribute: "email", Operator: "co", Value: "scim"}, {Attribute: "external_id", Operator: "pr"}}, Page{Limit: MaxPageLimit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestSCIMUserStore(t *testing.T) {
 	if stillThere.Active {
 		t.Fatalf("the deactivated row did not survive: %+v", stillThere)
 	}
-	activeOnly, err := store.SCIMUsers(ctx, organizationID, []SCIMClause{{Attribute: "active", Operator: "eq", Value: "true"}})
+	activeOnly, _, err := store.SCIMUsers(ctx, organizationID, []SCIMClause{{Attribute: "active", Operator: "eq", Value: "true"}}, Page{Limit: MaxPageLimit})
 	if err != nil {
 		t.Fatal(err)
 	}

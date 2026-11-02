@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"shift.dev/shift/internal/network"
 	"shift.dev/shift/internal/observability"
 	linuxplatform "shift.dev/shift/internal/platform/linux"
+	shiftruntime "shift.dev/shift/internal/runtime"
 	"shift.dev/shift/internal/securestore"
 )
 
@@ -89,6 +91,16 @@ type Restorer struct {
 	service *Service
 	records *securestore.EncryptedCollection[RestoreRecord]
 	logger  *slog.Logger
+	// inFlight guards the single-writer switch protocol: Prepare's backup
+	// rename, activation, and rollback assume at most one transaction per
+	// target root at a time. A second restore — a failover racing an
+	// operator restore, a double submission — would otherwise adopt the
+	// first transaction's activated tree as its "previous root" and delete
+	// it on commit, destroying a live committed workload. The guard spans
+	// Prepare through Commit/Rollback, exactly like createInFlight spans a
+	// checkpoint.
+	inFlight   map[string]struct{}
+	inFlightMu sync.Mutex
 }
 
 func OpenRestorer(service *Service) (*Restorer, error) {
@@ -96,16 +108,35 @@ func OpenRestorer(service *Service) (*Restorer, error) {
 	if err != nil {
 		return nil, err
 	}
-	restorer := &Restorer{service: service, records: records, logger: service.logger}
+	restorer := &Restorer{service: service, records: records, logger: service.logger, inFlight: make(map[string]struct{})}
 	if err := restorer.Recover(context.Background()); err != nil {
 		return nil, err
 	}
 	return restorer, nil
 }
 
+// beginRestore claims the restore transaction guard for one target root. A
+// second claim on the same root while a transaction spans Prepare→Commit or
+// Prepare→Rollback is refused.
+func (r *Restorer) beginRestore(targetRoot string) error {
+	r.inFlightMu.Lock()
+	defer r.inFlightMu.Unlock()
+	if _, busy := r.inFlight[targetRoot]; busy {
+		return fmt.Errorf("a restore over %s is already in progress", targetRoot)
+	}
+	r.inFlight[targetRoot] = struct{}{}
+	return nil
+}
+
+// endRestore releases the transaction guard. Idempotent: rollback, commit,
+// and Prepare's failure paths may all route through here.
+func (r *Restorer) endRestore(targetRoot string) {
+	r.inFlightMu.Lock()
+	delete(r.inFlight, targetRoot)
+	r.inFlightMu.Unlock()
+}
+
 func (r *Restorer) Prepare(parent context.Context, checkpointID string, options PrepareOptions) (record RestoreRecord, err error) {
-	ctx, cancel := commandTimeout(parent, options.Timeout)
-	defer cancel()
 	// A lazy restore's prerequisites are about the machine, not the
 	// checkpoint, so they are checked before anything is staged or extracted:
 	// an unsupported kernel must fail in milliseconds, not after minutes of
@@ -116,7 +147,10 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 		if !ok {
 			return RestoreRecord{}, errors.New("this checkpoint engine cannot serve lazy restores")
 		}
-		if checkErr := capable.CheckFeature(ctx, "uffd"); checkErr != nil {
+		probeCtx, probeCancel := commandTimeout(parent, time.Minute)
+		checkErr := capable.CheckFeature(probeCtx, "uffd")
+		probeCancel()
+		if checkErr != nil {
 			return RestoreRecord{}, fmt.Errorf("lazy restore is unavailable: userfaultfd is not supported here: %w", checkErr)
 		}
 		lazyEngine = capable
@@ -133,6 +167,18 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	if err != nil {
 		return RestoreRecord{}, err
 	}
+	// The default deadline scales with the checkpoint's plain size: a flat
+	// 10-minute cap silently bounds the whole dump/restore pipeline and
+	// would kill CRIU mid-restore of a huge memory image.
+	ctx, cancel := commandTimeout(parent, options.Timeout, manifest.RequiredBytes)
+	defer cancel()
+	// Defense in depth at the point of use: ingest paths already gate on the
+	// trust store, but the restore is the last checkpoint-into-root pipeline
+	// left, so a manifest that somehow sits in the repository unsigned by a
+	// trust anchor is refused here too.
+	if err := r.service.repository.Trust().Admit(manifest); err != nil {
+		return RestoreRecord{}, fmt.Errorf("checkpoint %s: %w", checkpointID, err)
+	}
 	destination, err := r.service.inventory.Inspect(ctx)
 	if err != nil {
 		return RestoreRecord{}, err
@@ -141,6 +187,34 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	if !report.Compatible {
 		return RestoreRecord{}, compatibilityError(report)
 	}
+	// The restore target is untrusted input: the manifest is signed by the
+	// source, and a compromised source signs hostile manifests. Admission —
+	// system-tree refusal, operator registration, ownership, and the restored
+	// process identity — happens before any port, chunk, or filesystem work.
+	policy, err := r.service.activeRestorePolicy()
+	if err != nil {
+		return RestoreRecord{}, err
+	}
+	targetRoot := filepath.Clean(manifest.Workload.RootPath)
+	if err := policy.CheckRestoreTarget(targetRoot, manifest.Workload, r.service.registeredRoot(manifest.Workload.ID)); err != nil {
+		return RestoreRecord{}, err
+	}
+	if isMountpoint(targetRoot) {
+		return RestoreRecord{}, errors.New("restoring directly over a mountpoint requires a filesystem snapshot adapter")
+	}
+	// One transaction per target root from here until Commit or Rollback:
+	// the filesystem switch below is a single-writer protocol, and a second
+	// restore racing this one would delete this transaction's live tree.
+	if err = r.beginRestore(targetRoot); err != nil {
+		return RestoreRecord{}, err
+	}
+	defer func() {
+		if err != nil {
+			// Once a record exists, rollback() releases the guard too; this
+			// covers every failure before the transaction record is created.
+			r.endRestore(targetRoot)
+		}
+	}()
 	// The workload's declared host ports are reserved before any restore work
 	// begins, so a collision with another workload on this machine fails here
 	// instead of halfway through the restore. A workload that declares ports
@@ -179,17 +253,7 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	if err != nil {
 		return RestoreRecord{}, err
 	}
-	targetRoot := filepath.Clean(manifest.Workload.RootPath)
-	if targetRoot == string(filepath.Separator) || !filepath.IsAbs(targetRoot) {
-		return RestoreRecord{}, errors.New("unsafe restore target")
-	}
-	if isMountpoint(targetRoot) {
-		return RestoreRecord{}, errors.New("restoring directly over a mountpoint requires a filesystem snapshot adapter")
-	}
 	parentDirectory := filepath.Dir(targetRoot)
-	if err := os.MkdirAll(parentDirectory, 0o755); err != nil {
-		return RestoreRecord{}, err
-	}
 	stagingRoot := filepath.Join(parentDirectory, ".shift-restore-"+sessionID)
 	backupRoot := filepath.Join(parentDirectory, ".shift-backup-"+sessionID)
 	restoreDirectory := filepath.Join(r.service.stateDir, "restores", sessionID)
@@ -220,7 +284,7 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	if err != nil {
 		return record, err
 	}
-	err = extractDirectory(ctx, r.service.chunks, manifest.Workload.ID, filesystemAsset, stagingRoot)
+	err = extractDirectory(ctx, r.service.chunks, manifest.Workload.ID, filesystemAsset, stagingRoot, policy)
 	if err != nil {
 		return record, err
 	}
@@ -228,7 +292,7 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	if err != nil {
 		return record, err
 	}
-	err = materializeProcessChain(ctx, r.service.repository, r.service.chunks, manifest, restoreDirectory)
+	err = materializeProcessChain(ctx, r.service.repository, r.service.chunks, manifest, restoreDirectory, policy)
 	if err != nil {
 		return record, err
 	}
@@ -236,23 +300,62 @@ func (r *Restorer) Prepare(parent context.Context, checkpointID string, options 
 	if info, statErr := os.Stat(imagesDirectory); statErr != nil || !info.IsDir() {
 		return record, errors.New("restored process image directory is missing")
 	}
-	if targetInfo, lstatErr := os.Lstat(targetRoot); lstatErr == nil {
-		if targetInfo.Mode()&os.ModeSymlink != 0 {
+	// The filesystem switch is the one step that must survive a crash
+	// halfway: the record says what is about to happen before it happens, so
+	// recovery always finds the truth on disk. The parent is pinned
+	// symlink-free and every rename runs through the pin — an intermediate
+	// symlink or a parent swapped during the extraction window redirects
+	// nothing and is refused.
+	switcher, pinErr := pinTargetDir(targetRoot)
+	if pinErr != nil {
+		return record, pinErr
+	}
+	defer func() { _ = switcher.Close() }()
+	// The ownership verdict was reached at admission, before a long
+	// extraction window. Re-run it against the pin's current identity so a
+	// target swapped during that window is refused before the backup rename
+	// touches anything.
+	if err = policy.RecheckPinnedTarget(switcher, manifest.Workload.UID); err != nil {
+		return record, err
+	}
+	if targetStat, exists, statErr := switcher.lstatTarget(); statErr != nil {
+		return record, statErr
+	} else if exists {
+		if targetStat.Mode&syscall.S_IFMT == syscall.S_IFLNK {
 			return record, errors.New("refusing to replace a symlinked workload root")
 		}
-		err = os.Rename(targetRoot, backupRoot)
-		if err != nil {
+		// The backup is recorded before the original moves: a crash between
+		// this write and the rename leaves a record whose backup does not
+		// exist yet (nothing to restore, nothing lost), and a crash after
+		// the rename leaves a rollback that renames it back.
+		record.BackupRoot = backupRoot
+		record.UpdatedAt = time.Now().UTC()
+		if err = r.records.Put(record.ID, record); err != nil {
+			return record, err
+		}
+		if err = switcher.renameWithin(switcher.name, filepath.Base(backupRoot)); err != nil {
+			record.BackupRoot = ""
 			return record, fmt.Errorf("preserve destination root: %w", err)
 		}
-	} else if !errors.Is(lstatErr, os.ErrNotExist) {
-		return record, lstatErr
 	} else {
+		// A fresh target has no backup to restore; the switched state is
+		// what tells crash recovery to clear a half-materialized tree.
 		record.BackupRoot = ""
+		record.State = RestoreFilesystemSwitched
+		record.UpdatedAt = time.Now().UTC()
+		if err = r.records.Put(record.ID, record); err != nil {
+			return record, err
+		}
 	}
-	err = materializeRoot(restoredRoot, targetRoot)
+	err = materializeRootAt(switcher, restoredRoot)
 	if err != nil {
 		if record.BackupRoot != "" {
-			_ = os.Rename(record.BackupRoot, targetRoot)
+			// Retried by the rollback below and surfaced here rather than
+			// swallowed: a rename-back that failed is data at risk, not a
+			// footnote.
+			if restoreErr := switcher.renameWithin(filepath.Base(backupRoot), switcher.name); restoreErr != nil {
+				return record, fmt.Errorf("activate restored filesystem: %w (restoring the destination backup also failed: %v)", err, restoreErr)
+			}
 		}
 		return record, fmt.Errorf("activate restored filesystem: %w", err)
 	}
@@ -444,7 +547,7 @@ func processChain(ctx context.Context, repository *Repository, chunks *chunkstor
 // references unchanged pages in its parent, so the sets must sit in sibling
 // directories, never overlaid into one where the newest file would silently
 // shadow the older file restore still needs.
-func materializeProcessChain(ctx context.Context, repository *Repository, chunks *chunkstore.Store, manifest model.CheckpointManifest, destination string) error {
+func materializeProcessChain(ctx context.Context, repository *Repository, chunks *chunkstore.Store, manifest model.CheckpointManifest, destination string, policy RestorePolicy) error {
 	chain, err := processChain(ctx, repository, chunks, manifest)
 	if err != nil {
 		return err
@@ -459,7 +562,7 @@ func materializeProcessChain(ctx context.Context, repository *Repository, chunks
 			target = filepath.Join(target, "parent-images")
 		}
 		for _, asset := range append([]model.AssetManifest{final}, passes...) {
-			if err := extractDirectory(ctx, chunks, manifest.Workload.ID, asset, target); err != nil {
+			if err := extractDirectory(ctx, chunks, manifest.Workload.ID, asset, target, policy); err != nil {
 				return fmt.Errorf("extract process state %s: %w", member.ID, err)
 			}
 		}
@@ -514,6 +617,7 @@ func (r *Restorer) Commit(id string) (RestoreRecord, error) {
 		return RestoreRecord{}, err
 	}
 	if record.State == RestoreCommitted {
+		r.endRestore(record.TargetRoot)
 		return record, nil
 	}
 	if record.State != RestoreValidated {
@@ -545,6 +649,7 @@ func (r *Restorer) Commit(id string) (RestoreRecord, error) {
 	if err := r.records.Put(id, record); err != nil {
 		return RestoreRecord{}, err
 	}
+	r.endRestore(record.TargetRoot)
 	if r.service.diagnostics != nil {
 		r.service.diagnostics.RestoreFinished(observability.OutcomeSuccess)
 	}
@@ -591,6 +696,15 @@ func (r *Restorer) Recover(ctx context.Context) error {
 				if err := r.rollback(ctx, &record, "validated destination process missing after agent restart"); err != nil {
 					return err
 				}
+				continue
+			}
+			// The validation passed and its process survived the restart: the
+			// request that prepared this restore is gone and will never call
+			// Commit, so standing VALIDATED forever would leak the backup,
+			// staging, and image trees and leave a half-committed record.
+			// The intent was committed — complete it here.
+			if _, err := r.Commit(record.ID); err != nil {
+				return fmt.Errorf("recover restore %s: %w", record.ID, err)
 			}
 		}
 	}
@@ -621,12 +735,20 @@ func (r *Restorer) Recover(ctx context.Context) error {
 // observes, from outside, the moment the image set stops being needed.
 // Liveness is proven from /proc against the daemon's own command line, so a
 // recycled pid reads as dead and a live daemon is never deleted under.
+// The daemon exiting while the restored workload still runs is a fault, not
+// an ending: the workload can no longer satisfy a page fault and will wedge
+// or SIGBUS, so it is logged loudly instead of passing silently.
 func (r *Restorer) watchRetainedImages(record RestoreRecord) {
 	images := filepath.Join(record.RestoreDirectory, "images")
 	for {
 		time.Sleep(lazyPagesWatchInterval)
 		if lazyPagesDaemonAlive(record.LazyPagesPID, images) {
 			continue
+		}
+		if workload, err := r.service.runtime.Get(record.WorkloadID); err == nil &&
+			workload.Process != nil && linuxplatform.ProcessAlive(workload.Process.PID, workload.Process.ProcStartTicks) {
+			r.logger.Error("lazy-pages daemon exited while the restored workload is still running; the workload cannot satisfy further page faults and is expected to fail",
+				"restore_id", record.ID, "workload_id", record.WorkloadID, "lazy_pages_pid", record.LazyPagesPID)
 		}
 		if err := os.RemoveAll(record.RestoreDirectory); err != nil {
 			r.logger.Warn("could not remove a lazy restore's retained images",
@@ -656,6 +778,9 @@ func (r *Restorer) stopLazyPages(record RestoreRecord) {
 }
 
 func (r *Restorer) rollback(ctx context.Context, record *RestoreRecord, reason string) error {
+	// The transaction ends here whatever the rollback outcome: a retry comes
+	// from the next Prepare, and Recover re-attempts any half-finished one.
+	defer r.endRestore(record.TargetRoot)
 	originalState := record.State
 	record.State = RestoreRollingBack
 	record.Error = reason
@@ -676,24 +801,41 @@ func (r *Restorer) rollback(ctx context.Context, record *RestoreRecord, reason s
 	if r.service.network != nil {
 		r.service.network.Deactivate(record.WorkloadID, rollbackDrainGrace)
 	}
-	filesystemWasSwitched := originalState == RestoreFilesystemSwitched || originalState == RestoreProcessRunning || originalState == RestoreValidated || originalState == RestoreRollingBack
+	// The backup's presence on disk is the truth beyond what the record
+	// claims: a crash between the backup rename and the state write leaves
+	// the record at Preparing while the original root is already aside, and
+	// that backup still has to come back.
+	backupOnDisk := false
+	if record.BackupRoot != "" {
+		if _, err := os.Lstat(record.BackupRoot); err == nil {
+			backupOnDisk = true
+		}
+	}
+	filesystemWasSwitched := backupOnDisk ||
+		originalState == RestoreFilesystemSwitched || originalState == RestoreProcessRunning || originalState == RestoreValidated || originalState == RestoreRollingBack
 	if filesystemWasSwitched {
-		if _, err := os.Lstat(record.TargetRoot); err == nil {
-			failedRoot := record.TargetRoot + ".shift-failed-" + record.ID
-			if renameErr := os.Rename(record.TargetRoot, failedRoot); renameErr != nil {
+		switcher, pinErr := pinTargetDir(record.TargetRoot)
+		if pinErr != nil {
+			return pinErr
+		}
+		defer func() { _ = switcher.Close() }()
+		if _, exists, statErr := switcher.lstatTarget(); statErr != nil {
+			return statErr
+		} else if exists {
+			failedName := switcher.name + ".shift-failed-" + record.ID
+			if renameErr := switcher.renameWithin(switcher.name, failedName); renameErr != nil {
 				return renameErr
 			}
+			failedRoot := filepath.Join(filepath.Dir(record.TargetRoot), failedName)
 			defer func() {
 				if removeErr := os.RemoveAll(failedRoot); removeErr != nil {
 					r.logger.Error("remove the failed restore root", "path", failedRoot, "error", removeErr)
 				}
 			}()
 		}
-		if record.BackupRoot != "" {
-			if _, err := os.Lstat(record.BackupRoot); err == nil {
-				if err := os.Rename(record.BackupRoot, record.TargetRoot); err != nil {
-					return fmt.Errorf("restore destination backup: %w", err)
-				}
+		if backupOnDisk {
+			if renameErr := switcher.renameWithin(filepath.Base(record.BackupRoot), switcher.name); renameErr != nil {
+				return fmt.Errorf("restore destination backup: %w", renameErr)
 			}
 		}
 	}
@@ -899,7 +1041,24 @@ func runHealthCheck(ctx context.Context, workload model.WorkloadSpec, check mode
 		if len(check.Command) == 0 {
 			return errors.New("health command is empty")
 		}
-		command := exec.CommandContext(ctx, check.Command[0], check.Command[1:]...)
+		argv := append([]string{check.Command[0]}, check.Command[1:]...)
+		if os.Geteuid() == 0 {
+			// A privileged agent runs the health command through the same
+			// exec shim the workload itself starts under: the shim installs
+			// no-new-privileges (and the io_uring filter) before replacing
+			// itself with the command. The command is manifest-supplied and
+			// may resolve inside the extracted root, so without this a
+			// planted setuid or file-capability binary there would execute
+			// with full privilege at validation time. Go's process spawning
+			// has no pre-exec hook; re-executing this binary is the one
+			// place the flag can go, exactly as for workload start.
+			self, selfErr := os.Executable()
+			if selfErr != nil {
+				return fmt.Errorf("resolve the agent binary to run the health command: %w", selfErr)
+			}
+			argv = append([]string{self, shiftruntime.WorkloadExecCommand, "--"}, argv...)
+		}
+		command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 		command.Dir = workload.WorkingDir
 		command.Env = environmentForHealth(workload.Environment)
 		command.SysProcAttr = &syscall.SysProcAttr{}
@@ -947,10 +1106,19 @@ func isMountpoint(path string) bool {
 	if err != nil {
 		return false
 	}
+	return mountinfoContains(string(content), path)
+}
+
+// mountinfoContains reports whether a mount table lists path as a mountpoint.
+// Mount-point paths are compared only after decoding every octal escape
+// /proc/self/mountinfo uses — space, tab, newline, and backslash become \040,
+// \011, \012, \134 — because decoding just one of them leaves roots carrying
+// the others unmatched and silently skips the snapshot-adapter refusal.
+func mountinfoContains(table, path string) bool {
 	clean := filepath.Clean(path)
-	for _, line := range strings.Split(string(content), "\n") {
+	for _, line := range strings.Split(table, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) > 4 && filepath.Clean(strings.ReplaceAll(fields[4], "\\040", " ")) == clean {
+		if len(fields) > 4 && filepath.Clean(unescapeMountInfoPath(fields[4])) == clean {
 			return true
 		}
 	}

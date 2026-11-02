@@ -261,6 +261,9 @@ func (mirror *Mirror) Download(ctx context.Context, checkpointID string) (model.
 	if err != nil {
 		return model.CheckpointManifest{}, err
 	}
+	if err := mirror.repository.Trust().Admit(manifest); err != nil {
+		return model.CheckpointManifest{}, err
+	}
 	for _, ref := range uniqueChunkRefs(manifest.Assets) {
 		missing, err := mirror.chunks.Missing([]model.ChunkRef{ref})
 		if err != nil {

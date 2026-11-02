@@ -32,21 +32,28 @@ func runCommand(name string, arguments ...string) error {
 }
 
 // stressBytes is the size of the huge-memory arena, overridable so a slow CI
-// can still run a smaller variant of the same scenario.
-func stressBytes() int64 {
+// can still run a smaller variant of the same scenario. An override that is
+// not a positive byte count fails loudly: a typo silently shrinking (or
+// inflating) the arena would quietly change what the scenario proves.
+func stressBytes(t testing.TB) int64 {
+	t.Helper()
 	if value := os.Getenv("SHIFT_TEST_STRESS_BYTES"); value != "" {
 		var parsed int64
-		if _, err := fmt.Sscanf(value, "%d", &parsed); err == nil && parsed > 0 {
-			return parsed
+		if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil || parsed <= 0 {
+			t.Fatalf("SHIFT_TEST_STRESS_BYTES=%q is not a positive byte count", value)
 		}
+		return parsed
 	}
 	return 512 << 20
 }
 
 // TestStressHugeMemoryState: a workload holds a multi-hundred-megabyte
-// verified pattern in memory across checkpoint and restore. The process
-// re-checks the pattern after every write, so a restore that lost or
-// corrupted its memory fails loudly instead of quietly counting on.
+// verified pattern in memory across checkpoint and restore. The pattern is
+// written once at startup and the process verifies the whole arena before
+// every rewrite pass — verify-then-write, never write-then-verify — so
+// memory a restore lost or corrupted is found before anything can
+// overwrite the evidence, and the logged `n` must continue past the
+// checkpoint instead of restarting at 1.
 func TestStressHugeMemoryState(t *testing.T) {
 	requireStress(t)
 	if !interpreterAvailable("python3") {
@@ -60,18 +67,21 @@ SIZE = %d
 arena = bytearray(SIZE)
 step = 4096
 n = 0
+def pattern(offset):
+    return (offset // step) %% 251
+for offset in range(0, SIZE, step):
+    arena[offset] = pattern(offset)
 while True:
     for offset in range(0, SIZE, step):
-        arena[offset] = (offset // step) %% 251
-    if n %% 8 == 0:
-        for offset in range(0, SIZE, step):
-            if arena[offset] != (offset // step) %% 251:
-                raise SystemExit("memory corrupted")
+        if arena[offset] != pattern(offset):
+            raise SystemExit("memory corrupted")
+    for offset in range(0, SIZE, step):
+        arena[offset] = pattern(offset)
     n += 1
     with open("progress.log", "a") as fh:
         fh.write("%%d %%d\n" %% (n, len(arena)))
     time.sleep(1)
-`, stressBytes())
+`, stressBytes(t))
 	if err := os.WriteFile(script, []byte(source), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -103,11 +113,15 @@ while True:
 	}
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadRunning)
 
-	// The restored process re-verifies the whole arena every 8th pass; a
-	// SystemExit("memory corrupted") would surface as the workload dying.
+	// The restored process verifies the whole arena before its next rewrite
+	// pass; a SystemExit("memory corrupted") would surface as the workload
+	// dying. The logged `n` is the continuity signal: it must continue past
+	// the pre-checkpoint count in one unbroken run — a re-executed script
+	// restarts at 1, and line growth alone would pass it.
 	waitUntil(t, 180*time.Second, "restored arena to keep writing verified passes", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline+2, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
 }
 
 // TestStressThousandsOfProcesses: a supervisor spawns 1500 real processes,
@@ -189,7 +203,10 @@ while true; do sleep 60; done
 		t.Fatalf("checkpoint: %v", err)
 	}
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadCheckpointed)
-	baseline := distinct()
+	before := make(map[string]int)
+	for writer, values := range tagValues(t, filepath.Join(root, "heartbeats.log")) {
+		before[writer] = len(values)
+	}
 
 	record, err := agentProc.client.Restore(ctx, manifest.ID, agentclient.RestoreRequest{TimeoutSeconds: 600})
 	if err != nil {
@@ -200,11 +217,23 @@ while true; do sleep 60; done
 	}
 	waitForWorkload(t, agentProc.client, workload.Spec.ID, model.WorkloadRunning)
 
-	// After restore the same 1500 processes must all still be heartbeating.
+	// After restore the same 1500 processes must all still be heartbeating,
+	// each from its own in-memory counter: every writer appends past the
+	// count its checkpoint froze it at, and every writer's log stays its own
+	// unbroken 1, 2, 3, ... run. A tree dropped and re-spawned from its
+	// supervisor re-emits the same ids from 1 — invisible in a distinct-id
+	// count, caught at each writer's first post-restore value.
 	waitUntil(t, 300*time.Second, "all 1500 restored processes to keep heartbeating", func() (bool, string) {
-		count := distinct()
-		return count >= 1500, fmt.Sprintf("processes reporting=%d baseline=%d", count, baseline)
+		sequences := tagValues(t, filepath.Join(root, "heartbeats.log"))
+		pending := 0
+		for writer, want := range before {
+			if len(sequences[writer]) <= want {
+				pending++
+			}
+		}
+		return pending == 0, fmt.Sprintf("writers still at pre-checkpoint count: %d of %d", pending, len(before))
 	})
+	assertTagContinuity(t, filepath.Join(root, "heartbeats.log"), before)
 }
 
 // latencyProxy is a user-space TCP proxy that delays every byte it forwards.
@@ -250,18 +279,25 @@ func (p *latencyProxy) handle(client net.Conn) {
 		return
 	}
 	defer upstream.Close()
-	// Both directions get the same per-write delay; chunked writes mean the
-	// transfer of a multi-megabyte payload accumulates seconds of latency.
+	// Both directions charge the same delay; the delay is owed per byte
+	// forwarded (see delayedCopy), so a multi-megabyte transfer accumulates
+	// seconds of latency regardless of how the transport chunks it.
 	go delayedCopy(upstream, client, p.delay)
 	delayedCopy(client, upstream, p.delay)
 }
 
+// delayedCopy forwards bytes while charging `delay` per 64 KiB of payload —
+// 150 ms per 64 KiB when called with 150ms. Sleeping a flat delay per read
+// instead would make the total latency depend on the peer's record sizes
+// (TLS records at ~16 KiB would quadruple it past the migration's own
+// timeout); charging per byte bounds the accumulated delay by the bytes
+// moved: a 64 MiB transfer adds about 154 s whichever way it is chunked.
 func delayedCopy(destination io.Writer, source io.Reader, delay time.Duration) {
 	buffer := make([]byte, 64<<10)
 	for {
 		read, err := source.Read(buffer)
 		if read > 0 {
-			time.Sleep(delay)
+			time.Sleep(delay * time.Duration(read) / (64 << 10))
 			if _, writeErr := destination.Write(buffer[:read]); writeErr != nil {
 				return
 			}
@@ -277,8 +313,10 @@ func (p *latencyProxy) url() string {
 }
 
 // TestStressHighNetworkLatency: a migration whose entire path runs through a
-// proxy adding 150ms of latency to every 64KiB write. The migration must
-// still complete and resume the workload on the destination.
+// proxy adding 150ms of latency per 64KiB forwarded — about 154 s of
+// accumulated delay for the 64 MiB payload, inside the migration's own 600s
+// budget. The migration must still complete and resume the workload on the
+// destination, with its counter continuing.
 func TestStressHighNetworkLatency(t *testing.T) {
 	requireStress(t)
 	source := startAgent(t, "latency-source")
@@ -316,7 +354,10 @@ func TestStressHighNetworkLatency(t *testing.T) {
 		t.Fatalf("create migration: %v", err)
 	}
 
-	migration := waitForMigrationTerminal(t, source.client, created.ID)
+	// The helper's deadline must cover the migration's own 600s timeout
+	// plus the delay the proxy charges, or it fails while the migration is
+	// legitimately still transferring.
+	migration := waitForMigrationTerminal(t, source.client, created.ID, 12*time.Minute)
 	if migration.Stage != model.MigrationCompleted {
 		t.Fatalf("migration under latency ended in %s (%s: %s)", migration.Stage, migration.FailureCode, migration.FailureReason)
 	}
@@ -324,6 +365,7 @@ func TestStressHighNetworkLatency(t *testing.T) {
 	waitUntil(t, 120*time.Second, "migrated counter to keep counting through latency", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
 }
 
 // TestStressSourceFailureMidMigration: the SOURCE agent dies mid-transfer.
@@ -392,19 +434,26 @@ func TestStressSourceFailureMidMigration(t *testing.T) {
 
 	// The machine comes back. Recover() replays the journal on startup.
 	restarted := startAgentAt(t, "source-failure-b", stateDir, t.TempDir())
-	recovered := waitForMigrationTerminal(t, restarted.client, created.ID)
+	recovered := waitForMigrationTerminal(t, restarted.client, created.ID, 10*time.Minute)
 	if recovered.Stage == model.MigrationCompleted {
 		t.Fatal("migration completed even though the source died mid-transfer")
 	}
 	if recovered.FailureCode != "AGENT_RESTARTED" {
-		t.Logf("recovered migration failure code: %s (%s)", recovered.FailureCode, recovered.FailureReason)
+		t.Fatalf("journal recovery reported failure code %q (%s), want AGENT_RESTARTED — the in-flight migration was not settled as an agent restart",
+			recovered.FailureCode, recovered.FailureReason)
 	}
 
-	// The workload is running again on the source and its counter resumed.
+	// The workload is running again on the source and its counter resumed
+	// from its own state — the machine death cost it its progress, not its
+	// identity: the log stays the unbroken sequence and the root survives.
 	waitForWorkload(t, restarted.client, workload.Spec.ID, model.WorkloadRunning)
 	waitUntil(t, 120*time.Second, "recovered source counter to keep counting", func() (bool, string) {
 		return fileLineCount(t, logPath) > baseline, fmt.Sprintf("lines=%d baseline=%d", fileLineCount(t, logPath), baseline)
 	})
+	assertCounterContinuity(t, logPath, baseline)
+	if _, statErr := os.Stat(root); statErr != nil {
+		t.Fatalf("failed move destroyed the source root: %v", statErr)
+	}
 }
 
 // TestStressDiskExhaustion: the agent's state directory is a 128MiB tmpfs

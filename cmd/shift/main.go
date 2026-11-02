@@ -7,6 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,10 +17,13 @@ import (
 	"time"
 
 	"shift.dev/shift/internal/agentclient"
+	"shift.dev/shift/internal/billing"
+	"shift.dev/shift/internal/checkpoint"
 	"shift.dev/shift/internal/config"
 	"shift.dev/shift/internal/controlclient"
 	"shift.dev/shift/internal/migration"
 	"shift.dev/shift/internal/model"
+	"shift.dev/shift/internal/termio"
 )
 
 type options struct {
@@ -50,33 +55,48 @@ func main() {
 }
 
 func run(arguments []string, stdout, stderr io.Writer) error {
-	global := flag.NewFlagSet("shiftgate", flag.ContinueOnError)
-	global.SetOutput(stderr)
-	settings := options{stdout: stdout, stderr: stderr, timeout: 30 * time.Second}
-	global.StringVar(&settings.agentEndpoint, "agent", defaultAgentEndpoint(), "SHIFT agent endpoint")
-	global.StringVar(&settings.controlURL, "control-url", os.Getenv("SHIFT_CONTROL_URL"), "SHIFT control-plane URL (empty means the platform endpoint)")
-	global.StringVar(&settings.tokenStorePath, "token-store", controlclient.DefaultTokenStorePath(), "where the control-plane session is stored")
-	global.BoolVar(&settings.jsonOutput, "json", false, "emit JSON")
-	global.DurationVar(&settings.timeout, "timeout", 30*time.Second, "request timeout")
-	if err := global.Parse(arguments); err != nil {
+	if len(arguments) == 1 && arguments[0] == "--version" {
+		_, _ = fmt.Fprintln(stdout, "SHIFT", config.Version)
+		return nil
+	}
+	settings := options{
+		stdout: stdout, stderr: stderr,
+		agentEndpoint:  defaultAgentEndpoint(),
+		controlURL:     os.Getenv("SHIFT_CONTROL_URL"),
+		tokenStorePath: controlclient.DefaultTokenStorePath(),
+		timeout:        30 * time.Second,
+	}
+	if topic, asked := helpRequest(arguments); asked {
+		return printCommandHelp(stdout, topic)
+	}
+	remaining, err := extractGlobalFlags(arguments, &settings)
+	if err != nil {
 		return exitError{code: 2, err: err}
 	}
-	remaining := global.Args()
 	if len(remaining) == 0 {
 		printUsage(stdout)
 		return exitError{code: 2, err: errors.New("a command is required")}
 	}
 	command := remaining[0]
 	commandArgs := remaining[1:]
-	if command == "version" {
+	switch command {
+	case "version":
+		if err := rejectArgs("version", "shiftgate version", commandArgs); err != nil {
+			return err
+		}
 		if settings.jsonOutput {
 			return writeJSON(stdout, map[string]string{"version": config.Version})
 		}
 		_, _ = fmt.Fprintln(stdout, "SHIFT", config.Version)
 		return nil
-	}
-	if command == "completion" {
+	case "completion":
 		return completion(stdout, commandArgs)
+	case "connections":
+		return runConnections(settings, commandArgs)
+	case "disconnect":
+		return runDisconnect(settings, commandArgs)
+	case "connect":
+		return runConnect(context.Background(), settings, commandArgs)
 	}
 	ctx := context.Background()
 	// Control-plane commands share the global flags but talk to the control
@@ -91,20 +111,45 @@ func run(arguments []string, stdout, stderr io.Writer) error {
 	}
 	switch command {
 	case "doctor":
-		return runDoctor(ctx, client, settings)
+		return runDoctor(ctx, client, settings, commandArgs)
+	case "gc":
+		return runGC(ctx, client, settings, commandArgs)
 	case "machines", "machine":
 		// Dual-mode by configuration: with a control plane configured the
 		// fleet view is the more useful answer, and a lone agent still has
-		// its local answer when none is.
+		// its local answer when none is. Registration and capability queries
+		// only ever make sense against a control plane, so they always go
+		// there — on the default (platform) endpoint that means a login.
+		if len(commandArgs) > 0 {
+			switch commandArgs[0] {
+			case "register", "capability":
+				return runFleetMachines(ctx, settings, commandArgs)
+			case "list":
+				// `machines` and `machines list` are one view (help documents
+				// both forms); consume the synonym so the local mode never
+				// rejects the first form in its own usage block. Anything
+				// after it is still junk and is rejected below.
+				commandArgs = commandArgs[1:]
+			default:
+				if settings.controlURL != "" {
+					return runFleetMachines(ctx, settings, commandArgs)
+				}
+				return usageError(fmt.Sprintf("unknown machines subcommand %q; the local machine view takes no subcommands — 'shiftgate machines register|capability' manage the control-plane registry%s",
+					commandArgs[0], suggestCommand(commandArgs[0])))
+			}
+		}
 		if settings.controlURL != "" {
 			return runFleetMachines(ctx, settings, commandArgs)
 		}
-		return runMachine(ctx, client, settings)
+		return runMachine(ctx, client, settings, commandArgs)
 	case "workloads":
 		if settings.controlURL != "" {
 			return runFleetWorkloads(ctx, settings, commandArgs)
 		}
-		return runWorkload(ctx, client, settings, append([]string{"list"}, commandArgs...))
+		if err := rejectArgs("workloads", "shiftgate workloads", commandArgs); err != nil {
+			return err
+		}
+		return runWorkload(ctx, client, settings, []string{"list"})
 	case "workload":
 		return runWorkload(ctx, client, settings, commandArgs)
 	case "checkpoint":
@@ -129,7 +174,10 @@ func run(arguments []string, stdout, stderr io.Writer) error {
 		return runWorkload(ctx, client, settings, append([]string{"logs"}, commandArgs...))
 	default:
 		printUsage(stderr)
-		return exitError{code: 2, err: fmt.Errorf("unknown command %q", command)}
+		if strings.HasPrefix(command, "-") {
+			return exitError{code: 2, err: fmt.Errorf("unknown flag %q; see the global flags in 'shiftgate help' (a mistyped global flag is not a command)", command)}
+		}
+		return exitError{code: 2, err: fmt.Errorf("unknown command %q%s", command, suggestCommand(command))}
 	}
 }
 
@@ -137,34 +185,95 @@ func run(arguments []string, stdout, stderr io.Writer) error {
 // than the local agent.
 func isControlCommand(command string) bool {
 	switch command {
-	case "login", "logout", "whoami", "plans", "storage", "fleet", "marketplace", "market":
+	case "login", "logout", "whoami", "plans", "storage", "fleet", "marketplace", "market", "trial", "refer", "referral":
 		return true
 	}
 	return false
 }
 
-func runDoctor(ctx context.Context, client *agentclient.Client, settings options) error {
+// runGC fronts the chunk garbage collection story. Online sweeping under the
+// running agent is the shipped path: as root, `shiftgate gc` plans and
+// (--dry-run=false) deletes unreferenced chunks while the agent serves, under
+// the collector's two-phase grace and write guard. The offline 'shift-gc'
+// sweep is the fallback when the agent cannot take a live sweep at all.
+func runGC(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
+	flags := flagNew("gc")
+	grace := durationFlag(flags, "grace", 24*time.Hour, "minimum age for orphaned chunks")
+	dryRun := flags.Bool("dry-run", true, "plan only; never delete chunks")
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
+		return usageError(err.Error())
+	}
+	if err := rejectArgs("gc", "shiftgate gc [--grace DURATION] [--dry-run]", positional); err != nil {
+		return err
+	}
+	result, err := client.GarbageCollect(ctx, agentclient.GCRequest{GraceSeconds: int(grace.Seconds()), DryRun: *dryRun})
+	if err != nil {
+		var api *agentclient.APIError
+		if errors.As(err, &api) && api.Code == "GC_ROOT_REQUIRED" {
+			printOfflineGC(settings, *grace, *dryRun, api.Code)
+			return exitError{code: 3, err: errors.New("garbage collection needs root; rerun as root (sudo shiftgate gc), or run the offline sweep printed above")}
+		}
+		// A version-skewed or unreachable agent must not dead-end here
+		// either: the offline sweep is the fallback in every failure mode.
+		printOfflineGC(settings, *grace, *dryRun, "")
+		return operationError(err)
+	}
+	return writeJSON(settings.stdout, result)
+}
+
+// printOfflineGC names the remedy and the offline tool's exact invocation: an
+// operator staring at a full disk gets commands to copy, not a pointer at an
+// undocumented workflow. Everything goes to stderr — next to the error that
+// prompted it, and clear of --json stdout.
+func printOfflineGC(settings options, grace time.Duration, dryRun bool, code string) {
+	out := settings.stderr
+	switch code {
+	case "GC_ROOT_REQUIRED":
+		_, _ = fmt.Fprintln(out, "Garbage collection needs root (it rewrites the agent state directory): sudo shiftgate gc")
+	default:
+		_, _ = fmt.Fprintln(out, "The agent did not complete a live sweep; the offline sweep below reclaims the same chunks.")
+	}
+	stateDir := "/var/lib/shift"
+	_, _ = fmt.Fprintf(out, "Offline fallback (shift-gc), when the agent cannot take a live sweep:\n"+
+		"  sudo systemctl stop shift-agent\n"+
+		"  sudo shift-gc --state-dir %s --grace %s --dry-run        # plan only\n"+
+		"  sudo shift-gc --state-dir %s --grace %s --dry-run=false  # delete orphans past the grace period\n"+
+		"  sudo systemctl start shift-agent\n"+
+		"(adjust --state-dir when the agent config names another state directory)\n",
+		stateDir, grace, stateDir, grace)
+	if !dryRun {
+		_, _ = fmt.Fprintln(out, "This run requested deletion; rerun with root, or use the offline --dry-run=false invocation above.")
+	}
+}
+
+func runDoctor(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
+	if err := rejectArgs("doctor", "shiftgate doctor", arguments); err != nil {
+		return err
+	}
 	result, err := client.Doctor(ctx)
 	if err != nil {
 		return operationError(err)
 	}
+	report := buildDoctorReport(ctx, settings, result)
 	if settings.jsonOutput {
-		return writeJSON(settings.stdout, result)
-	}
-	for _, check := range result.Checks {
-		status := "FAIL"
-		if check.OK {
-			status = "OK"
+		if err := writeJSON(settings.stdout, report); err != nil {
+			return err
 		}
-		_, _ = fmt.Fprintf(settings.stdout, "%-5s %-20s %s\n", status, check.Name, check.Message)
+		// The exit-3 contract is not a human-renderer detail: CI running
+		// --json must see the same failure digit as an operator does.
+		if !report.Healthy {
+			return exitError{code: 3, err: errors.New("one or more required checks failed")}
+		}
+		return nil
 	}
-	if !result.Healthy {
-		return exitError{code: 3, err: errors.New("one or more required checks failed")}
-	}
-	return nil
+	return writeDoctorHuman(settings, report)
 }
 
-func runMachine(ctx context.Context, client *agentclient.Client, settings options) error {
+func runMachine(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
+	if err := rejectArgs("machines", "shiftgate machines", arguments); err != nil {
+		return err
+	}
 	machine, err := client.Machine(ctx)
 	if err != nil {
 		return operationError(err)
@@ -201,14 +310,19 @@ func runMachine(ctx context.Context, client *agentclient.Client, settings option
 	return writer.Flush()
 }
 
+var workloadSubcommands = []string{"create", "list", "inspect", "policy", "failover", "start", "pause", "resume", "stop", "delete", "logs"}
+
 func runWorkload(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 0 {
-		return exitError{code: 2, err: errors.New("workload subcommand is required")}
+		return usageError("workload subcommand is required; valid: " + strings.Join(workloadSubcommands, ", "))
 	}
 	subcommand := arguments[0]
 	args := arguments[1:]
 	switch subcommand {
 	case "list":
+		if err := rejectArgs("workload list", "shiftgate workload list", args); err != nil {
+			return err
+		}
 		values, err := client.Workloads(ctx)
 		if err != nil {
 			return operationError(err)
@@ -217,7 +331,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 			return writeJSON(settings.stdout, values)
 		}
 		writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-		_, _ = fmt.Fprintln(writer, "NAME\tSTATUS\tPID\tROOT\tCHECKPOINT")
+		_, _ = fmt.Fprintln(writer, "NAME\tSTATUS\tPID\tROOT\tLATEST CHECKPOINT")
 		for _, workload := range values {
 			pid := "-"
 			if workload.Process != nil {
@@ -226,32 +340,51 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 			checkpointID := shortID(workload.LatestCheckpointID)
 			_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", workload.Spec.Name, workload.Status, pid, workload.Spec.RootPath, checkpointID)
 		}
-		return writer.Flush()
+		if err := writer.Flush(); err != nil {
+			return err
+		}
+		for _, workload := range values {
+			if workload.LastError != "" {
+				_, _ = fmt.Fprintf(settings.stdout, "%s: %s (see 'shiftgate workload inspect %s')\n", workload.Spec.Name, workload.LastError, workload.Spec.ID)
+			}
+		}
+		return nil
 	case "create":
 		return workloadCreate(ctx, client, settings, args)
 	case "inspect":
-		if len(args) != 1 {
+		flags := flagNew("workload inspect")
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
+			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
 			return usageError("usage: shiftgate workload inspect ID")
 		}
-		value, err := client.Workload(ctx, args[0])
+		value, err := client.Workload(ctx, positional[0])
 		if err != nil {
 			return operationError(err)
 		}
 		return writeJSON(settings.stdout, value)
 	case "policy":
-		if len(args) < 1 {
-			return usageError("usage: shiftgate workload policy NAME (--every 10m [--keep 5] | --off)")
-		}
-		flags := flag.NewFlagSet("workload policy", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
+		flags := flagNew("workload policy")
 		every := flags.String("every", "", "checkpoint interval, for example 10m (minimum 10s)")
 		keep := flags.Int("keep", 0, "retain at most this many of the workload's checkpoints (0 keeps all)")
 		off := flags.Bool("off", false, "clear the periodic checkpoint policy")
-		if err := flags.Parse(args[1:]); err != nil {
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
 			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
+			return usageError("usage: shiftgate workload policy NAME (--every 10m [--keep 5] | --off)")
 		}
 		intervalSeconds := 0
 		if !*off {
+			// Periodic checkpoint policies are a paid capability (plan 2
+			// BR-07): free orgs get 402 PLAN_REQUIRED_PERIODIC_POLICY. Clear
+			// a policy (--off) is never gated.
+			if err := checkPlanFeatureEntitled(ctx, settings, billing.FeaturePeriodicPolicies, billing.PeriodicPolicyPlanRequiredCode, billing.PeriodicPolicyPlanRequiredMessage); err != nil {
+				return err
+			}
 			if *every == "" {
 				return usageError("either --every DURATION or --off is required")
 			}
@@ -267,7 +400,7 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		} else if *every != "" || *keep != 0 {
 			return usageError("--off cannot be combined with --every or --keep")
 		}
-		value, err := client.SetCheckpointPolicy(ctx, args[0], intervalSeconds, *keep)
+		value, err := client.SetCheckpointPolicy(ctx, positional[0], intervalSeconds, *keep)
 		if err != nil {
 			return operationError(err)
 		}
@@ -289,17 +422,17 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		}
 		return nil
 	case "failover":
-		if len(args) < 1 {
-			return usageError("usage: shiftgate workload failover NAME (--to URL [--machine-id ID] [--keep N] | --off)")
-		}
-		flags := flag.NewFlagSet("workload failover", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
+		flags := flagNew("workload failover")
 		to := flags.String("to", "", "standby agent's peer URL (https://HOST:PORT)")
 		machineID := flags.String("machine-id", "", "expected standby machine id; refuse a host that answers as another")
 		keep := flags.Int("keep", 0, "standby retains at most this many of the workload's checkpoints (0 keeps all)")
 		off := flags.Bool("off", false, "clear the failover policy; the standby duty is withdrawn")
-		if err := flags.Parse(args[1:]); err != nil {
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
 			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
+			return usageError("usage: shiftgate workload failover NAME (--to URL [--machine-id ID] [--keep N] | --off)")
 		}
 		var policy *model.FailoverPolicySpec
 		if !*off {
@@ -315,9 +448,15 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		}
 		agentURL, pin, keepLast := "", "", 0
 		if policy != nil {
+			// Arming warm-standby replication is a paid entitlement
+			// (plan 2 BR-08): HA Pack on Pro, included on Business. Clearing
+			// a policy is never gated.
+			if err := checkPlanFeatureEntitled(ctx, settings, billing.FeatureFailover, billing.FailoverPlanRequiredCode, billing.FailoverPlanRequiredMessage); err != nil {
+				return err
+			}
 			agentURL, pin, keepLast = policy.AgentURL, policy.MachineID, policy.KeepLast
 		}
-		value, err := client.SetFailoverPolicy(ctx, args[0], agentURL, pin, keepLast)
+		value, err := client.SetFailoverPolicy(ctx, positional[0], agentURL, pin, keepLast)
 		if err != nil {
 			return operationError(err)
 		}
@@ -339,35 +478,55 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		}
 		return nil
 	case "start", "pause", "resume":
-		if len(args) != 1 {
+		flags := flagNew("workload " + subcommand)
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
+			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
 			return usageError("usage: shiftgate workload " + subcommand + " ID")
 		}
-		value, err := client.WorkloadAction(ctx, args[0], subcommand, struct{}{})
+		value, err := client.WorkloadAction(ctx, positional[0], subcommand, struct{}{})
 		if err != nil {
 			return operationError(err)
 		}
 		return printWorkload(settings, value)
 	case "stop":
-		flags := flag.NewFlagSet("workload stop", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
-		timeout := flags.Int("timeout", 10, "graceful stop timeout in seconds")
-		if len(args) == 0 {
-			return usageError("usage: shiftgate workload stop ID [--timeout SECONDS]")
-		}
-		id := args[0]
-		if err := flags.Parse(args[1:]); err != nil {
+		flags := flagNew("workload stop")
+		timeout := durationFlag(flags, "timeout", 10*time.Second, "graceful stop timeout (accepts seconds or durations)")
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
 			return usageError(err.Error())
 		}
-		value, err := client.WorkloadAction(ctx, id, "stop", map[string]int{"timeout_seconds": *timeout})
+		if len(positional) != 1 {
+			return usageError("usage: shiftgate workload stop ID [--timeout DURATION]")
+		}
+		// The stop grace is clamped to the agent's 60s limit; say so instead
+		// of letting the number shrink silently.
+		effective := *timeout
+		if effective > time.Minute {
+			_, _ = fmt.Fprintf(settings.stderr, "note: --timeout %s exceeds the agent's 60s stop limit and is clamped to 1m\n", *timeout)
+			effective = time.Minute
+		}
+		value, err := opClient(client, settings, effective).WorkloadAction(ctx, positional[0], "stop", map[string]int{"timeout_seconds": int(effective.Seconds())})
 		if err != nil {
 			return operationError(err)
 		}
 		return printWorkload(settings, value)
 	case "delete":
-		if len(args) != 1 {
-			return usageError("usage: shiftgate workload delete ID")
+		flags := flagNew("workload delete")
+		yes := flags.Bool("yes", false, "skip the confirmation prompt")
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
+			return usageError(err.Error())
 		}
-		if err := client.DeleteWorkload(ctx, args[0]); err != nil {
+		if len(positional) != 1 {
+			return usageError("usage: shiftgate workload delete ID [--yes]")
+		}
+		if err := confirmDestructive(settings, *yes, fmt.Sprintf("delete workload %s and its network presence", positional[0])); err != nil {
+			return err
+		}
+		if err := client.DeleteWorkload(ctx, positional[0]); err != nil {
 			return operationError(err)
 		}
 		if !settings.jsonOutput {
@@ -375,33 +534,31 @@ func runWorkload(ctx context.Context, client *agentclient.Client, settings optio
 		}
 		return nil
 	case "logs":
-		if len(args) == 0 {
-			return usageError("usage: shiftgate workload logs ID [--tail LINES]")
-		}
-		flags := flag.NewFlagSet("workload logs", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
+		flags := flagNew("workload logs")
 		tail := flags.Int("tail", 200, "number of trailing lines")
-		if err := flags.Parse(args[1:]); err != nil {
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
 			return usageError(err.Error())
 		}
-		content, err := client.Logs(ctx, args[0], *tail)
+		if len(positional) != 1 {
+			return usageError("usage: shiftgate workload logs ID [--tail LINES]")
+		}
+		if *tail < 0 {
+			return usageError("--tail must not be negative")
+		}
+		content, err := client.Logs(ctx, positional[0], *tail)
 		if err != nil {
 			return operationError(err)
 		}
 		_, _ = fmt.Fprint(settings.stdout, content)
 		return nil
 	default:
-		return usageError("unknown workload subcommand " + subcommand)
+		return unknownSubcommandError("workload", subcommand, workloadSubcommands)
 	}
 }
 
 func workloadCreate(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
-	if len(arguments) == 0 {
-		return usageError("usage: shiftgate workload create NAME --path PATH -- COMMAND [ARGS...]")
-	}
-	name := arguments[0]
-	flags := flag.NewFlagSet("workload create", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
+	flags := flagNew("workload create")
 	root := flags.String("path", "", "explicit workload root")
 	working := flags.String("workdir", "", "working directory")
 	start := flags.Bool("start", false, "start immediately")
@@ -415,17 +572,30 @@ func workloadCreate(ctx context.Context, client *agentclient.Client, settings op
 	var gpus gpuValues
 	flags.Var(&environment, "env", "environment variable KEY=VALUE; repeatable")
 	flags.Var(&gpus, "gpu", "required GPU, fields vendor=,model=,memory=,compute=,runtime=,restore=; repeatable")
-	if err := flags.Parse(arguments[1:]); err != nil {
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
 		return usageError(err.Error())
 	}
-	command := flags.Args()
+	if len(positional) == 0 {
+		return usageError("usage: shiftgate workload create NAME --path PATH -- COMMAND [ARGS...]")
+	}
+	name := positional[0]
+	command := positional[1:]
 	if *root == "" || len(command) == 0 {
 		return usageError("an explicit --path and command after -- are required")
+	}
+	if *cpu < 0 || math.IsNaN(*cpu) || math.IsInf(*cpu, 0) {
+		return usageError("--cpu must be a non-negative number of cores")
 	}
 	switch model.DevicePolicy(*devicePolicy) {
 	case model.DeviceRejectIncompatible, model.DeviceWarnIncompatible:
 	default:
 		return usageError("device policy must be reject_incompatible or warn_incompatible")
+	}
+	switch model.NetworkPolicy(*network) {
+	case model.NetworkPreserve, model.NetworkReconnect, model.NetworkDrain:
+	default:
+		return usageError("network policy must be preserve, reconnect, or drain")
 	}
 	absRoot, err := filepath.Abs(*root)
 	if err != nil {
@@ -486,51 +656,72 @@ func workloadCreate(ctx context.Context, client *agentclient.Client, settings op
 	return printWorkload(settings, created)
 }
 
+var checkpointSubcommands = []string{"create", "list", "inspect", "mirror"}
+
 func runCheckpoint(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 0 {
-		return usageError("checkpoint subcommand is required")
+		return usageError("checkpoint subcommand is required; valid: " + strings.Join(checkpointSubcommands, ", "))
 	}
 	switch arguments[0] {
 	case "list":
-		flags := flag.NewFlagSet("checkpoint list", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
-		workload := flags.String("workload", "", "filter by workload id")
-		if err := flags.Parse(arguments[1:]); err != nil {
+		flags := flagNew("checkpoint list")
+		workload := flags.String("workload", "", "filter by workload id or name")
+		positional, err := parseCommandFlags(flags, arguments[1:])
+		if err != nil {
 			return usageError(err.Error())
 		}
-		values, err := client.Checkpoints(ctx, *workload)
+		if err := rejectArgs("checkpoint list", "shiftgate checkpoint list [--workload ID|NAME]", positional); err != nil {
+			return err
+		}
+		values, err := client.Checkpoints(ctx, "")
 		if err != nil {
 			return operationError(err)
+		}
+		if *workload != "" {
+			values = filterCheckpoints(values, *workload)
 		}
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, values)
 		}
 		writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-		_, _ = fmt.Fprintln(writer, "ID\tWORKLOAD\tKIND\tCREATED\tPLAIN\tSTORED")
+		_, _ = fmt.Fprintln(writer, "ID\tWORKLOAD\tKIND\tCREATED\tSIZE\tSTORED")
 		for _, value := range values {
 			_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", shortID(value.ID), value.WorkloadName, value.Kind, value.CreatedAt.Local().Format(time.DateTime), humanBytes(value.PlainBytes), humanBytes(value.StoredBytes))
 		}
 		return writer.Flush()
 	case "create":
-		if len(arguments) < 2 {
-			return usageError("usage: shiftgate checkpoint create WORKLOAD [options]")
-		}
-		flags := flag.NewFlagSet("checkpoint create", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
-		leaveRunning := flags.Bool("leave-running", true, "resume source after checkpoint")
+		flags := flagNew("checkpoint create")
+		leaveRunning := flags.Bool("leave-running", true, "resume the workload after the checkpoint (default)")
+		stopWhenDone := flags.Bool("stop-when-done", false, "leave the workload stopped after the checkpoint (same as --leave-running=false)")
 		tcpState := flags.Bool("tcp-state", false, "request CRIU TCP repair state")
 		parent := flags.String("parent", "", "parent checkpoint for incremental mode")
-		timeout := flags.Int("timeout", 1800, "checkpoint timeout in seconds")
-		if err := flags.Parse(arguments[2:]); err != nil {
+		timeout := durationFlag(flags, "timeout", 1800*time.Second, "checkpoint timeout (accepts seconds or durations)")
+		positional, err := parseCommandFlags(flags, arguments[1:])
+		if err != nil {
 			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
+			return usageError("usage: shiftgate checkpoint create WORKLOAD [options]")
+		}
+		leaveRunningSet := false
+		flags.Visit(func(f *flag.Flag) {
+			if f.Name == "leave-running" {
+				leaveRunningSet = true
+			}
+		})
+		if *stopWhenDone {
+			if leaveRunningSet && *leaveRunning {
+				return usageError("--leave-running and --stop-when-done are mutually exclusive")
+			}
+			*leaveRunning = false
 		}
 		kind := model.CheckpointFull
 		if *parent != "" {
 			kind = model.CheckpointIncremental
 		}
-		manifest, err := client.CreateCheckpoint(ctx, agentclient.CheckpointCreateRequest{
-			WorkloadID: arguments[1], Kind: kind, ParentID: *parent,
-			LeaveRunning: leaveRunning, TCPState: *tcpState, TimeoutSeconds: *timeout,
+		manifest, err := opClient(client, settings, *timeout).CreateCheckpoint(ctx, agentclient.CheckpointCreateRequest{
+			WorkloadID: positional[0], Kind: kind, ParentID: *parent,
+			LeaveRunning: leaveRunning, TCPState: *tcpState, TimeoutSeconds: int(timeout.Seconds()),
 		})
 		if err != nil {
 			return operationError(err)
@@ -561,10 +752,15 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 		}
 		return nil
 	case "mirror":
-		if len(arguments) != 2 {
+		flags := flagNew("checkpoint mirror")
+		positional, err := parseCommandFlags(flags, arguments[1:])
+		if err != nil {
+			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
 			return usageError("usage: shiftgate checkpoint mirror ID")
 		}
-		result, err := client.MirrorCheckpoint(ctx, arguments[1])
+		result, err := client.MirrorCheckpoint(ctx, positional[0])
 		if err != nil {
 			return operationError(err)
 		}
@@ -574,31 +770,51 @@ func runCheckpoint(ctx context.Context, client *agentclient.Client, settings opt
 		_, _ = fmt.Fprintf(settings.stdout, "Checkpoint %s mirrored: %d objects, %s.\n", shortID(result.CheckpointID), result.Objects, humanBytes(result.Bytes))
 		return nil
 	case "inspect":
-		if len(arguments) != 2 {
+		flags := flagNew("checkpoint inspect")
+		positional, err := parseCommandFlags(flags, arguments[1:])
+		if err != nil {
+			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
 			return usageError("usage: shiftgate checkpoint inspect ID")
 		}
-		manifest, err := client.Checkpoint(ctx, arguments[1])
+		manifest, err := client.Checkpoint(ctx, positional[0])
 		if err != nil {
 			return operationError(err)
 		}
 		return writeJSON(settings.stdout, manifest)
 	default:
-		return usageError("unknown checkpoint subcommand " + arguments[0])
+		return unknownSubcommandError("checkpoint", arguments[0], checkpointSubcommands)
 	}
 }
 
-func runRestore(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
-	if len(arguments) == 0 {
-		return usageError("usage: shiftgate restore CHECKPOINT [--lazy] [--timeout SECONDS]")
+// filterCheckpoints keeps the checkpoints of one workload, addressed by id or
+// by the workload name as printed in the WORKLOAD column. The agent's query
+// filter matches workload ids only, so a name filter (the form the docs and
+// demos use) is resolved here against the summaries instead of silently
+// printing an empty table.
+func filterCheckpoints(values []checkpoint.Summary, workload string) []checkpoint.Summary {
+	filtered := make([]checkpoint.Summary, 0, len(values))
+	for _, value := range values {
+		if value.WorkloadID == workload || value.WorkloadName == workload {
+			filtered = append(filtered, value)
+		}
 	}
-	flags := flag.NewFlagSet("restore", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
-	timeout := flags.Int("timeout", 1800, "restore timeout in seconds")
+	return filtered
+}
+
+func runRestore(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
+	flags := flagNew("restore")
+	timeout := durationFlag(flags, "timeout", 1800*time.Second, "restore timeout (accepts seconds or durations)")
 	lazy := flags.Bool("lazy", false, "start the process before its memory is fully loaded; pages stream in on demand (needs userfaultfd)")
-	if err := flags.Parse(arguments[1:]); err != nil {
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
 		return usageError(err.Error())
 	}
-	record, err := client.Restore(ctx, arguments[0], agentclient.RestoreRequest{TimeoutSeconds: *timeout, Lazy: *lazy})
+	if len(positional) != 1 {
+		return usageError("usage: shiftgate restore CHECKPOINT [--lazy] [--timeout DURATION]")
+	}
+	record, err := opClient(client, settings, *timeout).Restore(ctx, positional[0], agentclient.RestoreRequest{TimeoutSeconds: int(timeout.Seconds()), Lazy: *lazy})
 	if err != nil {
 		return operationError(err)
 	}
@@ -615,41 +831,60 @@ func runRestore(ctx context.Context, client *agentclient.Client, settings option
 }
 
 func runMigrate(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
-	if len(arguments) == 0 {
-		return usageError("usage: shiftgate migrate WORKLOAD --to https://HOST:PORT [options]")
-	}
-	workload := arguments[0]
-	flags := flag.NewFlagSet("migrate", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
+	flags := flagNew("migrate")
 	destination := flags.String("to", "", "destination peer agent URL")
 	machineID := flags.String("machine-id", "", "expected destination machine id")
 	serverName := flags.String("server-name", "", "TLS server name")
 	mode := flags.String("mode", string(model.MigrationCold), "cold or live")
 	preCopyPasses := flags.Int("pre-copy-passes", 0, "live mode: cap on pre-dump passes before the freeze (0 = single pass)")
 	dryRun := flags.Bool("dry-run", false, "check whether the migration would be admitted and exit; nothing is moved")
-	timeout := flags.Int("timeout", 7200, "migration timeout in seconds")
+	preflight := flags.Bool("preflight", false, "alias for --dry-run")
+	timeout := durationFlag(flags, "timeout", 7200*time.Second, "migration timeout (accepts seconds or durations)")
 	wait := flags.Bool("wait", true, "wait for completion")
-	if err := flags.Parse(arguments[1:]); err != nil {
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
 		return usageError(err.Error())
 	}
+	if len(positional) != 1 {
+		return usageError("usage: shiftgate migrate WORKLOAD --to https://HOST:PORT [options]")
+	}
+	workload := positional[0]
 	if *destination == "" {
 		return usageError("--to is required")
 	}
 	if *preCopyPasses < 0 || *preCopyPasses > 16 {
 		return usageError("--pre-copy-passes must be between 0 and 16")
 	}
-	if *dryRun {
-		return runMigrateDryRun(ctx, client, settings, workload, agentclient.MigrationCreateRequest{
-			WorkloadID:  workload,
-			Destination: model.Destination{MachineID: *machineID, AgentURL: *destination, ServerName: *serverName},
-			Mode:        model.MigrationMode(*mode), PreCopyPasses: *preCopyPasses, TimeoutSeconds: *timeout,
-		})
+	switch model.MigrationMode(*mode) {
+	case model.MigrationCold, model.MigrationLive:
+	default:
+		return usageError("--mode must be cold or live")
 	}
-	record, err := client.CreateMigration(ctx, agentclient.MigrationCreateRequest{
+	// Migrations run cross-machine for up to the operation timeout; the
+	// shared request timeout must not cut the synchronous pieces (preflight,
+	// the create call) short.
+	client = opClient(client, settings, *timeout)
+	resolvedDestination, err := resolveDestination(*destination, *machineID, *serverName)
+	if err != nil {
+		return usageError(err.Error())
+	}
+	input := agentclient.MigrationCreateRequest{
 		WorkloadID:  workload,
-		Destination: model.Destination{MachineID: *machineID, AgentURL: *destination, ServerName: *serverName},
-		Mode:        model.MigrationMode(*mode), PreCopyPasses: *preCopyPasses, TimeoutSeconds: *timeout,
-	})
+		Destination: resolvedDestination,
+		Mode:        model.MigrationMode(*mode), PreCopyPasses: *preCopyPasses, TimeoutSeconds: int(timeout.Seconds()),
+	}
+	if *dryRun || *preflight {
+		return runMigrateDryRun(ctx, client, settings, input)
+	}
+	// Live mode is a paid entitlement; refuse before anything freezes. The
+	// agent-side gate is the final authority (it also covers requests that
+	// never see this CLI).
+	if input.Mode == model.MigrationLive {
+		if err := checkLiveMigrationEntitled(ctx, settings); err != nil {
+			return err
+		}
+	}
+	record, err := client.CreateMigration(ctx, input)
 	if err != nil {
 		return operationError(err)
 	}
@@ -660,7 +895,13 @@ func runMigrate(ctx context.Context, client *agentclient.Client, settings option
 		_, _ = fmt.Fprintln(settings.stdout, record.ID)
 		return nil
 	}
-	return waitForMigration(ctx, client, settings, record.ID)
+	if err := waitForMigration(ctx, client, settings, record.ID); err != nil {
+		return err
+	}
+	// Post-success referral nudge after the third move in 30 days (plan 1
+	// BR-11): stderr only, suppressed by --json and SHIFT_NO_HINTS=1.
+	maybeReferralHint(ctx, settings)
+	return nil
 }
 
 // runMigrateDryRun is `migrate --dry-run`: the agent reaches the destination
@@ -669,7 +910,7 @@ func runMigrate(ctx context.Context, client *agentclient.Client, settings option
 // frozen, moved, or recorded. Exit 0 means the migration would be admitted
 // (warnings allowed); exit 3 means the destination is incompatible and the
 // migration would be rejected.
-func runMigrateDryRun(ctx context.Context, client *agentclient.Client, settings options, workload string, input agentclient.MigrationCreateRequest) error {
+func runMigrateDryRun(ctx context.Context, client *agentclient.Client, settings options, input agentclient.MigrationCreateRequest) error {
 	result, err := client.PreflightMigration(ctx, input)
 	if err != nil {
 		return operationError(err)
@@ -739,7 +980,12 @@ func printPreflight(output io.Writer, result migration.PreflightResult) {
 // the last attempt went. `shiftgate standby` on the standby machine is the
 // other half of the picture.
 func runFailover(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
-	if len(arguments) > 1 || (len(arguments) == 1 && arguments[0] != "status") {
+	flags := flagNew("failover")
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
+		return usageError(err.Error())
+	}
+	if len(positional) > 1 || (len(positional) == 1 && positional[0] != "status") {
 		return usageError("usage: shiftgate failover [status]")
 	}
 	entries, err := client.ReplicationEntries(ctx)
@@ -797,6 +1043,8 @@ func criuVersion(caps model.CRIUCapabilities) string {
 	return version
 }
 
+var standbySubcommands = []string{"list", "trigger"}
+
 // runStandby is the standby-side view of warm-standby failover: the duties
 // this machine holds, and the explicit trigger that restores one here.
 func runStandby(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
@@ -805,18 +1053,21 @@ func runStandby(ctx context.Context, client *agentclient.Client, settings option
 	}
 	switch arguments[0] {
 	case "list":
-		return standbyList(ctx, client, settings)
+		return standbyList(ctx, client, settings, arguments[1:])
 	case "trigger":
-		return standbyTrigger(ctx, settings, arguments)
+		return standbyTrigger(ctx, settings, arguments[1:])
 	default:
-		return usageError("unknown standby subcommand " + arguments[0])
+		return unknownSubcommandError("standby", arguments[0], standbySubcommands)
 	}
 }
 
 // standbyList prints the duty table, then the facts a table cannot hold:
 // whether the death watch is armed at all, and what happened on the duties
 // that already failed over or keep failing to.
-func standbyList(ctx context.Context, client *agentclient.Client, settings options) error {
+func standbyList(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
+	if err := rejectArgs("standby list", "shiftgate standby list", arguments); err != nil {
+		return err
+	}
 	result, err := client.StandbyStatus(ctx)
 	if err != nil {
 		return operationError(err)
@@ -866,16 +1117,16 @@ func standbyList(ctx context.Context, client *agentclient.Client, settings optio
 // confirmation — the command is the confirmation. The agent probes the
 // source first and reports a live one, because that means two live copies.
 func standbyTrigger(ctx context.Context, settings options, arguments []string) error {
-	if len(arguments) < 2 {
-		return usageError("usage: shiftgate standby trigger WORKLOAD_ID [--checkpoint ID] [--lazy] [--timeout DURATION]")
-	}
-	flags := flag.NewFlagSet("standby trigger", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
+	flags := flagNew("standby trigger")
 	checkpointID := flags.String("checkpoint", "", "restore this replicated checkpoint instead of the duty's newest")
 	lazy := flags.Bool("lazy", false, "start the failed-over process before its memory is fully loaded; pages stream in on demand (needs userfaultfd)")
-	timeout := flags.Duration("timeout", 15*time.Minute, "failover timeout; a restore can take minutes, so this overrides the global --timeout")
-	if err := flags.Parse(arguments[2:]); err != nil {
+	timeout := durationFlag(flags, "timeout", 15*time.Minute, "failover timeout; a restore can take minutes, so this overrides the global --timeout")
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
 		return usageError(err.Error())
+	}
+	if len(positional) != 1 {
+		return usageError("usage: shiftgate standby trigger WORKLOAD_ID [--checkpoint ID] [--lazy] [--timeout DURATION]")
 	}
 	// The trigger runs a full restore synchronously; the shared client's
 	// 30-second default would cut it off long before the agent finished.
@@ -883,7 +1134,7 @@ func standbyTrigger(ctx context.Context, settings options, arguments []string) e
 	if err != nil {
 		return exitError{code: 2, err: err}
 	}
-	result, err := triggerClient.TriggerStandbyFailover(ctx, arguments[1], *checkpointID, *lazy)
+	result, err := triggerClient.TriggerStandbyFailover(ctx, positional[0], *checkpointID, *lazy)
 	if err != nil {
 		return operationError(err)
 	}
@@ -903,8 +1154,16 @@ func standbyTrigger(ctx context.Context, settings options, arguments []string) e
 }
 
 func runStatus(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
-	if len(arguments) == 1 {
-		record, err := client.Migration(ctx, arguments[0])
+	flags := flagNew("status")
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
+		return usageError(err.Error())
+	}
+	if len(positional) > 1 {
+		return usageError("usage: shiftgate status [MIGRATION]")
+	}
+	if len(positional) == 1 {
+		record, err := client.Migration(ctx, positional[0])
 		if err != nil {
 			return operationError(err)
 		}
@@ -921,6 +1180,10 @@ func runStatus(ctx context.Context, client *agentclient.Client, settings options
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, values)
 	}
+	if len(values) == 0 {
+		_, _ = fmt.Fprintln(settings.stdout, "No migrations yet. Start one with: shiftgate migrate WORKLOAD --to ALIAS|https://HOST:PORT")
+		return nil
+	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
 	_, _ = fmt.Fprintln(writer, "ID\tWORKLOAD\tSTAGE\tPROGRESS\tDESTINATION\tUPDATED")
 	for _, value := range values {
@@ -928,7 +1191,7 @@ func runStatus(ctx context.Context, client *agentclient.Client, settings options
 		if len(value.Events) > 0 {
 			progress = value.Events[len(value.Events)-1].Progress * 100
 		}
-		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%.0f%%\t%s\t%s\n", shortID(value.ID), shortID(value.WorkloadID), value.Stage, progress, value.Destination.MachineID, value.UpdatedAt.Local().Format(time.DateTime))
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%.0f%%\t%s\t%s\n", shortID(value.ID), shortID(value.WorkloadID), value.Stage, progress, shortID(value.Destination.MachineID), value.UpdatedAt.Local().Format(time.DateTime))
 	}
 	return writer.Flush()
 }
@@ -945,9 +1208,17 @@ func waitForMigration(ctx context.Context, client *agentclient.Client, settings 
 		if err != nil {
 			return operationError(err)
 		}
+		terminal := record.Stage == model.MigrationCompleted || record.Stage == model.MigrationRolledBack ||
+			record.Stage == model.MigrationFailed || record.Stage == model.MigrationCancelled
 		if settings.jsonOutput {
-			if record.Stage == model.MigrationCompleted || record.Stage == model.MigrationRolledBack {
-				return writeJSON(settings.stdout, record)
+			// Machine-readable mode writes the terminal record exactly once,
+			// then falls through to the same exit-code contract human mode
+			// enforces: only a clean COMPLETED may exit 0. Scripts branch on
+			// that digit, so the failure path must never report success here.
+			if terminal {
+				if err := writeJSON(settings.stdout, record); err != nil {
+					return err
+				}
 			}
 		} else if len(record.Events) > 0 {
 			event := record.Events[len(record.Events)-1]
@@ -959,6 +1230,14 @@ func waitForMigration(ctx context.Context, client *agentclient.Client, settings 
 		switch record.Stage {
 		case model.MigrationCompleted:
 			printer.end()
+			// A completed stage that still carries a failure code is not a
+			// success: report it as the failure it is, never "successful".
+			if record.FailureCode != "" {
+				if !settings.jsonOutput {
+					_, _ = fmt.Fprintf(settings.stdout, "Migration finished with %s: %s\n", record.FailureCode, record.FailureReason)
+				}
+				return exitError{code: 5, err: errors.New(record.FailureReason)}
+			}
 			if !settings.jsonOutput {
 				_, _ = fmt.Fprintf(settings.stdout, "Migration successful. Downtime: %s, transferred: %s, deduplicated: %s.\n", record.Metrics.Downtime.Round(time.Millisecond), humanBytes(record.Metrics.TransferredBytes), humanBytes(record.Metrics.DeduplicatedBytes))
 				if record.Network.Identity.IP != "" {
@@ -969,16 +1248,10 @@ func waitForMigration(ctx context.Context, client *agentclient.Client, settings 
 					_, _ = fmt.Fprintf(settings.stdout, "Network: virtual address %s, %s.\n", record.Network.Identity.IP, sockets)
 				}
 			}
-			if record.FailureCode != "" {
-				return exitError{code: 5, err: errors.New(record.FailureReason)}
-			}
 			return nil
 		case model.MigrationRolledBack, model.MigrationFailed, model.MigrationCancelled:
 			printer.end()
-			if settings.jsonOutput {
-				_ = writeJSON(settings.stdout, record)
-			}
-			return exitError{code: 5, err: fmt.Errorf("record %s: %s", record.Stage, record.FailureReason)}
+			return exitError{code: 5, err: fmt.Errorf("migration %s: %s", record.Stage, record.FailureReason)}
 		}
 		select {
 		case <-ctx.Done():
@@ -1062,12 +1335,17 @@ func printMigration(writer io.Writer, record model.Migration) {
 	_, _ = fmt.Fprintf(writer, "%s %s %.0f%% %s\n", record.ID, record.Stage, progress, message)
 }
 
+var forkSubcommands = []string{"list", "inspect"}
+
 func runFork(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 0 {
 		return usageError("usage: shiftgate fork WORKLOAD [--name NAME] [--root PATH] [--checkpoint ID] [--activate]\n       shiftgate fork list\n       shiftgate fork inspect FORK")
 	}
 	switch arguments[0] {
 	case "list":
+		if err := rejectArgs("fork list", "shiftgate fork list", arguments[1:]); err != nil {
+			return err
+		}
 		records, err := client.Forks(ctx)
 		if err != nil {
 			return operationError(err)
@@ -1083,29 +1361,37 @@ func runFork(ctx context.Context, client *agentclient.Client, settings options, 
 		}
 		return writer.Flush()
 	case "inspect":
-		if len(arguments) < 2 {
+		flags := flagNew("fork inspect")
+		positional, err := parseCommandFlags(flags, arguments[1:])
+		if err != nil {
+			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
 			return usageError("usage: shiftgate fork inspect FORK")
 		}
-		record, err := client.Fork(ctx, arguments[1])
+		record, err := client.Fork(ctx, positional[0])
 		if err != nil {
 			return operationError(err)
 		}
 		return writeJSON(settings.stdout, record)
 	}
-	flags := flag.NewFlagSet("fork", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
+	flags := flagNew("fork")
 	name := flags.String("name", "", "name for the forked workload")
 	root := flags.String("root", "", "root directory for the forked workload")
 	checkpointID := flags.String("checkpoint", "", "fork from this checkpoint instead of the current state")
 	activate := flags.Bool("activate", false, "also restore the forked process tree so both workloads run")
-	timeout := flags.Int("timeout", 1800, "fork timeout in seconds")
-	if err := flags.Parse(arguments[1:]); err != nil {
+	timeout := durationFlag(flags, "timeout", 1800*time.Second, "fork timeout (accepts seconds or durations)")
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
 		return usageError(err.Error())
 	}
-	input := agentclient.ForkRequest{Name: *name, RootPath: *root, CheckpointID: *checkpointID, Activate: *activate, TimeoutSeconds: *timeout}
-	record, err := client.ForkWorkload(ctx, arguments[0], input)
+	if len(positional) != 1 {
+		return usageError("usage: shiftgate fork WORKLOAD [--name NAME] [--root PATH] [--checkpoint ID] [--activate]")
+	}
+	input := agentclient.ForkRequest{Name: *name, RootPath: *root, CheckpointID: *checkpointID, Activate: *activate, TimeoutSeconds: int(timeout.Seconds())}
+	record, err := opClient(client, settings, *timeout).ForkWorkload(ctx, positional[0], input)
 	if err != nil {
-		return operationError(err)
+		return operationError(withSubcommandTypoHint(err, positional[0], forkSubcommands))
 	}
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, record)
@@ -1121,12 +1407,17 @@ func runFork(ctx context.Context, client *agentclient.Client, settings options, 
 	return nil
 }
 
+var cloneSubcommands = []string{"list", "inspect", "rollback"}
+
 func runClone(ctx context.Context, client *agentclient.Client, settings options, arguments []string) error {
 	if len(arguments) == 0 {
-		return usageError("usage: shiftgate clone CHECKPOINT [--count N] [--prefix NAME] [--parallel N] [--timeout SECONDS]\n       shiftgate clone list\n       shiftgate clone inspect CLONE\n       shiftgate clone rollback CLONE")
+		return usageError("usage: shiftgate clone CHECKPOINT [--count N] [--prefix NAME] [--parallel N] [--timeout DURATION] [--wait-ready] [--wait-timeout DURATION]\n       shiftgate clone list\n       shiftgate clone inspect CLONE\n       shiftgate clone rollback CLONE")
 	}
 	switch arguments[0] {
 	case "list":
+		if err := rejectArgs("clone list", "shiftgate clone list", arguments[1:]); err != nil {
+			return err
+		}
 		records, err := client.Clones(ctx)
 		if err != nil {
 			return operationError(err)
@@ -1148,19 +1439,33 @@ func runClone(ctx context.Context, client *agentclient.Client, settings options,
 		}
 		return writer.Flush()
 	case "inspect":
-		if len(arguments) < 2 {
+		flags := flagNew("clone inspect")
+		positional, err := parseCommandFlags(flags, arguments[1:])
+		if err != nil {
+			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
 			return usageError("usage: shiftgate clone inspect CLONE")
 		}
-		record, err := client.Clone(ctx, arguments[1])
+		record, err := client.Clone(ctx, positional[0])
 		if err != nil {
 			return operationError(err)
 		}
 		return writeJSON(settings.stdout, record)
 	case "rollback":
-		if len(arguments) < 2 {
-			return usageError("usage: shiftgate clone rollback CLONE")
+		flags := flagNew("clone rollback")
+		yes := flags.Bool("yes", false, "skip the confirmation prompt")
+		positional, err := parseCommandFlags(flags, arguments[1:])
+		if err != nil {
+			return usageError(err.Error())
 		}
-		record, err := client.CloneRollback(ctx, arguments[1])
+		if len(positional) != 1 {
+			return usageError("usage: shiftgate clone rollback CLONE [--yes]")
+		}
+		if err := confirmDestructive(settings, *yes, fmt.Sprintf("roll back clone set %s and remove its member workloads", positional[0])); err != nil {
+			return err
+		}
+		record, err := client.CloneRollback(ctx, positional[0])
 		if err != nil {
 			return operationError(err)
 		}
@@ -1170,19 +1475,60 @@ func runClone(ctx context.Context, client *agentclient.Client, settings options,
 		_, _ = fmt.Fprintf(settings.stdout, "Clone set %s rolled back: %d workload(s) removed\n", record.ID, record.Count)
 		return nil
 	}
-	flags := flag.NewFlagSet("clone", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
+	flags := flagNew("clone")
 	count := flags.Int("count", 1, "how many clones to derive from the checkpoint (1-128)")
 	prefix := flags.String("prefix", "", "name prefix for the clones (default: derived from the source workload)")
 	parallel := flags.Int("parallel", 4, "how many clones to restore at once (1-16)")
-	timeout := flags.Int("timeout", 3600, "clone timeout in seconds")
-	if err := flags.Parse(arguments[1:]); err != nil {
+	timeout := durationFlag(flags, "timeout", 3600*time.Second, "clone timeout (accepts seconds or durations)")
+	waitReady := flags.Bool("wait-ready", false, "block until every spawned workload passes its health check (or is running), then print per-worker ready latency")
+	waitTimeout := durationFlag(flags, "wait-timeout", 120*time.Second, "how long --wait-ready may block before failing loudly (accepts seconds or durations)")
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
 		return usageError(err.Error())
 	}
-	input := agentclient.CloneRequest{Count: *count, NamePrefix: *prefix, Parallel: *parallel, TimeoutSeconds: *timeout}
-	record, err := client.CloneCheckpoint(ctx, arguments[0], input)
+	if len(positional) != 1 {
+		return usageError("usage: shiftgate clone CHECKPOINT [--count N] [--prefix NAME] [--parallel N] [--wait-ready] [--wait-timeout DURATION]")
+	}
+	if *count < 1 || *count > 128 {
+		return usageError("--count must be between 1 and 128")
+	}
+	if *parallel < 1 || *parallel > 16 {
+		return usageError("--parallel must be between 1 and 16")
+	}
+	input := agentclient.CloneRequest{Count: *count, NamePrefix: *prefix, Parallel: *parallel, TimeoutSeconds: int(timeout.Seconds())}
+	record, err := opClient(client, settings, *timeout).CloneCheckpoint(ctx, positional[0], input)
 	if err != nil {
-		return operationError(err)
+		return operationError(withSubcommandTypoHint(err, positional[0], cloneSubcommands))
+	}
+	if *waitReady {
+		statuses, waitErr := waitCloneReady(ctx, client, record, *waitTimeout)
+		if settings.jsonOutput {
+			payload := map[string]any{"clone": record, "workers": statuses}
+			if waitErr != nil {
+				payload["error"] = waitErr.Error()
+			}
+			_ = writeJSON(settings.stdout, payload)
+		} else {
+			for _, status := range statuses {
+				mark := "ready"
+				if !status.Ready {
+					mark = "NOT READY"
+				}
+				_, _ = fmt.Fprintf(settings.stdout, "  %-28s %-9s %6dms  %s\n", status.Name, mark, status.LatencyMS, status.Detail)
+			}
+		}
+		if waitErr != nil {
+			// Loudly: the clone set stands (originals untouched); the exit
+			// names the workers that never came ready.
+			failed := make([]string, 0)
+			for _, status := range statuses {
+				if !status.Ready {
+					failed = append(failed, status.Name)
+				}
+			}
+			return exitError{code: 1, err: fmt.Errorf("wait-ready: %v (not ready: %s)", waitErr, strings.Join(failed, ", "))}
+		}
+		return nil
 	}
 	if settings.jsonOutput {
 		return writeJSON(settings.stdout, record)
@@ -1197,61 +1543,73 @@ func runClone(ctx context.Context, client *agentclient.Client, settings options,
 	return nil
 }
 
-func printUsage(writer io.Writer) {
-	_, _ = fmt.Fprintln(writer, `Usage: shiftgate [--agent ENDPOINT] [--control-url URL] [--json] COMMAND
-
-Agent commands (local machine):
-  doctor                         Check local migration prerequisites
-  machines                       Show this machine
-  workload create|list|...        Manage workloads
-  checkpoint create|list|mirror|inspect
-                                  Manage checkpoints
-  restore CHECKPOINT              Restore a checkpoint locally
-  fork WORKLOAD|list|inspect      Derive an independent workload from a state
-  clone CHECKPOINT|list|inspect   Derive many independent running workloads
-                                  from one checkpoint at once
-  migrate WORKLOAD --to URL       Move a workload to another machine
-  failover [status]               Show what this machine replicates to standbys
-  standby list|trigger            Manage warm-standby duties and fail over
-  status [MIGRATION]              Show migration status
-  update status|check|apply|rollback|block|unblock
-                                  Manage this machine's updates
-  logs WORKLOAD                   Show workload logs
-  completion bash|zsh|fish        Generate shell completion
-  version                         Print version
-
-Control-plane commands (shiftgate login first; --control-url or SHIFT_CONTROL_URL, empty meaning the platform endpoint):
-  login [--sso]                    Log in and store a session (single sign-on with --sso)
-  logout                          Revoke the session and clear the stored tokens
-  whoami                          Show identity and organizations
-  plans                           Show the public plan catalog
-  storage [--org ID]              Show hosted checkpoint storage status and agent setup
-  fleet machines|workloads|migrations|checkpoints|audit|retention|sso|api-keys|entitlement|usage
-                                  Manage the organization's registry
-  marketplace offers|inventory|place|publish|withdraw|reservations|reserve|commit|release|fail
-                                  Trade compute on the marketplace
-
-With --control-url set, 'machines' and 'workloads' show the fleet view.`)
+// opClient gives one synchronous long operation its own request deadline.
+// The shared client's default (30s) exists for quick commands; a checkpoint,
+// restore, fork, clone, or migration runs for the minutes-to-hours the
+// operation budget allows and must never be cut off client-side while the
+// agent is still working. The client gets the operation budget plus slack so
+// the agent's own timeout fires first.
+func opClient(client *agentclient.Client, settings options, operationTimeout time.Duration) *agentclient.Client {
+	deadline := operationTimeout + 30*time.Second
+	if settings.timeout > deadline {
+		deadline = settings.timeout
+	}
+	return client.WithTimeout(deadline)
 }
 
-func completion(writer io.Writer, arguments []string) error {
-	if len(arguments) != 1 {
-		return usageError("usage: shiftgate completion bash|zsh|fish")
+// withSubcommandTypoHint turns a not-found failure into an actionable one
+// without ever blocking a real name: `shiftgate fork best` forks a workload
+// named "best", and only a genuine not-found on "lst" gets the note that
+// "list" exists. The old pre-dispatch refusal treated every near-miss as a
+// typo and made real workloads unforkable.
+func withSubcommandTypoHint(err error, argument string, valid []string) error {
+	if err == nil {
+		return nil
 	}
-	commands := "doctor machines workloads workload checkpoint restore fork clone migrate failover standby status update logs login logout whoami plans storage fleet marketplace version"
-	switch arguments[0] {
-	case "bash":
-		_, _ = fmt.Fprintf(writer, "complete -W %q shiftgate\n", commands)
-	case "zsh":
-		_, _ = fmt.Fprintf(writer, "#compdef shiftgate\n_arguments '1:command:(%s)'\n", commands)
-	case "fish":
-		for _, command := range strings.Fields(commands) {
-			_, _ = fmt.Fprintf(writer, "complete -c shiftgate -f -n '__fish_use_subcommand' -a %s\n", command)
+	var api *agentclient.APIError
+	if errors.As(err, &api) && (api.Status == http.StatusNotFound || strings.Contains(api.Code, "NOT_FOUND")) {
+		if hint := subcommandTypo(argument, valid); hint != "" {
+			return fmt.Errorf("%w; if %q was meant as a subcommand: %s", err, argument, strings.Join(valid, ", "))
 		}
-	default:
-		return usageError("unsupported shell " + arguments[0])
 	}
-	return nil
+	return err
+}
+
+// subcommandTypo notices an argument that looks like a misspelled subcommand
+// (fork lst, clone roolback) so a not-found error can suggest the fix.
+func subcommandTypo(argument string, valid []string) string {
+	lowered := strings.ToLower(argument)
+	for _, candidate := range valid {
+		if lowered != candidate && editDistance(lowered, candidate) <= 2 {
+			return fmt.Sprintf("%q looks like a misspelling of the %q subcommand; valid: %s", argument, candidate, strings.Join(valid, ", "))
+		}
+	}
+	return ""
+}
+
+// confirmDestructive gates a destructive operation: a terminal gets a y/N
+// prompt, and scripts must say --yes explicitly — a pipeline that deletes
+// workloads should never be one typo away from doing it silently.
+func confirmDestructive(settings options, yes bool, action string) error {
+	if yes {
+		return nil
+	}
+	if !termio.IsTerminal(os.Stdin) {
+		return usageError(fmt.Sprintf("refusing to %s without confirmation; pass --yes to confirm in scripts", action))
+	}
+	_, _ = fmt.Fprintf(settings.stderr, "Really %s? [y/N] ", action)
+	answer, err := termio.ReadLine(os.Stdin)
+	if err != nil {
+		return exitError{code: 3, err: fmt.Errorf("read confirmation: %w", err)}
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return nil
+	}
+	// Declining the prompt is the operator saying "this invocation was not
+	// what I meant" — a usage-level outcome, exit 2, not an environment
+	// failure.
+	return usageError("aborted")
 }
 
 func writeJSON(writer io.Writer, value any) error {
@@ -1277,6 +1635,9 @@ func usageError(message string) error {
 }
 
 func defaultAgentEndpoint() string {
+	if value := os.Getenv("SHIFT_AGENT_ENDPOINT"); value != "" {
+		return value
+	}
 	if value := os.Getenv("SHIFT_AGENT"); value != "" {
 		return value
 	}
@@ -1329,7 +1690,14 @@ func parseBytes(value string) (int64, error) {
 			if err != nil || parsed < 0 {
 				return 0, fmt.Errorf("invalid byte value %q", value)
 			}
-			return int64(parsed * float64(multiplier.value)), nil
+			// The byte count must be a whole number of bytes inside int64:
+			// `1.5B` is a typo, and an overflowing product would wrap into a
+			// negative size — both are usage errors, never garbage.
+			product := parsed * float64(multiplier.value)
+			if product != math.Trunc(product) || product >= math.Exp2(63) {
+				return 0, fmt.Errorf("invalid byte value %q", value)
+			}
+			return int64(product), nil
 		}
 	}
 	parsed, err := strconv.ParseInt(normalized, 10, 64)

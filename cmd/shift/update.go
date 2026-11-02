@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"time"
 
@@ -22,12 +21,18 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 	args := arguments[1:]
 	switch subcommand {
 	case "status":
+		if err := rejectArgs("update status", "shiftgate update status", args); err != nil {
+			return err
+		}
 		status, err := client.UpdateStatus(ctx)
 		if err != nil {
 			return operationError(err)
 		}
 		return printUpdateStatus(settings, status)
 	case "check":
+		if err := rejectArgs("update check", "shiftgate update check", args); err != nil {
+			return err
+		}
 		result, err := client.UpdateCheck(ctx)
 		if err != nil {
 			return operationError(err)
@@ -37,11 +42,14 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 		}
 		return printUpdateEvaluations(settings, result.Evaluations)
 	case "apply":
-		flags := flag.NewFlagSet("update apply", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
+		flags := flagNew("update apply")
 		version := flags.String("version", "", "install this specific release instead of the current selection")
-		if err := flags.Parse(args); err != nil {
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
 			return usageError(err.Error())
+		}
+		if err := rejectArgs("update apply", "shiftgate update apply [--version V]", positional); err != nil {
+			return err
 		}
 		installed, err := client.UpdateApply(ctx, *version)
 		if err != nil {
@@ -53,11 +61,18 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 		_, _ = fmt.Fprintf(settings.stdout, "Installed %s (was %s). Restart the agent service to run it.\n", installed.Version, installed.PreviousVersion)
 		return nil
 	case "rollback":
-		flags := flag.NewFlagSet("update rollback", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
+		flags := flagNew("update rollback")
 		backupID := flags.String("backup", "", "roll back to this preserved binary instead of the most recent")
-		if err := flags.Parse(args); err != nil {
+		yes := flags.Bool("yes", false, "skip the confirmation prompt")
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
 			return usageError(err.Error())
+		}
+		if err := rejectArgs("update rollback", "shiftgate update rollback [--backup ID] [--yes]", positional); err != nil {
+			return err
+		}
+		if err := confirmDestructive(settings, *yes, "roll back the agent binary on this machine"); err != nil {
+			return err
 		}
 		installed, err := client.UpdateRollback(ctx, *backupID)
 		if err != nil {
@@ -69,39 +84,44 @@ func runUpdate(ctx context.Context, client *agentclient.Client, settings options
 		_, _ = fmt.Fprintf(settings.stdout, "Rolled back to %s (was %s). Restart the agent service to run it.\n", installed.Version, installed.PreviousVersion)
 		return nil
 	case "block":
-		if len(args) < 1 {
-			return usageError("usage: shiftgate update block VERSION [--reason TEXT]")
-		}
-		flags := flag.NewFlagSet("update block", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
+		flags := flagNew("update block")
 		reason := flags.String("reason", "", "why this version is refused on this machine")
-		if err := flags.Parse(args[1:]); err != nil {
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
 			return usageError(err.Error())
 		}
-		status, err := client.UpdateBlock(ctx, args[0], *reason)
+		if len(positional) != 1 {
+			return usageError("usage: shiftgate update block VERSION [--reason TEXT]")
+		}
+		status, err := client.UpdateBlock(ctx, positional[0], *reason)
 		if err != nil {
 			return operationError(err)
 		}
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, status)
 		}
-		_, _ = fmt.Fprintf(settings.stdout, "Version %s is blocked on this machine.\n", args[0])
+		_, _ = fmt.Fprintf(settings.stdout, "Version %s is blocked on this machine.\n", positional[0])
 		return nil
 	case "unblock":
-		if len(args) != 1 {
+		flags := flagNew("update unblock")
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
+			return usageError(err.Error())
+		}
+		if len(positional) != 1 {
 			return usageError("usage: shiftgate update unblock VERSION")
 		}
-		status, err := client.UpdateUnblock(ctx, args[0])
+		status, err := client.UpdateUnblock(ctx, positional[0])
 		if err != nil {
 			return operationError(err)
 		}
 		if settings.jsonOutput {
 			return writeJSON(settings.stdout, status)
 		}
-		_, _ = fmt.Fprintf(settings.stdout, "Version %s is allowed again on this machine.\n", args[0])
+		_, _ = fmt.Fprintf(settings.stdout, "Version %s is allowed again on this machine.\n", positional[0])
 		return nil
 	default:
-		return usageError("unknown update subcommand " + subcommand)
+		return unknownSubcommandError("update", subcommand, []string{"status", "check", "apply", "rollback", "block", "unblock"})
 	}
 }
 

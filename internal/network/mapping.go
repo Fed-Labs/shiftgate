@@ -95,7 +95,12 @@ func (table *NATTable) Reserve(workloadID string, mappings []model.PortMapping) 
 	}
 	table.mu.Lock()
 	defer table.mu.Unlock()
+	claimed := make(map[int]string, len(mappings))
 	for _, mapping := range mappings {
+		if previous, clash := claimed[mapping.HostPort]; clash {
+			return fmt.Errorf("host port %d is mapped twice in one reservation (%s and %s)", mapping.HostPort, previous, mapping.String())
+		}
+		claimed[mapping.HostPort] = mapping.String()
 		existing, taken := table.entries[mapping.HostPort]
 		if !taken {
 			continue

@@ -61,8 +61,9 @@ func (store *Store) RevokeAPIKey(ctx context.Context, organizationID, keyID stri
 	return tx.Commit(ctx)
 }
 
-func (store *Store) APIKeys(ctx context.Context, organizationID string) ([]APIKeyRecord, error) {
-	rows, err := store.pool.Query(ctx, `SELECT id,organization_id,user_id,name,prefix,scopes,expires_at,last_used_at,revoked_at,created_at FROM api_keys WHERE organization_id=$1 ORDER BY created_at DESC`, organizationID)
+func (store *Store) APIKeys(ctx context.Context, organizationID string, page Page) ([]APIKeyRecord, error) {
+	query := `SELECT id,organization_id,user_id,name,prefix,scopes,expires_at,last_used_at,revoked_at,created_at FROM api_keys WHERE organization_id=$1 ORDER BY created_at DESC` + page.clause()
+	rows, err := store.pool.Query(ctx, query, organizationID)
 	if err != nil {
 		return nil, err
 	}

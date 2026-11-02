@@ -55,12 +55,20 @@ func (s *Service) applyCheckpointPolicies(ctx context.Context) {
 		}
 		interval := time.Duration(policy.IntervalSeconds) * time.Second
 		checkpointCtx, cancel := context.WithTimeout(ctx, interval)
+		// The policy loop is a background writer that never passes through
+		// guardWrites, so it takes the write guard itself for the whole
+		// checkpoint-and-prune block. The online collector holds the same
+		// guard exclusively while it sweeps; without this a GC run can delete
+		// a chunk between this checkpoint resolving it and installing its
+		// reference — a silently unrestorable checkpoint.
+		s.gcGuard.mu.RLock()
 		manifest, err := s.checkpoints.Create(checkpointCtx, workload.Spec.ID, checkpoint.CreateOptions{
 			LeaveRunning: true,
 			Timeout:      interval,
 		})
 		cancel()
 		if err != nil {
+			s.gcGuard.mu.RUnlock()
 			// The next pass retries; a workload that keeps failing is visible
 			// through its status and the checkpoint diagnostics, not silenced.
 			s.logger.Warn("periodic checkpoint failed",
@@ -73,6 +81,7 @@ func (s *Service) applyCheckpointPolicies(ctx context.Context) {
 		if policy.KeepLast > 0 {
 			s.pruneCheckpoints(workload, policy.KeepLast)
 		}
+		s.gcGuard.mu.RUnlock()
 	}
 }
 

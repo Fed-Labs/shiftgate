@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -134,6 +135,11 @@ type FailoverPolicySpec struct {
 	// AgentURL is the standby agent's peer listener — the same kind of https
 	// URL a migration destination uses.
 	AgentURL string `json:"agent_url"`
+	// FencingProvider controls automatic failover admission. "disabled" and
+	// "self" are explicit non-authorizing modes; "command" requires an
+	// operator-configured external fence integration on the standby.
+	FencingProvider string `json:"fencing_provider,omitempty"`
+	FencingCommand  string `json:"fencing_command,omitempty"`
 	// MachineID optionally pins the standby's identity. When set, replication
 	// refuses to deposit state on a machine whose identity does not match,
 	// so a mistyped address cannot silently land on the wrong host.
@@ -155,6 +161,17 @@ func (p *FailoverPolicySpec) Validate() error {
 	}
 	if p.KeepLast < 0 {
 		return errors.New("failover keep_last cannot be negative")
+	}
+	if p.FencingProvider == "" {
+		p.FencingProvider = "disabled"
+	}
+	switch p.FencingProvider {
+	case "disabled", "self", "command":
+	default:
+		return fmt.Errorf("unsupported failover fencing provider %q", p.FencingProvider)
+	}
+	if p.FencingProvider == "command" && strings.TrimSpace(p.FencingCommand) == "" {
+		return errors.New("command fencing requires fencing_command")
 	}
 	return nil
 }
@@ -225,6 +242,9 @@ func (s *WorkloadSpec) Normalize() error {
 	if !pathWithin(s.RootPath, s.WorkingDir) {
 		return errors.New("working directory must be within the workload root")
 	}
+	if s.UID < 0 || s.GID < 0 {
+		return errors.New("workload uid/gid must not be negative")
+	}
 	if len(s.Paths) == 0 {
 		s.Paths = []PathSpec{{Path: s.RootPath, Mode: PathReadWrite}}
 	}
@@ -241,6 +261,11 @@ func (s *WorkloadSpec) Normalize() error {
 	}
 	if s.NetworkPolicy == "" {
 		s.NetworkPolicy = NetworkReconnect
+	}
+	switch s.NetworkPolicy {
+	case NetworkPreserve, NetworkReconnect, NetworkDrain:
+	default:
+		return fmt.Errorf("network policy must be %q, %q, or %q, got %q", NetworkPreserve, NetworkReconnect, NetworkDrain, s.NetworkPolicy)
 	}
 	if err := s.CheckpointPolicy.Validate(); err != nil {
 		return fmt.Errorf("checkpoint policy: %w", err)
@@ -419,12 +444,10 @@ type NetworkPlan struct {
 
 // virtualNetworkRange is the RFC 6598 carrier-grade NAT space virtual
 // identities are drawn from. It is parsed once at package initialization and
-// never mutated.
+// never mutated; the literal cannot fail to parse, but a failure is surfaced
+// through Validate rather than a panic.
 var virtualNetworkRange = func() *net.IPNet {
-	_, network, err := net.ParseCIDR("100.64.0.0/10")
-	if err != nil {
-		panic("model: " + err.Error())
-	}
+	_, network, _ := net.ParseCIDR("100.64.0.0/10")
 	return network
 }()
 
@@ -435,6 +458,9 @@ func (identity VirtualIdentity) Validate() error {
 	ip := net.ParseIP(identity.IP)
 	if ip == nil || ip.To4() == nil {
 		return fmt.Errorf("virtual network identity %q is not an IPv4 address", identity.IP)
+	}
+	if virtualNetworkRange == nil {
+		return errors.New("virtual network identity range is unavailable")
 	}
 	if !virtualNetworkRange.Contains(ip) {
 		return fmt.Errorf("virtual network identity %q is outside the %s range", identity.IP, virtualNetworkRange)
@@ -677,6 +703,53 @@ type CheckpointManifest struct {
 	CompatibilityID string               `json:"compatibility_id"`
 }
 
+// Public returns the projection of a checkpoint manifest that may leave the
+// data plane. Plaintext environment values, command arguments, declared
+// paths, health-check details, and unkeyed plaintext chunk digests are
+// removed: environment values routinely hold credentials, plaintext digests
+// let an offline adversary confirm guessed file contents, and the control
+// plane is metadata-only and untrusted. The keyed chunk addresses, sizes,
+// signer identity, engine and machine facts, and asset structure that
+// placement needs all survive.
+func (m CheckpointManifest) Public() CheckpointManifest {
+	out := m
+	out.Workload = m.Workload.Public()
+	out.Assets = make([]AssetManifest, len(m.Assets))
+	for i, asset := range m.Assets {
+		out.Assets[i] = asset
+		if len(asset.Chunks) > 0 {
+			chunks := make([]ChunkRef, len(asset.Chunks))
+			copy(chunks, asset.Chunks)
+			for j := range chunks {
+				chunks[j].PlainSHA256 = ""
+			}
+			out.Assets[i].Chunks = chunks
+		}
+	}
+	return out
+}
+
+// Public returns the workload projection safe for egress: environment
+// variables and paths are dropped, command arguments after the program name
+// are redacted, and health-check details are dropped. The workload identity,
+// root path, uid/gid, ports, resources, and policies placement reasons about
+// are kept.
+func (s WorkloadSpec) Public() WorkloadSpec {
+	out := s
+	out.Environment = nil
+	out.Paths = nil
+	out.HealthCheck = nil
+	if len(s.Command) > 0 {
+		command := make([]string, len(s.Command))
+		copy(command, s.Command)
+		for i := 1; i < len(command); i++ {
+			command[i] = "<redacted>"
+		}
+		out.Command = command
+	}
+	return out
+}
+
 type CompatibilityIssue struct {
 	Code        string `json:"code"`
 	Severity    string `json:"severity"`
@@ -684,7 +757,6 @@ type CompatibilityIssue struct {
 	Description string `json:"description"`
 	Adaptation  string `json:"adaptation,omitempty"`
 }
-
 type CompatibilityReport struct {
 	Compatible bool                 `json:"compatible"`
 	Issues     []CompatibilityIssue `json:"issues"`
@@ -737,8 +809,11 @@ var migrationTransitions = map[MigrationStage]map[MigrationStage]bool{
 	MigrationSwitch:       {MigrationCommit: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
 	MigrationCommit:       {MigrationCleanup: true, MigrationRollingBack: true, MigrationFailed: true, MigrationCancelled: true},
 	MigrationCleanup:      {MigrationCompleted: true, MigrationFailed: true, MigrationCancelled: true},
-	MigrationFailed:       {MigrationRollingBack: true},
-	MigrationRollingBack:  {MigrationRolledBack: true, MigrationFailed: true, MigrationCancelled: true},
+	// FAILED is terminal. A settled failure keeps its original failure code
+	// and reason; agent restarts and recovery passes observe it, never
+	// re-roll it back or rewrite its cause.
+	MigrationFailed:      {},
+	MigrationRollingBack: {MigrationRolledBack: true, MigrationFailed: true, MigrationCancelled: true},
 }
 
 func CanTransition(from, to MigrationStage) bool {
@@ -753,9 +828,12 @@ const (
 )
 
 type Destination struct {
-	MachineID  string `json:"machine_id"`
-	AgentURL   string `json:"agent_url"`
-	ServerName string `json:"server_name,omitempty"`
+	MachineID     string `json:"machine_id"`
+	AgentURL      string `json:"agent_url"`
+	ServerName    string `json:"server_name,omitempty"`
+	Route         string `json:"route,omitempty"`
+	RelayEndpoint string `json:"relay_endpoint,omitempty"`
+	RelayTicket   string `json:"relay_ticket,omitempty"`
 }
 
 type MigrationMetrics struct {
@@ -785,7 +863,10 @@ type MigrationEvent struct {
 }
 
 type Migration struct {
-	ID              string        `json:"id"`
+	ID string `json:"id"`
+	// IdempotencyKey lets a coordinator retry creation after a transport or
+	// control-plane restart without starting a second data-plane migration.
+	IdempotencyKey  string        `json:"idempotency_key,omitempty"`
 	WorkloadID      string        `json:"workload_id"`
 	CheckpointID    string        `json:"checkpoint_id,omitempty"`
 	SourceMachineID string        `json:"source_machine_id"`
@@ -823,7 +904,7 @@ func (m *Migration) Transition(to MigrationStage, message string, progress float
 		Timestamp: m.UpdatedAt,
 		Progress:  progress,
 	})
-	if to == MigrationCompleted || to == MigrationRolledBack || to == MigrationCancelled {
+	if to == MigrationCompleted || to == MigrationRolledBack || to == MigrationCancelled || to == MigrationFailed {
 		completed := m.UpdatedAt
 		m.CompletedAt = &completed
 	}
@@ -848,6 +929,10 @@ type StandbyDuty struct {
 	WorkloadName     string    `json:"workload_name,omitempty"`
 	WorkloadUID      int       `json:"workload_uid,omitempty"`
 	SourceMachineID  string    `json:"source_machine_id"`
+	OwnershipEpoch   uint64    `json:"ownership_epoch,omitempty"`
+	OwnershipToken   string    `json:"ownership_token,omitempty"`
+	FencingProvider  string    `json:"fencing_provider,omitempty"`
+	FenceResult      string    `json:"fence_result,omitempty"`
 	SourceAgentURL   string    `json:"source_agent_url,omitempty"`
 	KeepLast         int       `json:"keep_last,omitempty"`
 	LastCheckpointID string    `json:"last_checkpoint_id"`
@@ -888,4 +973,35 @@ type ErrorResponse struct {
 	Message   string `json:"message"`
 	RequestID string `json:"request_id,omitempty"`
 	Details   any    `json:"details,omitempty"`
+}
+
+// HeartbeatResponse carries the protocol truths the control plane reports on
+// every machine heartbeat, alongside the machine record itself. These fields
+// are the serialized contract between the two sides: a field written here and
+// never parsed is a silent contract loss, so both halves live in one type.
+type HeartbeatResponse struct {
+	// LiveMigrationAllowed is the organization's live-migration entitlement
+	// for this machine, computed from its plan and subscription state. A
+	// managed agent must treat it as the authoritative answer for its live
+	// mode admission gate — never a local configuration assertion.
+	LiveMigrationAllowed bool `json:"live_migration_allowed"`
+}
+
+// AgentCommandPayloadVersion is the schema version stamped into agent-command
+// payloads. A receiver that does not understand the version refuses the
+// payload (and the command is redelivered) instead of mis-executing it during
+// a mixed-version window.
+const AgentCommandPayloadVersion = 1
+
+// AgentCommand is the wire envelope for a control-plane command delivered to
+// an agent over the command channel. PayloadVersion names the schema of
+// Payload so an old agent and a new control plane can negotiate instead of
+// dying on an unknown field.
+type AgentCommand struct {
+	ID             string          `json:"id"`
+	Action         string          `json:"action"`
+	Payload        json.RawMessage `json:"payload"`
+	PayloadVersion int             `json:"payload_version,omitempty"`
+	ClaimToken     string          `json:"claim_token,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
 }

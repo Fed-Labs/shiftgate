@@ -502,6 +502,124 @@ func TestManagerRunStopsWithItsContext(t *testing.T) {
 	}
 }
 
+// TestManagerMandatoryPolicyNeverSkipsAMandatoryRelease is the regression for
+// the silent skip: a mandatory security fix sitting behind a newer optional
+// release must still land. The old selection took the newest applicable
+// release, saw it was not mandatory, and returned — never installing the
+// mandatory one, on this check or any later check.
+func TestManagerMandatoryPolicyNeverSkipsAMandatoryRelease(t *testing.T) {
+	fixture := newManagerFixture(t, "0.2.0", PolicyMandatory, nil)
+	mandatoryPayload := versionScript("shift-agent", "0.2.1")
+	fixture.publish(t, "0.2.1", mandatoryPayload, func(release *Release) { release.Mandatory = true })
+	fixture.publish(t, "0.3.0", versionScript("shift-agent", "0.3.0"), nil)
+
+	fixture.manager.runOnce(context.Background())
+	if fixture.installer.installed(t) != string(mandatoryPayload) {
+		t.Fatal("the mandatory release behind a newer optional one must be installed")
+	}
+	status := fixture.manager.Status()
+	if status.PendingVersion != "0.2.1" {
+		t.Fatalf("the mandatory release must be the pending version, got %q", status.PendingVersion)
+	}
+}
+
+// With nothing mandatory applicable the mandatory policy still leaves optional
+// releases alone — the fix must not silently become an automatic policy.
+func TestManagerMandatoryPolicyStillIgnoresOptionalReleases(t *testing.T) {
+	fixture := newManagerFixture(t, "0.2.0", PolicyMandatory, nil)
+	fixture.publish(t, "0.3.0", versionScript("shift-agent", "0.3.0"), nil)
+	fixture.manager.runOnce(context.Background())
+	if fixture.installer.fetcher.calls != 0 {
+		t.Fatal("a mandatory-only policy must not apply an optional release")
+	}
+}
+
+// TestManagerTransientInstallFailureDoesNotBlockTheRelease: a network blip or
+// disk hiccup says nothing about the release — it must be recorded as a
+// retryable failure and the release must remain installable on the next check,
+// not burned into the local block list.
+func TestManagerTransientInstallFailureDoesNotBlockTheRelease(t *testing.T) {
+	fixture := newManagerFixture(t, "1.0.0", PolicyAutomatic, nil)
+	payload := versionScript("shift-agent", "1.1.0")
+	fixture.publish(t, "1.1.0", payload, nil)
+	fixture.installer.fetcher.failWith = errors.New("connection reset by peer")
+
+	if _, err := fixture.manager.Apply(context.Background(), ""); err == nil {
+		t.Fatal("a failed fetch must fail the apply")
+	}
+	status := fixture.manager.Status()
+	if len(status.Blocked) != 0 {
+		t.Fatalf("a transient failure must never block the release, got %+v", status.Blocked)
+	}
+	if !containsKind(status, EventFailed) {
+		t.Fatalf("the failure must be recorded, got %v", historyKinds(status))
+	}
+
+	fixture.installer.fetcher.failWith = nil
+	if _, err := fixture.manager.Apply(context.Background(), ""); err != nil {
+		t.Fatalf("the same release must install once the transport recovers: %v", err)
+	}
+	if fixture.installer.installed(t) != string(payload) {
+		t.Fatal("the retried release is not on disk")
+	}
+}
+
+// A deterministic failure — the delivered bytes are not what the signed
+// release promised — still blocks the version locally, which is the block
+// list's job.
+func TestManagerDeterministicInstallFailureBlocksTheRelease(t *testing.T) {
+	fixture := newManagerFixture(t, "1.0.0", PolicyAutomatic, nil)
+	promised := versionScript("shift-agent", "1.1.0")
+	substituted := versionScript("shift-agent", "1.1.9")
+	if len(promised) != len(substituted) {
+		t.Fatal("the test payloads must be the same length so the digest is what fails")
+	}
+	url := "https://releases.example/agent-1.1.0"
+	artifact := binaryArtifact(ComponentAgent, url, promised)
+	fixture.installer.fetcher.add(url, substituted)
+	release := releaseFor("1.1.0", artifact)
+	signed, err := fixture.signer.SignRelease(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.feed.Releases = append(fixture.feed.Releases, signed)
+
+	if _, err := fixture.manager.Apply(context.Background(), ""); err == nil {
+		t.Fatal("a substituted download must fail the apply")
+	}
+	status := fixture.manager.Status()
+	if len(status.Blocked) != 1 {
+		t.Fatalf("a deterministic failure must block the release locally, got %+v", status.Blocked)
+	}
+}
+
+// TestManagerRefusesDowngrades: an older signed release in the feed — the
+// classic downgrade attack — is never selected and never installs, and an
+// explicit request for it is refused too. Rollbacks remain the only sanctioned
+// way back and they run through preserved backups, not the feed.
+func TestManagerRefusesDowngrades(t *testing.T) {
+	fixture := newManagerFixture(t, "1.2.0", PolicyAutomatic, nil)
+	fixture.publish(t, "1.1.0", versionScript("shift-agent", "1.1.0"), func(release *Release) { release.Mandatory = true })
+
+	result, err := fixture.manager.Check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Available != nil {
+		t.Fatalf("an older release must never be selected, got %+v", result.Available)
+	}
+	fixture.manager.runOnce(context.Background())
+	if fixture.installer.fetcher.calls != 0 {
+		t.Fatal("the automatic loop must not install a downgrade")
+	}
+	if _, err := fixture.manager.Apply(context.Background(), "1.1.0"); err == nil {
+		t.Fatal("an explicit downgrade request must be refused without an allow-downgrade installation")
+	}
+	if fixture.installer.installed(t) != string(versionScript("shift-agent", "1.2.0")) {
+		t.Fatal("the running binary must be untouched")
+	}
+}
+
 // readState and writeState read and rewrite the persisted state file directly, so
 // a test can check what was stored and simulate a corrupted or foreign file.
 func readState(path string, into *State) error {

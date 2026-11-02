@@ -79,6 +79,10 @@ func (p *fakePeer) Get(context.Context, string) (transfer.Session, error) {
 	return transfer.Session{}, errors.New("preflight never reads sessions")
 }
 
+func (p *fakePeer) GetForCleanup(context.Context, string) (transfer.Session, error) {
+	return transfer.Session{}, errors.New("preflight never reads sessions")
+}
+
 // preflightOrchestrator builds a real orchestrator around one running
 // workload and a client factory the test controls.
 func preflightOrchestrator(t *testing.T, clients ClientFactory) (*Orchestrator, model.Workload, *identity.Identity) {
@@ -234,5 +238,66 @@ func TestPreflight(t *testing.T) {
 
 	if migrations := orchestrator.List(); len(migrations) != 0 {
 		t.Fatalf("a dry run must never create migration records, got %d", len(migrations))
+	}
+}
+
+// TestPreflightRejectsWhatCreateRejects: a dry run must refuse what Create
+// refuses — an in-flight migration for the same workload, and a reused
+// idempotency key with different parameters — so a green preflight can never
+// promise admission the real request would reject. An identical same-key
+// replay stays admissible: Create answers it with the existing record.
+func TestPreflightRejectsWhatCreateRejects(t *testing.T) {
+	inventory := linuxplatform.NewInventory("source-machine")
+	source, err := inventory.Inspect(context.Background())
+	if err != nil {
+		t.Fatalf("inspect source: %v", err)
+	}
+	peer := &fakePeer{profile: destinationLike(source, "destination-machine")}
+	orchestrator, workload, _ := preflightOrchestrator(t, func(model.Destination) (PeerClient, error) {
+		return peer, nil
+	})
+	request := CreateRequest{
+		WorkloadID:  workload.Spec.ID,
+		Destination: model.Destination{AgentURL: "https://destination.example:8443"},
+	}
+
+	now := time.Now().UTC()
+	if err := orchestrator.records.Put("mig-active", model.Migration{
+		ID: "mig-active", WorkloadID: workload.Spec.ID, Stage: model.MigrationTransfer,
+		CreatedAt: now, UpdatedAt: now, Revision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.Preflight(context.Background(), request); !errors.Is(err, ErrMigrationAlreadyActive) {
+		t.Fatalf("preflight must refuse a workload with a migration in flight, got %v", err)
+	}
+	if err := orchestrator.records.Delete("mig-active"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := orchestrator.records.Put("mig-key", model.Migration{
+		ID: "mig-key", IdempotencyKey: "key-1", WorkloadID: workload.Spec.ID,
+		Destination: model.Destination{AgentURL: "https://destination.example:8443", ServerName: "destination.example", MachineID: "destination-machine"},
+		Mode:        model.MigrationCold, Stage: model.MigrationCompleted,
+		CreatedAt: now, UpdatedAt: now, Revision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = orchestrator.Preflight(context.Background(), CreateRequest{
+		WorkloadID: workload.Spec.ID, IdempotencyKey: "key-1",
+		Destination: model.Destination{AgentURL: "https://destination.example:8443", MachineID: "someone-else"},
+		Mode:        model.MigrationCold,
+	})
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("preflight must surface the idempotency conflict Create would reject, got %v", err)
+	}
+	// The identical replay (machine_id left empty, as the run fills it) is
+	// not a conflict and not an active-migration refusal.
+	if _, err := orchestrator.Preflight(context.Background(), CreateRequest{
+		WorkloadID: workload.Spec.ID, IdempotencyKey: "key-1",
+		Destination: model.Destination{AgentURL: "https://destination.example:8443"},
+		Mode:        model.MigrationCold,
+	}); err != nil {
+		t.Fatalf("an identical same-key replay must stay admissible in preflight, got %v", err)
 	}
 }

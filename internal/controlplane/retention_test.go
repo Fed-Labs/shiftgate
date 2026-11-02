@@ -65,11 +65,20 @@ func TestRetentionPolicyRoutes(t *testing.T) {
 		t.Fatalf("unexpected default policy: %+v", policy)
 	}
 
-	// A partial update names one window; the others keep their value.
-	days := 60
-	expectStatus(t, client, http.MethodPut, organizationPath+"/retention", http.StatusOK, authHeader, SetRetentionPolicyRequest{AuditRetentionDays: &days})
+	// Creating a policy names every window explicitly: a partial first write
+	// would silently persist the displayed defaults — arming 90-day checkpoint
+	// deletion off one unrelated knob. A later partial update names one
+	// window; the others keep their stored value.
+	auditDays, checkpointDays, deletedStorageDays := 60, 90, 30
+	expectStatus(t, client, http.MethodPut, organizationPath+"/retention", http.StatusOK, authHeader, SetRetentionPolicyRequest{AuditRetentionDays: &auditDays, CheckpointRetentionDays: &checkpointDays, DeletedStorageRetentionDays: &deletedStorageDays})
 	getJSON(t, client, organizationPath+"/retention", http.StatusOK, &policy, authHeader)
 	if policy.AuditRetentionDays != 60 || policy.CheckpointRetentionDays != 90 || policy.DeletedStorageRetentionDays != 30 {
+		t.Fatalf("explicit create did not round-trip: %+v", policy)
+	}
+	days := 55
+	expectStatus(t, client, http.MethodPut, organizationPath+"/retention", http.StatusOK, authHeader, SetRetentionPolicyRequest{AuditRetentionDays: &days})
+	getJSON(t, client, organizationPath+"/retention", http.StatusOK, &policy, authHeader)
+	if policy.AuditRetentionDays != 55 || policy.CheckpointRetentionDays != 90 || policy.DeletedStorageRetentionDays != 30 {
 		t.Fatalf("partial update did not leave unnamed windows alone: %+v", policy)
 	}
 

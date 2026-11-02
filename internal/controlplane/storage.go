@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -43,10 +44,15 @@ type storageService struct {
 
 // newStorageService builds the broker for a validated storage configuration.
 // It returns nil (not an error) when hosting is disabled — every caller treats
-// nil as "not configured", which is the stable external contract.
+// nil as "not configured", which is the stable external contract. The
+// credential TTL is validated here so a misconfigured lifetime fails at
+// startup instead of at the first agent's credential request.
 func newStorageService(configuration config.StorageConfig) (*storageService, error) {
 	if !configuration.Enabled {
 		return nil, nil
+	}
+	if configuration.CredentialTTL < time.Minute || configuration.CredentialTTL > 7*24*time.Hour {
+		return nil, fmt.Errorf("storage credential_ttl must be between one minute and seven days, got %s", configuration.CredentialTTL)
 	}
 	lister, err := objectstore.OpenS3(objectstore.S3Config{
 		Endpoint:        configuration.Endpoint,
@@ -78,27 +84,57 @@ func newStorageService(configuration config.StorageConfig) (*storageService, err
 }
 
 // storagePrefix is the key prefix one organization's mirrored objects live
-// under, without the trailing slash ("org/org_123").
-func storagePrefix(organizationID string) string {
-	return "org/" + organizationID
+// under, without the trailing slash ("org/org_123"). The organization ID is
+// validated rather than trusted: the prefix is interpolated into the session
+// policy's Resource ARN and its s3:prefix glob conditions, so a `*`, `?`, or
+// `/` in an ID would broaden the credential across organizations. IDs are
+// UUIDs today, but this is where the invariant is enforced — anything outside
+// [A-Za-z0-9_-] is refused before any policy is built.
+func storagePrefix(organizationID string) (string, error) {
+	if organizationID == "" || len(organizationID) > 128 {
+		return "", ErrInvalidStorageOrganization
+	}
+	for _, character := range organizationID {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '_' || character == '-' {
+			continue
+		}
+		return "", ErrInvalidStorageOrganization
+	}
+	return "org/" + organizationID, nil
 }
+
+// ErrInvalidStorageOrganization reports an organization ID that cannot safely
+// be embedded in a storage prefix or session policy.
+var ErrInvalidStorageOrganization = errors.New("organization id contains characters unsafe for a storage prefix")
 
 // sessionPolicy is the inline policy stamped onto every credential this broker
 // mints: object reads, writes, deletes, and multipart operations restricted to
 // the organization's own prefix, and bucket listings that can only see that
 // prefix. Marshaling a map keeps the keys sorted, so the policy is stable and
-// comparable across issuances.
-func (service *storageService) sessionPolicy(organizationID string) string {
-	prefix := storagePrefix(organizationID)
+// comparable across issuances. When allowWrites is false the policy omits
+// s3:PutObject — the over-quota contract: an organization past its storage
+// entitlement still gets read and delete capability (restores keep working,
+// and deleting objects is the way back under quota) while every write is
+// refused by the credential itself. s3:PutObject is also what covers
+// CreateMultipartUpload and UploadPart, so the reduced policy blocks every
+// write path, including multipart. The empty string means the organization ID
+// was refused and no credential may be minted.
+func (service *storageService) sessionPolicy(organizationID string, allowWrites bool) string {
+	prefix, err := storagePrefix(organizationID)
+	if err != nil {
+		return ""
+	}
+	objectActions := []string{"s3:GetObject", "s3:DeleteObject", "s3:ListMultipartUploadParts", "s3:AbortMultipartUpload"}
+	if allowWrites {
+		objectActions = append(objectActions, "s3:PutObject")
+	}
 	policy := map[string]any{
 		"Version": "2012-10-17",
 		"Statement": []map[string]any{
 			{
-				"Effect": "Allow",
-				"Action": []string{
-					"s3:GetObject", "s3:PutObject", "s3:DeleteObject",
-					"s3:ListMultipartUploadParts", "s3:AbortMultipartUpload",
-				},
+				"Effect":   "Allow",
+				"Action":   objectActions,
 				"Resource": []string{fmt.Sprintf("arn:aws:s3:::%s/%s/*", service.configuration.Bucket, prefix)},
 			},
 			{
@@ -133,8 +169,12 @@ func (service *storageService) snapshot(organizationID string) (storageUsageSnap
 // caches the snapshot. It does not write the database; the caller decides
 // whether this is a background pass or a synchronous status refresh.
 func (service *storageService) reconcileOrganization(ctx context.Context, organizationID string) (storageUsageSnapshot, error) {
+	prefix, err := storagePrefix(organizationID)
+	if err != nil {
+		return storageUsageSnapshot{}, err
+	}
 	var total int64
-	err := service.lister.ListPrefix(ctx, storagePrefix(organizationID)+"/", func(info objectstore.ObjectInfo) error {
+	err = service.lister.ListPrefix(ctx, prefix+"/", func(info objectstore.ObjectInfo) error {
 		total += info.Size
 		return nil
 	})
@@ -202,7 +242,9 @@ func (server *Server) startStorageReconciler(ctx context.Context) {
 		return
 	}
 	interval := server.storage.configuration.ReconcileInterval
+	server.backgroundWg.Add(1)
 	go func() {
+		defer server.backgroundWg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {

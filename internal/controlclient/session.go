@@ -107,11 +107,15 @@ func (session *Session) Logout(ctx context.Context) error {
 
 // call is the shape every authenticated method funnels through.
 func (session *Session) call(ctx context.Context, method, requestPath string, input, output any) error {
+	return session.callWithHeaders(ctx, method, requestPath, input, output, nil)
+}
+
+func (session *Session) callWithHeaders(ctx context.Context, method, requestPath string, input, output any, headers map[string]string) error {
 	accessToken, err := session.token(ctx)
 	if err != nil {
 		return err
 	}
-	err = session.client.do(ctx, method, requestPath, accessToken, input, output)
+	err = session.client.doWithHeaders(ctx, method, requestPath, accessToken, input, output, headers)
 	if err == nil {
 		return nil
 	}
@@ -130,7 +134,7 @@ func (session *Session) call(ctx context.Context, method, requestPath string, in
 		if saveErr := session.store.Save(session.current); saveErr != nil {
 			return saveErr
 		}
-		return session.client.do(ctx, method, requestPath, refreshed.AccessToken, input, output)
+		return session.client.doWithHeaders(ctx, method, requestPath, refreshed.AccessToken, input, output, headers)
 	}
 	return err
 }

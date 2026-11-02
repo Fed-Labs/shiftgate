@@ -41,11 +41,22 @@ func CloneFile(source, destination string) (cloned bool, err error) {
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, output.Fd(), ficlone, input.Fd())
 	switch errno {
 	case 0:
-		return true, output.Chmod(info.Mode().Perm())
+		if err := output.Chmod(info.Mode().Perm()); err != nil {
+			return false, err
+		}
+		if err := output.Sync(); err != nil {
+			return false, err
+		}
+		syncParentDir(destination)
+		return true, nil
 	case syscall.ENOTSUP, syscall.EINVAL, syscall.EXDEV, syscall.EPERM:
 		// The filesystem cannot share extents. The destination was created
 		// empty by the open above, so a plain copy reproduces the file.
 		if _, err = io.Copy(output, input); err != nil {
+			// A partial copy is worse than none: the caller assumes the
+			// destination is either absent or complete.
+			_ = output.Close()
+			_ = os.Remove(destination)
 			return false, err
 		}
 		if err := output.Chmod(info.Mode().Perm()); err != nil {
@@ -54,9 +65,21 @@ func CloneFile(source, destination string) (cloned bool, err error) {
 		if err := output.Sync(); err != nil {
 			return false, err
 		}
+		syncParentDir(destination)
 		return false, nil
 	default:
 		return false, errno
+	}
+}
+
+// syncParentDir flushes the directory entry that names a just-written file,
+// so the copy cannot survive a crash without its name (or vice versa). It is
+// best-effort: the file's own Sync is the durability barrier, and a directory
+// that refuses sync is a filesystem limitation, not a copy failure.
+func syncParentDir(path string) {
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 }
 

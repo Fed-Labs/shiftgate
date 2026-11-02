@@ -231,3 +231,82 @@ func TestNewDefaultsToThePlatformControlPlane(t *testing.T) {
 		t.Fatal("expected an error for a URL without a scheme")
 	}
 }
+
+// TestMachineHeartbeatParsesTheEntitlementField pins the heartbeat response
+// contract: live_migration_allowed is written by the control plane on every
+// heartbeat and must survive parsing on this side — a serialized-never-parsed
+// field is a silent licensing-contract loss (reports 41/50).
+func TestMachineHeartbeatParsesTheEntitlementField(t *testing.T) {
+	newSession := func(t *testing.T, roundTrip roundTripFunc) *Session {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "cli-session.json")
+		store, err := OpenTokenStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Save(StoredSession{
+			ControlPlaneURL: "http://control-plane",
+			AccessToken:     "shift_at_1",
+			Email:           "operator@example.com",
+			ExpiresAt:       time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		current, err := store.Load("http://control-plane")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &Session{client: testClient(roundTrip), store: store, current: current}
+	}
+	session := newSession(t, func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/v1/organizations/org-1/machines/machine-1/heartbeat" {
+			return nil, fmt.Errorf("unexpected path %s", request.URL.Path)
+		}
+		return testResponse(http.StatusOK, map[string]any{
+			"id": "row-1", "organization_id": "org-1", "machine_id": "machine-1",
+			"name": "worker", "agent_url": "https://worker.example.com:8443",
+			"capabilities": map[string]any{}, "status": "online",
+			"created_at": time.Now().UTC(), "updated_at": time.Now().UTC(),
+			"live_migration_allowed": true,
+		}), nil
+	})
+	result, err := session.MachineHeartbeat(context.Background(), "org-1", "machine-1", MachineHeartbeatInput{Name: "worker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Machine.MachineID != "machine-1" || result.Machine.Name != "worker" {
+		t.Fatalf("machine record did not parse: %+v", result.Machine)
+	}
+	if !result.LiveMigrationAllowed {
+		t.Fatalf("live_migration_allowed did not parse: %+v", result.HeartbeatResponse)
+	}
+
+	// And the negative: a cold-only organization reports false, which must
+	// parse as false — never as the zero value of a dropped field.
+	session = newSession(t, func(request *http.Request) (*http.Response, error) {
+		return testResponse(http.StatusOK, map[string]any{
+			"machine_id": "machine-1", "live_migration_allowed": false,
+		}), nil
+	})
+	result, err = session.MachineHeartbeat(context.Background(), "org-1", "machine-1", MachineHeartbeatInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.LiveMigrationAllowed {
+		t.Fatal("a cold-only heartbeat parsed as live-capable")
+	}
+}
+
+// TestMigrationJobCarriesTheRelayFields: the create response can carry the
+// relay route setup a Go embedder needs to observe the flow; dropping the
+// fields would silently lose the one-use ticket.
+func TestMigrationJobCarriesTheRelayFields(t *testing.T) {
+	var job MigrationJob
+	payload := []byte(`{"id":"m-1","mode":"live","route":"relay","relay_endpoint":"https://relay.example.com","relay_ticket":"one-use-ticket","status":"queued"}`)
+	if err := json.Unmarshal(payload, &job); err != nil {
+		t.Fatal(err)
+	}
+	if job.Route != "relay" || job.RelayEndpoint != "https://relay.example.com" || job.RelayTicket != "one-use-ticket" {
+		t.Fatalf("relay fields did not parse: %+v", job)
+	}
+}

@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -12,8 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"shift.dev/shift/internal/billing"
 	"shift.dev/shift/internal/checkpoint"
 	"shift.dev/shift/internal/config"
+	"shift.dev/shift/internal/gc"
 	"shift.dev/shift/internal/migration"
 	"shift.dev/shift/internal/model"
 	"shift.dev/shift/internal/network"
@@ -21,6 +25,32 @@ import (
 )
 
 const localBodyLimit = int64(4 << 20)
+
+// maxRequestSeconds bounds every caller-supplied seconds-to-duration field
+// (timeouts, grace periods): converting an absurd value would wrap the
+// multiplication and silently become a different deadline than the caller
+// asked for. Zero keeps its per-route meaning of "the default".
+const maxRequestSeconds = 86400
+
+const (
+	// maxLogTailLines and maxLogTailBytes together bound what one logs
+	// request may buffer: a tail of 5000 lines of multi-megabyte log lines
+	// must not turn a small HTTP request into gigabytes of agent-side
+	// allocation. Lines are dropped from the front as either cap is reached —
+	// the end of the log is what a tail is for.
+	maxLogTailLines = 5000
+	maxLogTailBytes = 8 << 20
+	maxLogLineBytes = 4 << 20
+)
+
+// Admission failures distinguishable from the plain authorization refusal so
+// the create handler can answer with the contract's status and code for each.
+var (
+	errWorkloadIDInvalid    = errors.New("workload id is not valid")
+	errWorkloadIDConflict   = errors.New("workload id already exists")
+	errWorkloadNameConflict = errors.New("workload name already exists")
+	errWorkloadRootInvalid  = errors.New("workload root is not valid")
+)
 
 type healthResponse struct {
 	Status    string    `json:"status"`
@@ -121,8 +151,20 @@ type cloneRequest struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
+type gcRequest struct {
+	GraceSeconds int  `json:"grace_seconds,omitempty"`
+	DryRun       bool `json:"dry_run"`
+}
+
+type gcResponse struct {
+	Plan    gc.Plan `json:"plan"`
+	Deleted int     `json:"deleted"`
+	Skipped int     `json:"skipped"`
+}
+
 type migrateRequest struct {
 	WorkloadID     string              `json:"workload_id"`
+	IdempotencyKey string              `json:"idempotency_key,omitempty"`
 	Destination    model.Destination   `json:"destination"`
 	Mode           model.MigrationMode `json:"mode,omitempty"`
 	PreCopyPasses  int                 `json:"pre_copy_passes,omitempty"`
@@ -135,6 +177,7 @@ func (s *Service) localHandler() http.Handler {
 	mux.HandleFunc("GET /v1/machine", s.handleMachine)
 	mux.HandleFunc("GET /v1/identity", s.handleIdentity)
 	mux.HandleFunc("GET /v1/doctor", s.handleDoctor)
+	mux.HandleFunc("POST /v1/gc", s.handleGC)
 	mux.Handle("GET /metrics", s.metrics.Handler())
 	mux.HandleFunc("GET /v1/workloads", s.handleWorkloadList)
 	mux.HandleFunc("POST /v1/workloads", s.handleWorkloadCreate)
@@ -270,10 +313,25 @@ func (s *Service) handleWorkloadCreate(writer http.ResponseWriter, request *http
 		return
 	}
 	caller, _ := s.caller(request)
-	if err := authorizeNewSpec(&spec, caller); err != nil {
-		writeAPIError(writer, http.StatusForbidden, "WORKLOAD_FORBIDDEN", err.Error())
+	if err := s.authorizeNewSpec(&spec, caller); err != nil {
+		status, code := http.StatusForbidden, "WORKLOAD_FORBIDDEN"
+		switch {
+		case errors.Is(err, errWorkloadIDConflict):
+			status, code = http.StatusConflict, "WORKLOAD_ID_CONFLICT"
+		case errors.Is(err, errWorkloadNameConflict):
+			status, code = http.StatusConflict, "WORKLOAD_NAME_CONFLICT"
+		case errors.Is(err, errWorkloadIDInvalid):
+			status, code = http.StatusUnprocessableEntity, "WORKLOAD_ID_INVALID"
+		case errors.Is(err, errWorkloadRootInvalid):
+			status, code = http.StatusUnprocessableEntity, "WORKLOAD_ROOT_INVALID"
+		}
+		writeAPIError(writer, status, code, err.Error())
 		return
 	}
+	// The record's timestamp is the agent's, never the caller's: the policy
+	// scheduler measures intervals from it, so a caller-set created_at could
+	// force an immediate periodic checkpoint or suppress scheduling.
+	spec.CreatedAt = time.Now().UTC()
 	workload, err := s.runtime.Create(spec)
 	if err != nil {
 		writeAPIError(writer, http.StatusBadRequest, "WORKLOAD_CREATE_FAILED", err.Error())
@@ -295,15 +353,20 @@ func (s *Service) handleWorkloadDelete(writer http.ResponseWriter, request *http
 	if !ok {
 		return
 	}
-	// Deleting a workload withdraws its network presence too: forwarders
-	// drain and the host-port reservations go back, so a later workload can
-	// claim the ports. Its changed-file index is discarded with it.
-	s.network.Deactivate(workload.Spec.ID, network.DefaultDrainGrace)
-	s.checkpoints.DiscardIndex(workload.Spec.ID)
+	// The guarded delete runs first: it refuses while the workload's process
+	// is alive, and a refused delete must leave everything in service. Only
+	// once the record is gone does deleting a workload withdraw its network
+	// presence — forwarders drain and the host-port reservations go back, so
+	// a later workload can claim the ports — and discard its changed-file
+	// index. Doing either before the delete would silently take a running
+	// workload's published ports out of service on a request the API itself
+	// answers with a refusal.
 	if err := s.runtime.Delete(workload.Spec.ID); err != nil {
 		writeAPIError(writer, http.StatusConflict, "WORKLOAD_DELETE_FAILED", err.Error())
 		return
 	}
+	s.network.Deactivate(workload.Spec.ID, network.DefaultDrainGrace)
+	s.checkpoints.DiscardIndex(workload.Spec.ID)
 	writer.WriteHeader(http.StatusNoContent)
 }
 
@@ -414,10 +477,23 @@ func (s *Service) handleWorkloadStop(writer http.ResponseWriter, request *http.R
 	if request.ContentLength != 0 && !decodeAPIJSON(writer, request, &input) {
 		return
 	}
-	timeout := time.Duration(input.TimeoutSeconds) * time.Second
-	if timeout <= 0 || timeout > time.Minute {
+	// The stop grace is the caller's, clamped to the documented 60s limit:
+	// a request above the limit gets the limit (not the default — silently
+	// replacing an operator's 120s with 10s was the bug), and the effective
+	// value is surfaced with the response. Absurd values are refused before
+	// the conversion can wrap into a different timeout entirely.
+	requested, ok := requestDuration(writer, input.TimeoutSeconds, "timeout_seconds")
+	if !ok {
+		return
+	}
+	timeout := requested
+	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	if timeout > time.Minute {
+		timeout = time.Minute
+	}
+	writer.Header().Set("X-Shift-Stop-Timeout-Seconds", strconv.Itoa(int(timeout.Seconds())))
 	result, err := s.runtime.Stop(workload.Spec.ID, timeout)
 	if err != nil {
 		writeAPIError(writer, http.StatusConflict, "WORKLOAD_STOP_FAILED", err.Error())
@@ -436,17 +512,49 @@ func (s *Service) handleWorkloadLogs(writer http.ResponseWriter, request *http.R
 		return
 	}
 	tail, _ := strconv.Atoi(request.URL.Query().Get("tail"))
-	if tail > 5000 {
-		tail = 5000
+	if tail > maxLogTailLines {
+		tail = maxLogTailLines
 	}
-	reader, err := s.runtime.LogReader(workload.Spec.ID, tail)
+	reader, err := s.runtime.LogReader(workload.Spec.ID, 0)
 	if err != nil {
 		writeAPIError(writer, http.StatusNotFound, "LOGS_NOT_FOUND", err.Error())
 		return
 	}
 	defer func() { _ = reader.Close() }()
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = io.Copy(writer, reader)
+	if tail <= 0 {
+		_, _ = io.Copy(writer, reader)
+		return
+	}
+	_, _ = io.WriteString(writer, logTail(reader, tail, maxLogTailBytes))
+}
+
+// logTail returns the trailing lines of a log, bounded both in lines and in
+// bytes. The workload's log content is controlled by whichever local user
+// owns the workload, so an unbounded tail — 5000 lines of 4 MiB each — is a
+// one-request memory denial of service against the agent. As either cap is
+// reached the oldest lines are dropped; a line the scanner cannot hold in one
+// piece ends the scan and the collected tail is returned as-is.
+func logTail(reader io.Reader, maxLines, maxBytes int) string {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64<<10), maxLogLineBytes)
+	lines := make([][]byte, 0, 16)
+	total := 0
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		lines = append(lines, line)
+		total += len(line) + 1
+		for len(lines) > 0 && (len(lines) > maxLines || (total > maxBytes && len(lines) > 1)) {
+			total -= len(lines[0]) + 1
+			lines = lines[1:]
+		}
+	}
+	var out strings.Builder
+	for _, line := range lines {
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+	return out.String()
 }
 
 func (s *Service) workloadAction(writer http.ResponseWriter, request *http.Request, action func(string) (model.Workload, error)) {
@@ -480,6 +588,10 @@ func (s *Service) handleCheckpointCreate(writer http.ResponseWriter, request *ht
 	if !decodeAPIJSON(writer, request, &input) {
 		return
 	}
+	if strings.TrimSpace(input.WorkloadID) == "" {
+		writeAPIError(writer, http.StatusBadRequest, "CHECKPOINT_REQUEST_INVALID", "workload_id is required")
+		return
+	}
 	workload, ok := s.authorizedWorkload(writer, request, input.WorkloadID)
 	if !ok {
 		return
@@ -488,9 +600,13 @@ func (s *Service) handleCheckpointCreate(writer http.ResponseWriter, request *ht
 	if input.LeaveRunning != nil {
 		leaveRunning = *input.LeaveRunning
 	}
+	timeout, ok := requestDuration(writer, input.TimeoutSeconds, "timeout_seconds")
+	if !ok {
+		return
+	}
 	manifest, err := s.checkpoints.Create(request.Context(), workload.Spec.ID, checkpoint.CreateOptions{
 		Kind: input.Kind, ParentID: input.ParentID, LeaveRunning: leaveRunning,
-		TCPState: input.TCPState, Timeout: time.Duration(input.TimeoutSeconds) * time.Second,
+		TCPState: input.TCPState, Timeout: timeout,
 	})
 	if err != nil {
 		writeAPIError(writer, http.StatusUnprocessableEntity, "CHECKPOINT_FAILED", err.Error())
@@ -545,8 +661,12 @@ func (s *Service) handleCheckpointRestore(writer http.ResponseWriter, request *h
 	if request.ContentLength != 0 && !decodeAPIJSON(writer, request, &input) {
 		return
 	}
+	timeout, ok := requestDuration(writer, input.TimeoutSeconds, "timeout_seconds")
+	if !ok {
+		return
+	}
 	record, err := s.restorer.Prepare(request.Context(), manifest.ID, checkpoint.PrepareOptions{
-		Timeout: time.Duration(input.TimeoutSeconds) * time.Second,
+		Timeout: timeout,
 		Lazy:    input.Lazy,
 	})
 	if err != nil {
@@ -577,7 +697,11 @@ func (s *Service) handleRestoreList(writer http.ResponseWriter, request *http.Re
 func (s *Service) handleRestoreGet(writer http.ResponseWriter, request *http.Request) {
 	record, err := s.restorer.Get(request.PathValue("id"))
 	if err != nil {
-		writeAPIError(writer, http.StatusNotFound, "RESTORE_NOT_FOUND", err.Error())
+		status, code := http.StatusInternalServerError, "RESTORE_LOOKUP_FAILED"
+		if errors.Is(err, persistence.ErrNotFound) {
+			status, code = http.StatusNotFound, "RESTORE_NOT_FOUND"
+		}
+		writeAPIError(writer, status, code, err.Error())
 		return
 	}
 	workload, ok := s.authorizedWorkload(writer, request, record.WorkloadID)
@@ -624,9 +748,13 @@ func (s *Service) handleCheckpointFork(writer http.ResponseWriter, request *http
 }
 
 func (s *Service) fork(writer http.ResponseWriter, request *http.Request, sourceWorkloadID string, input forkRequest) {
+	timeout, ok := requestDuration(writer, input.TimeoutSeconds, "timeout_seconds")
+	if !ok {
+		return
+	}
 	record, err := s.forker.Fork(request.Context(), sourceWorkloadID, checkpoint.ForkOptions{
 		Name: input.Name, RootPath: input.RootPath, CheckpointID: input.CheckpointID,
-		Activate: input.Activate, Timeout: time.Duration(input.TimeoutSeconds) * time.Second,
+		Activate: input.Activate, Timeout: timeout,
 	})
 	if err != nil {
 		writeAPIError(writer, http.StatusUnprocessableEntity, "FORK_FAILED", err.Error())
@@ -676,9 +804,13 @@ func (s *Service) handleCheckpointClone(writer http.ResponseWriter, request *htt
 	if request.ContentLength != 0 && !decodeAPIJSON(writer, request, &input) {
 		return
 	}
+	timeout, ok := requestDuration(writer, input.TimeoutSeconds, "timeout_seconds")
+	if !ok {
+		return
+	}
 	record, err := s.cloner.Clone(request.Context(), manifest.ID, checkpoint.CloneOptions{
 		Count: input.Count, NamePrefix: input.NamePrefix, Parallel: input.Parallel,
-		Timeout: time.Duration(input.TimeoutSeconds) * time.Second,
+		Timeout: timeout,
 	})
 	if err != nil {
 		writeAPIError(writer, http.StatusUnprocessableEntity, "CLONE_FAILED", err.Error())
@@ -731,16 +863,82 @@ func (s *Service) handleCloneRollback(writer http.ResponseWriter, request *http.
 	writeAPIJSON(writer, http.StatusOK, reversed)
 }
 
+func (s *Service) handleGC(writer http.ResponseWriter, request *http.Request) {
+	caller, _ := s.caller(request)
+	if caller.UID != 0 {
+		writeAPIError(writer, http.StatusForbidden, "GC_ROOT_REQUIRED",
+			"garbage collection requires root; rerun as root (sudo shiftgate gc)")
+		return
+	}
+	var input gcRequest
+	if !decodeAPIJSON(writer, request, &input) {
+		return
+	}
+	// Online collection: the agent keeps serving while the collector reclaims
+	// unreferenced chunks, guarded by the agent's in-process write lock so no
+	// chunk can be deleted between a writer resolving it and installing its
+	// reference. The two-phase grace period is unchanged — a chunk must be
+	// observed unreferenced across two passes — and a dry run plans without
+	// deleting. Concurrent GC runs are serialized: two collectors over one
+	// state directory would race the orphan ledger. The offline stopped-agent
+	// procedure remains in the reclaim runbook (deployments/monitoring/README.md,
+	// "Chunk-store reclaim").
+	s.gcRunMu.Lock()
+	defer s.gcRunMu.Unlock()
+	collector, err := gc.OpenOnline(s.config.StateDir, s.repository, s.chunks, &s.gcGuard)
+	if err != nil {
+		writeAPIError(writer, http.StatusInternalServerError, "GC_OPEN_FAILED", err.Error())
+		return
+	}
+	defer collector.Close()
+	grace, ok := requestDuration(writer, input.GraceSeconds, "grace_seconds")
+	if !ok {
+		return
+	}
+	if grace <= 0 {
+		grace = 24 * time.Hour
+	}
+	plan, err := collector.Plan(request.Context(), grace, time.Now().UTC())
+	if err != nil {
+		writeAPIError(writer, http.StatusInternalServerError, "GC_PLAN_FAILED", err.Error())
+		return
+	}
+	swept, err := collector.Sweep(request.Context(), plan.ID, input.DryRun)
+	if err != nil {
+		writeAPIError(writer, http.StatusInternalServerError, "GC_SWEEP_FAILED", err.Error())
+		return
+	}
+	deleted, skipped := 0, 0
+	for _, candidate := range swept.Candidates {
+		switch candidate.Status {
+		case "deleted":
+			deleted++
+		case "skipped", "error":
+			skipped++
+		}
+	}
+	writeAPIJSON(writer, http.StatusOK, gcResponse{Plan: swept, Deleted: deleted, Skipped: skipped})
+}
+
 func (s *Service) handleMigrationList(writer http.ResponseWriter, request *http.Request) {
 	caller, _ := s.caller(request)
 	values := s.migrations.List()
 	filtered := values[:0]
 	for _, value := range values {
 		if caller.UID == 0 || s.workloadOwnedBy(value.WorkloadID, caller.UID) {
-			filtered = append(filtered, value)
+			filtered = append(filtered, publicMigration(value))
 		}
 	}
 	writeAPIJSON(writer, http.StatusOK, filtered)
+}
+
+// publicMigration projects a migration record for API reads. The relay
+// ticket is a one-use bearer credential for the transfer session — it is
+// served exactly once, to the caller that supplied it in the create request,
+// and never re-served on list or get.
+func publicMigration(record model.Migration) model.Migration {
+	record.Destination.RelayTicket = ""
+	return record
 }
 
 func (s *Service) handleMigrationCreate(writer http.ResponseWriter, request *http.Request) {
@@ -748,14 +946,31 @@ func (s *Service) handleMigrationCreate(writer http.ResponseWriter, request *htt
 	if !decodeAPIJSON(writer, request, &input) {
 		return
 	}
+	if strings.TrimSpace(input.WorkloadID) == "" {
+		writeAPIError(writer, http.StatusBadRequest, "MIGRATION_REQUEST_INVALID", "workload_id is required")
+		return
+	}
 	workload, ok := s.authorizedWorkload(writer, request, input.WorkloadID)
 	if !ok {
 		return
 	}
+	// Live mode is a paid entitlement and this local API is an admission
+	// point the product controls: without an entitlement that allows it, the
+	// create is refused before anything freezes. Cold mode and preflight are
+	// never gated — compatibility must always be checkable.
+	if input.Mode == model.MigrationLive && !s.liveMigrationAllowed() {
+		writeAPIError(writer, http.StatusPaymentRequired,
+			billing.LiveMigrationPlanRequiredCode, billing.LiveMigrationPlanRequiredMessage)
+		return
+	}
+	timeout, ok := requestDuration(writer, input.TimeoutSeconds, "timeout_seconds")
+	if !ok {
+		return
+	}
 	result, err := s.migrations.Create(request.Context(), migration.CreateRequest{
-		WorkloadID: workload.Spec.ID, Destination: input.Destination, Mode: input.Mode,
+		WorkloadID: workload.Spec.ID, IdempotencyKey: input.IdempotencyKey, Destination: input.Destination, Mode: input.Mode,
 		PreCopyPasses: input.PreCopyPasses,
-		Timeout:       time.Duration(input.TimeoutSeconds) * time.Second,
+		Timeout:       timeout,
 	})
 	if err != nil {
 		writeAPIError(writer, http.StatusBadRequest, "MIGRATION_CREATE_FAILED", err.Error())
@@ -773,18 +988,25 @@ func (s *Service) handleMigrationPreflight(writer http.ResponseWriter, request *
 	if !decodeAPIJSON(writer, request, &input) {
 		return
 	}
+	if strings.TrimSpace(input.WorkloadID) == "" {
+		writeAPIError(writer, http.StatusBadRequest, "MIGRATION_REQUEST_INVALID", "workload_id is required")
+		return
+	}
 	workload, ok := s.authorizedWorkload(writer, request, input.WorkloadID)
 	if !ok {
 		return
 	}
-	timeout := time.Duration(input.TimeoutSeconds) * time.Second
+	timeout, ok := requestDuration(writer, input.TimeoutSeconds, "timeout_seconds")
+	if !ok {
+		return
+	}
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(request.Context(), timeout)
 	defer cancel()
 	result, err := s.migrations.Preflight(ctx, migration.CreateRequest{
-		WorkloadID: workload.Spec.ID, Destination: input.Destination, Mode: input.Mode,
+		WorkloadID: workload.Spec.ID, IdempotencyKey: input.IdempotencyKey, Destination: input.Destination, Mode: input.Mode,
 		PreCopyPasses: input.PreCopyPasses, Timeout: timeout,
 	})
 	if err != nil {
@@ -806,19 +1028,27 @@ func (s *Service) handleMigrationPreflight(writer http.ResponseWriter, request *
 func (s *Service) handleMigrationGet(writer http.ResponseWriter, request *http.Request) {
 	result, err := s.migrations.Get(request.PathValue("id"))
 	if err != nil {
-		writeAPIError(writer, http.StatusNotFound, "MIGRATION_NOT_FOUND", err.Error())
+		status, code := http.StatusInternalServerError, "MIGRATION_LOOKUP_FAILED"
+		if errors.Is(err, persistence.ErrNotFound) {
+			status, code = http.StatusNotFound, "MIGRATION_NOT_FOUND"
+		}
+		writeAPIError(writer, status, code, err.Error())
 		return
 	}
 	if _, ok := s.authorizedWorkload(writer, request, result.WorkloadID); !ok {
 		return
 	}
-	writeAPIJSON(writer, http.StatusOK, result)
+	writeAPIJSON(writer, http.StatusOK, publicMigration(result))
 }
 
 func (s *Service) handleMigrationCancel(writer http.ResponseWriter, request *http.Request) {
 	result, err := s.migrations.Get(request.PathValue("id"))
 	if err != nil {
-		writeAPIError(writer, http.StatusNotFound, "MIGRATION_NOT_FOUND", err.Error())
+		status, code := http.StatusInternalServerError, "MIGRATION_LOOKUP_FAILED"
+		if errors.Is(err, persistence.ErrNotFound) {
+			status, code = http.StatusNotFound, "MIGRATION_NOT_FOUND"
+		}
+		writeAPIError(writer, status, code, err.Error())
 		return
 	}
 	if _, ok := s.authorizedWorkload(writer, request, result.WorkloadID); !ok {
@@ -841,10 +1071,20 @@ func (s *Service) handleStandbyList(writer http.ResponseWriter, request *http.Re
 	filtered := duties[:0]
 	for _, duty := range duties {
 		if caller.UID == 0 || duty.WorkloadUID == int(caller.UID) {
-			filtered = append(filtered, duty)
+			filtered = append(filtered, publicStandbyDuty(duty))
 		}
 	}
 	writeAPIJSON(writer, http.StatusOK, standbyListResponse{Duties: filtered, AutomaticFailover: s.standby.automaticFailover()})
+}
+
+// publicStandbyDuty projects a duty for API responses. The ownership token
+// is the control plane's fencing capability — issued exactly once and never
+// re-disclosable through routine reads — and the fence result is the fencing
+// command's own output; both stay inside the agent.
+func publicStandbyDuty(duty model.StandbyDuty) model.StandbyDuty {
+	duty.OwnershipToken = ""
+	duty.FenceResult = ""
+	return duty
 }
 
 // handleFailoverList lists the replication ledger: what this source pushed to
@@ -871,11 +1111,11 @@ func (s *Service) handleFailoverList(writer http.ResponseWriter, request *http.R
 func (s *Service) handleStandbyTrigger(writer http.ResponseWriter, request *http.Request) {
 	duty, err := s.standby.Duty(request.PathValue("workload"))
 	if err != nil {
-		status := http.StatusInternalServerError
+		status, code := http.StatusInternalServerError, "STANDBY_DUTY_LOOKUP_FAILED"
 		if errors.Is(err, persistence.ErrNotFound) {
-			status = http.StatusNotFound
+			status, code = http.StatusNotFound, "STANDBY_DUTY_NOT_FOUND"
 		}
-		writeAPIError(writer, status, "STANDBY_DUTY_NOT_FOUND", err.Error())
+		writeAPIError(writer, status, code, err.Error())
 		return
 	}
 	if !s.authorizeUID(writer, request, duty.WorkloadUID) {
@@ -904,18 +1144,20 @@ func (s *Service) handleStandbyTrigger(writer http.ResponseWriter, request *http
 		writeAPIError(writer, status, code, err.Error())
 		return
 	}
-	response.Duty = updated
+	response.Duty = publicStandbyDuty(updated)
 	writeAPIJSON(writer, http.StatusOK, response)
 }
 
 func (s *Service) authorizedWorkload(writer http.ResponseWriter, request *http.Request, id string) (model.Workload, bool) {
 	workload, err := s.runtime.Get(id)
 	if err != nil {
-		status := http.StatusInternalServerError
+		status, code := http.StatusInternalServerError, "WORKLOAD_LOOKUP_FAILED"
+		message := err.Error()
 		if errors.Is(err, persistence.ErrNotFound) {
-			status = http.StatusNotFound
+			status, code = http.StatusNotFound, "WORKLOAD_NOT_FOUND"
+			message = fmt.Sprintf("no workload with id %q; run 'shiftgate workload list' to see the known ones", id)
 		}
-		writeAPIError(writer, status, "WORKLOAD_NOT_FOUND", err.Error())
+		writeAPIError(writer, status, code, message)
 		return model.Workload{}, false
 	}
 	caller, _ := s.caller(request)
@@ -940,7 +1182,11 @@ func (s *Service) workloadOwnedBy(id string, uid uint32) bool {
 	return err == nil && workload.Spec.UID == int(uid)
 }
 
-func authorizeNewSpec(spec *model.WorkloadSpec, caller peerCredentials) error {
+// authorizeNewSpec vets a workload spec before any record exists. A
+// non-root caller may only run workloads as itself, under a root it owns;
+// workload ids and names are admitted here too, before either can reach a
+// record key, a URL path segment, or a log-file path.
+func (s *Service) authorizeNewSpec(spec *model.WorkloadSpec, caller peerCredentials) error {
 	if caller.UID != 0 {
 		if spec.UID != 0 && spec.UID != int(caller.UID) {
 			return errors.New("non-root callers cannot choose another workload uid")
@@ -951,9 +1197,36 @@ func authorizeNewSpec(spec *model.WorkloadSpec, caller peerCredentials) error {
 		spec.UID = int(caller.UID)
 		spec.GID = int(caller.GID)
 	}
+	// Workload ids are the agent's to mint. A client-supplied id is either a
+	// masquerade attempt against an existing record (refused with 409 before
+	// anything can overwrite it) or a name the agent will not store: ids are
+	// format-checked so a crafted one can never steer a path join (the log
+	// paths under .shift/logs are keyed by the id), then dropped so the
+	// create always carries a freshly minted UUID.
+	if spec.ID != "" {
+		if !validWorkloadID(spec.ID) {
+			return fmt.Errorf("%w: %q is not a well-formed workload id; omit the id field and read the assigned one from the create response", errWorkloadIDInvalid, spec.ID)
+		}
+		for _, existing := range s.runtime.List() {
+			if existing.Spec.ID == spec.ID {
+				return fmt.Errorf("%w: refusing to overwrite existing workload %s; ids are assigned by the agent", errWorkloadIDConflict, spec.ID)
+			}
+		}
+		spec.ID = ""
+	}
+	if spec.Name != "" {
+		for _, existing := range s.runtime.List() {
+			if strings.EqualFold(existing.Spec.Name, spec.Name) {
+				return fmt.Errorf("%w: %q is already in use; workload names are machine-global, pick another", errWorkloadNameConflict, spec.Name)
+			}
+		}
+	}
+	if strings.TrimSpace(spec.RootPath) == "" {
+		return fmt.Errorf("%w: root path is required; SHIFT will not infer an unrestricted home-directory capture", errWorkloadRootInvalid)
+	}
 	info, err := os.Stat(spec.RootPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errWorkloadRootInvalid, err)
 	}
 	if caller.UID != 0 {
 		stat, ok := info.Sys().(*syscall.Stat_t)
@@ -964,19 +1237,76 @@ func authorizeNewSpec(spec *model.WorkloadSpec, caller peerCredentials) error {
 	return nil
 }
 
+// validWorkloadID reports whether an id is exactly the shape model.NewID
+// mints: a UUIDv4 in lowercase hex with dashes at the fixed positions. It is
+// the format gate in front of every path a workload id can reach — log files
+// are named <id>.log under directories the root agent creates.
+func validWorkloadID(id string) bool {
+	if len(id) != 36 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		char := id[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if char != '-' {
+				return false
+			}
+		default:
+			if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// requestDuration converts a caller-supplied seconds field into a duration,
+// refusing values whose conversion would wrap into a completely different
+// deadline. Zero keeps its per-route meaning of "the downstream default".
+func requestDuration(writer http.ResponseWriter, seconds int, field string) (time.Duration, bool) {
+	if seconds < 0 || seconds > maxRequestSeconds {
+		writeAPIError(writer, http.StatusBadRequest, "INVALID_ARGUMENT",
+			fmt.Sprintf("%s must be between 0 and %d seconds", field, maxRequestSeconds))
+		return 0, false
+	}
+	return time.Duration(seconds) * time.Second, true
+}
+
+// decodeAPIJSON decodes a request body under the local API's size limit. An
+// empty body is the zero request — the documented way to clear a policy or
+// run a default GC — not malformed JSON, and an over-limit body is a 413,
+// not a generic decode failure.
 func decodeAPIJSON(writer http.ResponseWriter, request *http.Request, target any) bool {
 	request.Body = http.MaxBytesReader(writer, request.Body, localBodyLimit)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		writeAPIError(writer, http.StatusBadRequest, "INVALID_JSON", err.Error())
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		writeDecodeError(writer, err)
 		return false
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeAPIError(writer, http.StatusBadRequest, "INVALID_JSON", "request contains trailing data")
-		return false
+	if err := decoder.Decode(&struct{}{}); err != nil {
+		if !errors.Is(err, io.EOF) {
+			writeDecodeError(writer, err)
+			return false
+		}
+		return true
 	}
-	return true
+	writeAPIError(writer, http.StatusBadRequest, "INVALID_JSON", "request contains trailing data")
+	return false
+}
+
+func writeDecodeError(writer http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeAPIError(writer, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE",
+			fmt.Sprintf("request body exceeds the %d byte local API limit", localBodyLimit))
+		return
+	}
+	writeAPIError(writer, http.StatusBadRequest, "INVALID_JSON", err.Error())
 }
 
 func writeAPIJSON(writer http.ResponseWriter, status int, value any) {

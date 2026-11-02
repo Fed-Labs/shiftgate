@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -40,6 +41,70 @@ func controlSession(settings options) (*controlclient.Session, error) {
 	return session, nil
 }
 
+// checkLiveMigrationEntitled is the CLI half of the live-migration paywall:
+// when a control-plane session exists, the signed-in organization's
+// entitlement is checked before a live move is admitted, and a failed lookup
+// fails closed. No session means a local-only deployment — its agent is the
+// final authority (a detached agent asserts its entitlement explicitly in
+// agent config, and the local API gate enforces it either way).
+func checkLiveMigrationEntitled(ctx context.Context, settings options) error {
+	session, err := controlclient.NewSession(settings.controlURL, settings.tokenStorePath, settings.timeout)
+	if err != nil || !session.Authenticated() {
+		return nil
+	}
+	organizationID, err := resolveOrganization(ctx, session, "")
+	if err != nil {
+		return exitError{code: 1, err: fmt.Errorf("%s: entitlement lookup failed (live mode fails closed): %w", billing.LiveMigrationPlanRequiredCode, err)}
+	}
+	entitlement, err := session.Entitlement(ctx, organizationID)
+	if err != nil {
+		return exitError{code: 1, err: fmt.Errorf("%s: entitlement lookup failed (live mode fails closed): %w", billing.LiveMigrationPlanRequiredCode, err)}
+	}
+	if !billing.LiveMigrationAllowed(entitlement.Plan, entitlement.Status == "active") {
+		return exitError{code: 1, err: errors.New(billing.LiveMigrationPlanRequiredCode + ": " + billing.LiveMigrationPlanRequiredMessage)}
+	}
+	return nil
+}
+
+// checkPlanFeatureEntitled is the CLI half of a plan-feature paywall (plan 2
+// BR-08's failover gate and the other entitlement walls): when a control
+// session exists, the signed-in organization's entitlement must include the
+// feature. A running trial grants the Business feature set (the entitlement
+// row's Allow() handles it). No session means a local-only deployment whose
+// agent is the final authority.
+func checkPlanFeatureEntitled(ctx context.Context, settings options, feature billing.Feature, code, message string) error {
+	session, err := controlclient.NewSession(settings.controlURL, settings.tokenStorePath, settings.timeout)
+	if err != nil || !session.Authenticated() {
+		return nil
+	}
+	organizationID, err := resolveOrganization(ctx, session, "")
+	if err != nil {
+		return exitError{code: 1, err: fmt.Errorf("%s: entitlement lookup failed (fails closed): %w", code, err)}
+	}
+	entitlement, err := session.Entitlement(ctx, organizationID)
+	if err != nil {
+		return exitError{code: 1, err: fmt.Errorf("%s: entitlement lookup failed (fails closed): %w", code, err)}
+	}
+	active := entitlement.Status == "active" || entitlement.Status == "trialing" || entitlement.Status == "past_due"
+	if !active {
+		return exitError{code: 1, err: errors.New(code + ": " + message)}
+	}
+	planKey := entitlement.Plan
+	if entitlement.TrialActive {
+		// The trial carries the Business feature set for its window
+		// (plan 2 BR-02) without overwriting the displayed plan.
+		planKey = "business"
+	}
+	if plan, ok := billing.FindPlan(planKey); ok {
+		if plan.Allows(feature) {
+			return nil
+		}
+		return exitError{code: 1, err: errors.New(code + ": " + message)}
+	}
+	// Unknown (negotiated) tiers carry their contract, so they pass.
+	return nil
+}
+
 // controlOperationError maps a control-plane failure onto the CLI's exit-code
 // contract: 4 for a missing resource, 3 for every other operation failure.
 func controlOperationError(err error) error {
@@ -57,7 +122,7 @@ func controlOperationError(err error) error {
 
 // resolveOrganization picks the organization fleet commands operate on: an
 // explicit --org, the only one, or the first of several with a note that the
-// flag exists.
+// flag exists — the default docs/cli.md and the --org flag help promise.
 func resolveOrganization(ctx context.Context, session *controlclient.Session, organizationID string) (string, error) {
 	if organizationID != "" {
 		return organizationID, nil
@@ -68,6 +133,10 @@ func resolveOrganization(ctx context.Context, session *controlclient.Session, or
 	}
 	if len(organizations) == 0 {
 		return "", exitError{code: 3, err: errors.New("this account belongs to no organization")}
+	}
+	if len(organizations) > 1 {
+		_, _ = fmt.Fprintf(os.Stderr, "note: this account belongs to %d organizations; using %s (%s). Pass --org ID before the subcommand to choose another.\n",
+			len(organizations), organizations[0].Name, organizations[0].ID)
 	}
 	return organizations[0].ID, nil
 }
@@ -84,6 +153,9 @@ func runControlLogin(ctx context.Context, settings options, arguments []string) 
 	sso := flags.Bool("sso", false, "log in through the control plane's single sign-on issuer")
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err.Error())
+	}
+	if err := rejectArgs("login", "shiftgate login [--email ADDRESS] [--sso]", flags.Args()); err != nil {
+		return err
 	}
 	// No control-plane check here: an unset --control-url means the platform's
 	// control plane, which is the normal case for a hosted deployment.
@@ -107,7 +179,10 @@ func runControlLogin(ctx context.Context, settings options, arguments []string) 
 		return runControlLoginSSO(ctx, settings, session, *email)
 	}
 	_, _ = fmt.Fprint(settings.stdout, "Password: ")
-	password, err := termio.ReadPassword(os.Stdin)
+	// The same buffered reader that read the email reads the password: a
+	// piped "email\npassword\n" would otherwise lose the password to the
+	// email reader's over-read of the pipe.
+	password, err := termio.ReadPasswordFrom(reader, os.Stdin, settings.stderr)
 	if err != nil {
 		return exitError{code: 3, err: fmt.Errorf("read password: %w", err)}
 	}
@@ -215,10 +290,19 @@ func runControl(ctx context.Context, command string, arguments []string, setting
 	case "login":
 		return runControlLogin(ctx, settings, arguments)
 	case "logout":
+		if err := rejectArgs("logout", "shiftgate logout", arguments); err != nil {
+			return err
+		}
 		return runControlLogout(ctx, settings)
 	case "whoami":
+		if err := rejectArgs("whoami", "shiftgate whoami", arguments); err != nil {
+			return err
+		}
 		return runControlWhoami(ctx, settings)
 	case "plans":
+		if err := rejectArgs("plans", "shiftgate plans", arguments); err != nil {
+			return err
+		}
 		return runControlPlans(ctx, settings)
 	case "storage":
 		return runControlStorage(ctx, settings, arguments)
@@ -226,6 +310,10 @@ func runControl(ctx context.Context, command string, arguments []string, setting
 		return runFleet(ctx, settings, arguments)
 	case "marketplace", "market":
 		return runMarketplace(ctx, settings, arguments)
+	case "trial":
+		return runTrial(ctx, settings, arguments)
+	case "refer", "referral":
+		return runRefer(ctx, settings, arguments)
 	default:
 		return usageError("unknown command " + command)
 	}
@@ -354,22 +442,27 @@ func runControlStorage(ctx context.Context, settings options, arguments []string
 // The --org flag comes before the subcommand (Go's flag package stops at the
 // first non-flag word, and each subcommand owns its own flags after it).
 func runFleet(ctx context.Context, settings options, arguments []string) error {
-	flags := flag.NewFlagSet("fleet", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
-	organization := flags.String("org", "", "organization id (defaults to your first organization)")
-	if err := flags.Parse(arguments); err != nil {
+	organization, remaining, err := extractStringFlag(arguments, "org")
+	if err != nil {
 		return usageError(err.Error())
 	}
-	remaining := flags.Args()
 	if len(remaining) == 0 {
 		return usageError("usage: shiftgate fleet [--org ID] machines|workloads|migrations|checkpoints|audit|retention|sso|api-keys|entitlement|usage [args]")
 	}
 	subcommand, args := remaining[0], remaining[1:]
+	// The zero-argument subcommands reject their junk before any session or
+	// network work, so a stray word is a usage error (exit 2), never a
+	// silently truncated run of something other than what was asked for.
+	if subcommand == "audit" || subcommand == "entitlement" {
+		if err := rejectArgs("fleet "+subcommand, "shiftgate fleet "+subcommand, args); err != nil {
+			return err
+		}
+	}
 	session, err := controlSession(settings)
 	if err != nil {
 		return err
 	}
-	organizationID, err := resolveOrganization(ctx, session, *organization)
+	organizationID, err := resolveOrganization(ctx, session, organization)
 	if err != nil {
 		return err
 	}
@@ -403,27 +496,25 @@ func runFleet(ctx context.Context, settings options, arguments []string) error {
 	case "usage":
 		return runFleetUsage(ctx, session, settings, organizationID, args)
 	default:
-		return usageError("unknown fleet subcommand " + subcommand)
+		return unknownSubcommandError("fleet", subcommand, []string{"machines", "workloads", "migrations", "checkpoints", "audit", "api-keys", "retention", "sso", "entitlement", "usage"})
 	}
 }
 
 // runFleetMachines backs the top-level `shift machines` in fleet mode.
 func runFleetMachines(ctx context.Context, settings options, arguments []string) error {
+	organization, remaining, err := extractStringFlag(arguments, "org")
+	if err != nil {
+		return usageError(err.Error())
+	}
 	session, err := controlSession(settings)
 	if err != nil {
 		return err
 	}
-	flags := flag.NewFlagSet("machines", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
-	organization := flags.String("org", "", "organization id (defaults to your first organization)")
-	if err := flags.Parse(arguments); err != nil {
-		return usageError(err.Error())
-	}
-	organizationID, err := resolveOrganization(ctx, session, *organization)
+	organizationID, err := resolveOrganization(ctx, session, organization)
 	if err != nil {
 		return err
 	}
-	return runFleetMachine(ctx, session, settings, organizationID, flags.Args())
+	return runFleetMachine(ctx, session, settings, organizationID, remaining)
 }
 
 // runFleetMachine lists (by default), registers, and queries machines. The
@@ -435,7 +526,7 @@ func runFleetMachine(ctx context.Context, session *controlclient.Session, settin
 		subcommand = arguments[0]
 	}
 	if subcommand != "list" && subcommand != "register" && subcommand != "capability" {
-		return usageError("unknown machines subcommand " + subcommand)
+		return unknownSubcommandError("machines", subcommand, []string{"list", "register", "capability"})
 	}
 	args := []string{}
 	if len(arguments) > 1 {
@@ -443,6 +534,9 @@ func runFleetMachine(ctx context.Context, session *controlclient.Session, settin
 	}
 	switch subcommand {
 	case "list":
+		if err := rejectArgs("machines list", "shiftgate machines list", args); err != nil {
+			return err
+		}
 		machines, err := session.Machines(ctx, organizationID)
 		if err != nil {
 			return controlOperationError(err)
@@ -451,13 +545,16 @@ func runFleetMachine(ctx context.Context, session *controlclient.Session, settin
 	case "capability":
 		return runFleetMachineCapability(ctx, session, settings, organizationID, args)
 	case "register":
-		flags := flag.NewFlagSet("machines register", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
+		flags := flagNew("machines register")
 		machineID := flags.String("machine-id", "", "stable machine id")
 		name := flags.String("name", "", "display name")
 		agentURL := flags.String("agent-url", "", "https agent URL peers and the dispatcher dial")
-		if err := flags.Parse(args); err != nil {
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
 			return usageError(err.Error())
+		}
+		if err := rejectArgs("machines register", "shiftgate machines register --machine-id ID --name NAME --agent-url URL", positional); err != nil {
+			return err
 		}
 		if *machineID == "" || *name == "" || *agentURL == "" {
 			return usageError("machine-id, name, and agent-url are required")
@@ -480,15 +577,14 @@ func runFleetMachine(ctx context.Context, session *controlclient.Session, settin
 // `shift fleet machines capability cuda_version --kind number --minimum 9`
 // answers "which machines can run a CUDA 12 build".
 func runFleetMachineCapability(ctx context.Context, session *controlclient.Session, settings options, organizationID string, arguments []string) error {
-	flags := flag.NewFlagSet("machines capability", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
+	flags := flagNew("machines capability")
 	kind := flags.String("kind", "text", "capability kind: number, text, or boolean")
 	minimum := flags.Float64("minimum", 0, "minimum value, numbers only")
-	if err := flags.Parse(arguments); err != nil {
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
 		return usageError(err.Error())
 	}
-	rest := flags.Args()
-	if len(rest) != 1 {
+	if len(positional) != 1 {
 		return usageError("usage: shiftgate fleet machines capability NAME [--kind number] [--minimum 9.0]")
 	}
 	if *kind != "number" && *kind != "text" && *kind != "boolean" {
@@ -497,12 +593,12 @@ func runFleetMachineCapability(ctx context.Context, session *controlclient.Sessi
 	if *minimum != 0 && *kind != "number" {
 		return usageError("--minimum applies to numbers only")
 	}
-	machines, err := session.MachinesWithCapability(ctx, organizationID, rest[0], *kind, *minimum)
+	machines, err := session.MachinesWithCapability(ctx, organizationID, positional[0], *kind, *minimum)
 	if err != nil {
 		return controlOperationError(err)
 	}
 	if len(machines) == 0 {
-		_, _ = fmt.Fprintf(settings.stderr, "no machines report capability %q\n", rest[0])
+		_, _ = fmt.Fprintf(settings.stderr, "no machines report capability %q\n", positional[0])
 		return nil
 	}
 	return printFleetMachines(settings, machines)
@@ -647,7 +743,12 @@ func runFleetWorkload(ctx context.Context, session *controlclient.Session, setti
 
 // runFleetMigration lists migrations and inspects one job with its events.
 func runFleetMigration(ctx context.Context, session *controlclient.Session, settings options, organizationID string, arguments []string) error {
-	if len(arguments) == 0 {
+	flags := flagNew("fleet migrations")
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
+		return usageError(err.Error())
+	}
+	if len(positional) == 0 {
 		jobs, err := session.Migrations(ctx, organizationID)
 		if err != nil {
 			return controlOperationError(err)
@@ -662,10 +763,10 @@ func runFleetMigration(ctx context.Context, session *controlclient.Session, sett
 		}
 		return writer.Flush()
 	}
-	if len(arguments) != 1 {
+	if len(positional) != 1 {
 		return usageError("usage: shiftgate fleet migrations [ID]")
 	}
-	migrationID := arguments[0]
+	migrationID := positional[0]
 	jobs, err := session.Migrations(ctx, organizationID)
 	if err != nil {
 		return controlOperationError(err)
@@ -696,12 +797,17 @@ func runFleetMigration(ctx context.Context, session *controlclient.Session, sett
 
 // runFleetCheckpoint lists checkpoints, optionally for one workload.
 func runFleetCheckpoint(ctx context.Context, session *controlclient.Session, settings options, organizationID string, arguments []string) error {
-	if len(arguments) > 1 {
+	flags := flagNew("fleet checkpoints")
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
+		return usageError(err.Error())
+	}
+	if len(positional) > 1 {
 		return usageError("usage: shiftgate fleet checkpoints [WORKLOAD]")
 	}
 	workloadID := ""
-	if len(arguments) == 1 {
-		workloadID = arguments[0]
+	if len(positional) == 1 {
+		workloadID = positional[0]
 	}
 	checkpoints, err := session.Checkpoints(ctx, organizationID, workloadID)
 	if err != nil {
@@ -711,7 +817,7 @@ func runFleetCheckpoint(ctx context.Context, session *controlclient.Session, set
 		return writeJSON(settings.stdout, checkpoints)
 	}
 	writer := tabwriter.NewWriter(settings.stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(writer, "ID\tWORKLOAD\tMACHINE\tKIND\tPLAIN\tSTORED\tCREATED")
+	_, _ = fmt.Fprintln(writer, "ID\tWORKLOAD\tMACHINE\tKIND\tSIZE\tSTORED\tCREATED")
 	for _, checkpoint := range checkpoints {
 		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", shortID(checkpoint.ID), shortID(checkpoint.WorkloadID), shortID(checkpoint.MachineID), checkpoint.Kind, humanBytes(checkpoint.PlainBytes), humanBytes(checkpoint.StoredBytes), checkpoint.CreatedAt.Local().Format(time.DateTime))
 	}
@@ -719,13 +825,53 @@ func runFleetCheckpoint(ctx context.Context, session *controlclient.Session, set
 }
 
 // runFleetUsage summarizes metered usage; from and to are inclusive ISO dates.
+// With --summary (or no range) it prints the self-serve usage summary object
+// (storage, transfer with fair-use throttle state, machines, migration health,
+// seats, API budget) from GET /v1/organizations/{org}/usage/summary.
 func runFleetUsage(ctx context.Context, session *controlclient.Session, settings options, organizationID string, arguments []string) error {
 	flags := flag.NewFlagSet("fleet usage", flag.ContinueOnError)
 	flags.SetOutput(settings.stderr)
 	from := flags.String("from", "", "range start, 2006-01-02 (defaults to a month ago)")
 	to := flags.String("to", "", "range end, 2006-01-02 (defaults to tomorrow)")
+	summary := flags.Bool("summary", false, "print the usage summary object instead of raw records")
+	period := flags.Duration("period", 30*24*time.Hour, "window for the summary view (informational; the summary covers 30 days)")
+	_ = period
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err.Error())
+	}
+	if err := rejectArgs("fleet usage", "shiftgate fleet usage [--from YYYY-MM-DD] [--to YYYY-MM-DD]", flags.Args()); err != nil {
+		return err
+	}
+	if *summary || (*from == "" && *to == "") {
+		report, err := session.UsageSummaryReport(ctx, organizationID)
+		if err != nil {
+			return controlOperationError(err)
+		}
+		if settings.jsonOutput {
+			return writeJSON(settings.stdout, report)
+		}
+		_, _ = fmt.Fprintf(settings.stdout, "Storage:  %s of %s used (%.1f%%)\n", humanBytes(report.Storage.UsedBytes), humanBytes(report.Storage.MaxBytes), report.Storage.Pct)
+		throttle := report.Transfer.Throttle
+		if throttle == "warn" {
+			throttle = "WARN — nearing the fair-use ceiling"
+		} else if throttle == "exceeded" {
+			throttle = "EXCEEDED — platform-mediated transfer throttled until " + report.Transfer.ResetsAt
+		}
+		_, _ = fmt.Fprintf(settings.stdout, "Transfer: %s of %s (30d) — %s\n", humanBytes(report.Transfer.Bytes30d), humanBytes(report.Transfer.LimitBytes), throttle)
+		for channel, bytes := range report.Transfer.ByChannel {
+			_, _ = fmt.Fprintf(settings.stdout, "  %-8s %s\n", channel, humanBytes(bytes))
+		}
+		_, _ = fmt.Fprintf(settings.stdout, "Machines: %d online / %d registered\n", report.Machines.Online, report.Machines.Total)
+		_, _ = fmt.Fprintf(settings.stdout, "Seats:    %d members · %d purchased · %d included\n", report.Seats.Members, report.Seats.Purchased, report.Seats.Included)
+		budget := strconv.Itoa(report.APIRequests.DailyBudget)
+		if report.APIRequests.DailyBudget < 0 {
+			budget = "unlimited"
+		}
+		_, _ = fmt.Fprintf(settings.stdout, "API:      %d requests today (daily budget %s)\n", report.APIRequests.RequestsToday, budget)
+		if len(report.Migrations) > 0 {
+			_, _ = fmt.Fprintf(settings.stdout, "Migrations (7d): %v\n", report.Migrations)
+		}
+		return nil
 	}
 	var fromTime, toTime time.Time
 	if *from != "" {
@@ -785,12 +931,15 @@ func runFleetAPIKeys(ctx context.Context, session *controlclient.Session, settin
 	subcommand, args := arguments[0], arguments[1:]
 	switch subcommand {
 	case "create":
-		flags := flag.NewFlagSet("fleet api-keys create", flag.ContinueOnError)
-		flags.SetOutput(settings.stderr)
+		flags := flagNew("fleet api-keys create")
 		name := flags.String("name", "", "key name")
 		scopes := flags.String("scopes", "machines,workloads,checkpoints,migrations", "comma-separated scopes")
-		if err := flags.Parse(args); err != nil {
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
 			return usageError(err.Error())
+		}
+		if err := rejectArgs("fleet api-keys create", "shiftgate fleet api-keys create --name N [--scopes S]", positional); err != nil {
+			return err
 		}
 		if *name == "" {
 			return usageError("--name is required")
@@ -805,39 +954,55 @@ func runFleetAPIKeys(ctx context.Context, session *controlclient.Session, settin
 		_, _ = fmt.Fprintf(settings.stdout, "API key %s created. Secret (shown once, store it now):\n  %s\n", created.Name, created.Secret)
 		return nil
 	case "revoke":
-		if len(args) != 1 {
-			return usageError("usage: shiftgate fleet api-keys revoke KEY")
+		flags := flagNew("fleet api-keys revoke")
+		yes := flags.Bool("yes", false, "skip the confirmation prompt")
+		positional, err := parseCommandFlags(flags, args)
+		if err != nil {
+			return usageError(err.Error())
 		}
-		if err := session.RevokeAPIKey(ctx, organizationID, args[0]); err != nil {
+		if len(positional) != 1 {
+			return usageError("usage: shiftgate fleet api-keys revoke KEY [--yes]")
+		}
+		if err := confirmDestructive(settings, *yes, fmt.Sprintf("revoke API key %s", positional[0])); err != nil {
+			return err
+		}
+		if err := session.RevokeAPIKey(ctx, organizationID, positional[0]); err != nil {
 			return controlOperationError(err)
+		}
+		if settings.jsonOutput {
+			return writeJSON(settings.stdout, map[string]string{"id": positional[0], "status": "revoked"})
 		}
 		_, _ = fmt.Fprintln(settings.stdout, "Revoked.")
 		return nil
 	default:
-		return usageError("unknown api-keys subcommand " + subcommand)
+		return unknownSubcommandError("api-keys", subcommand, []string{"create", "revoke"})
 	}
 }
 
 // runMarketplace routes the compute marketplace: publishing and withdrawing
 // offers, inspecting inventory, placements, and reservations. As with fleet,
-// --org comes before the subcommand.
+// --org may appear anywhere before "--".
 func runMarketplace(ctx context.Context, settings options, arguments []string) error {
-	flags := flag.NewFlagSet("marketplace", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
-	organization := flags.String("org", "", "organization id (defaults to your first organization)")
-	if err := flags.Parse(arguments); err != nil {
+	organization, remaining, err := extractStringFlag(arguments, "org")
+	if err != nil {
 		return usageError(err.Error())
 	}
-	remaining := flags.Args()
 	if len(remaining) == 0 {
 		return usageError("usage: shiftgate marketplace [--org ID] offers|inventory|place|publish|withdraw|reservations|reserve|commit|release|fail [args]")
 	}
 	subcommand, args := remaining[0], remaining[1:]
+	// Like fleet's zero-argument subcommands: junk is a usage error before
+	// any session work, never a silently ignored argument.
+	if subcommand == "offers" || subcommand == "inventory" {
+		if err := rejectArgs("marketplace "+subcommand, "shiftgate marketplace "+subcommand, args); err != nil {
+			return err
+		}
+	}
 	session, err := controlSession(settings)
 	if err != nil {
 		return err
 	}
-	organizationID, err := resolveOrganization(ctx, session, *organization)
+	organizationID, err := resolveOrganization(ctx, session, organization)
 	if err != nil {
 		return err
 	}
@@ -867,7 +1032,7 @@ func runMarketplace(ctx context.Context, settings options, arguments []string) e
 	case "commit", "release", "fail":
 		return runMarketplaceTransition(ctx, session, settings, organizationID, subcommand, args)
 	default:
-		return usageError("unknown marketplace subcommand " + subcommand)
+		return unknownSubcommandError("marketplace", subcommand, []string{"offers", "inventory", "place", "publish", "withdraw", "reservations", "reserve", "commit", "release", "fail"})
 	}
 }
 
@@ -881,6 +1046,9 @@ func resourceFlags(flags *flag.FlagSet) func() (scheduler.Resources, uint64, err
 	storage := flags.String("storage", "", "storage required (bytes or 100GiB)")
 	stateBytes := flags.String("state-bytes", "", "checkpoint size (bytes or 4GiB)")
 	return func() (scheduler.Resources, uint64, error) {
+		if *cpu < 0 {
+			return scheduler.Resources{}, 0, errors.New("--cpu must not be negative")
+		}
 		resources := scheduler.Resources{CPUCount: *cpu}
 		if *memory != "" {
 			value, err := parseBytes(*memory)
@@ -926,6 +1094,9 @@ func runMarketplacePlace(ctx context.Context, session *controlclient.Session, se
 	requirements := resourceFlags(flags)
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err.Error())
+	}
+	if err := rejectArgs("marketplace place", "shiftgate marketplace place --workload ID --cpu N --memory SIZE [--checkpoint ID] ...", flags.Args()); err != nil {
+		return err
 	}
 	resources, stateBytes, err := requirements()
 	if err != nil {
@@ -1000,6 +1171,9 @@ func runMarketplacePublish(ctx context.Context, session *controlclient.Session, 
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err.Error())
 	}
+	if err := rejectArgs("marketplace publish", "shiftgate marketplace publish --machine ID --cpu N --memory SIZE ...", flags.Args()); err != nil {
+		return err
+	}
 	if *machine == "" {
 		return usageError("--machine is required")
 	}
@@ -1044,14 +1218,21 @@ func runMarketplacePublish(ctx context.Context, session *controlclient.Session, 
 
 // runMarketplaceWithdraw takes an offer off the market.
 func runMarketplaceWithdraw(ctx context.Context, session *controlclient.Session, settings options, organizationID string, arguments []string) error {
-	flags := flag.NewFlagSet("marketplace withdraw", flag.ContinueOnError)
-	flags.SetOutput(settings.stderr)
+	flags := flagNew("marketplace withdraw")
 	offer := flags.String("offer", "", "offer id")
-	if err := flags.Parse(arguments); err != nil {
+	yes := flags.Bool("yes", false, "skip the confirmation prompt")
+	positional, err := parseCommandFlags(flags, arguments)
+	if err != nil {
 		return usageError(err.Error())
+	}
+	if err := rejectArgs("marketplace withdraw", "shiftgate marketplace withdraw --offer ID [--yes]", positional); err != nil {
+		return err
 	}
 	if *offer == "" {
 		return usageError("--offer is required")
+	}
+	if err := confirmDestructive(settings, *yes, fmt.Sprintf("withdraw marketplace offer %s", *offer)); err != nil {
+		return err
 	}
 	withdrawn, err := session.WithdrawComputeOffer(ctx, organizationID, *offer)
 	if err != nil {
@@ -1071,6 +1252,9 @@ func runMarketplaceReservations(ctx context.Context, session *controlclient.Sess
 	offer := flags.String("offer", "", "filter to this offer id")
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err.Error())
+	}
+	if err := rejectArgs("marketplace reservations", "shiftgate marketplace reservations [--offer ID]", flags.Args()); err != nil {
+		return err
 	}
 	reservations, err := session.ComputeReservations(ctx, organizationID, *offer)
 	if err != nil {
@@ -1106,6 +1290,9 @@ func runMarketplaceReserve(ctx context.Context, session *controlclient.Session, 
 	requirements := resourceFlags(flags)
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err.Error())
+	}
+	if err := rejectArgs("marketplace reserve", "shiftgate marketplace reserve --offer ID --workload ID --cpu N --memory SIZE ...", flags.Args()); err != nil {
+		return err
 	}
 	if *offer == "" {
 		return usageError("--offer is required")
@@ -1143,6 +1330,9 @@ func runMarketplaceTransition(ctx context.Context, session *controlclient.Sessio
 	reason := flags.String("reason", "", "why the reservation failed (fail only)")
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err.Error())
+	}
+	if err := rejectArgs("marketplace "+action, "shiftgate marketplace "+action+" --reservation ID"+map[string]string{"fail": " [--reason TEXT]"}[action], flags.Args()); err != nil {
+		return err
 	}
 	if *reservationID == "" {
 		return usageError("--reservation is required")
@@ -1205,6 +1395,16 @@ func printEntitlement(settings options, entitlement controlclient.Entitlement) e
 	_, _ = fmt.Fprintf(settings.stdout, "Plan:      %s (%s)\n", entitlement.Plan, entitlement.Status)
 	_, _ = fmt.Fprintf(settings.stdout, "Machines:  %d\n", entitlement.MaxMachines)
 	_, _ = fmt.Fprintf(settings.stdout, "Storage:   %s of %s used\n", humanBytes(entitlement.UsedStorageBytes), humanBytes(entitlement.MaxStorageBytes))
+	if entitlement.MaxStorageBytes > 0 {
+		free := entitlement.MaxStorageBytes - entitlement.UsedStorageBytes
+		if free < 0 {
+			free = 0
+		}
+		_, _ = fmt.Fprintf(settings.stdout, "Remaining: %s storage before new writes are refused (data is never deleted)\n", humanBytes(free))
+	}
+	if entitlement.Status != "active" {
+		_, _ = fmt.Fprintln(settings.stdout, "Subscription is not active: free-tier limits apply. Resume: shiftgate plans")
+	}
 	return nil
 }
 

@@ -116,7 +116,8 @@ func scimUserResponse(user database.SCIMUser) map[string]any {
 
 // scimRequestUser validates a create/replace body and turns it into the
 // store's shape. defaultActive is what an absent "active" means: true on
-// create, and on replace the protocol's read of a full replacement.
+// create, and on replace the account's current state — a routine attribute
+// sync that omits the flag must never re-enable a deactivated account.
 func scimRequestUser(input scimUserRequest, defaultActive bool) (database.SCIMUser, error) {
 	email, err := normalizeEmail(input.UserName)
 	if err != nil {
@@ -151,47 +152,48 @@ func scimRequestUser(input scimUserRequest, defaultActive bool) (database.SCIMUs
 	return database.SCIMUser{ExternalID: externalID, Email: email, DisplayName: displayName, Active: active}, nil
 }
 
-// handleSCIMUsersList answers GET /Users with a ListResponse. Filtering uses
-// the database layer's parser — attribute and operator names come from fixed
-// whitelists and values only ever bind as parameters.
+// handleSCIMUsersList answers GET /Users with a ListResponse. Filtering and
+// paging both run in SQL: attribute and operator names come from fixed
+// whitelists and values only ever bind as parameters, and a large directory
+// is never materialized in memory just to be sliced.
 func (server *Server) handleSCIMUsersList(writer http.ResponseWriter, request *http.Request) {
 	filter, err := database.ParseSCIMFilter(request.URL.Query().Get("filter"))
 	if err != nil {
 		writeSCIMError(writer, http.StatusBadRequest, err.Error())
 		return
 	}
-	users, err := server.database.SCIMUsers(request.Context(), principalFrom(request.Context()).OrganizationID, filter)
-	if err != nil {
-		writeSCIMError(writer, http.StatusInternalServerError, "the user list could not be read")
-		return
-	}
 	startIndex := int(parseMetadataInt(request.URL.Query().Get("startIndex"), 1))
+	if startIndex < 1 {
+		startIndex = 1
+	}
 	count := int(parseMetadataInt(request.URL.Query().Get("count"), 100))
 	if count > scimMaxPage {
 		count = scimMaxPage
 	}
-	begin := startIndex - 1
-	if begin < 0 || begin > len(users) {
-		begin = len(users)
+	if count < 0 {
+		count = 0
 	}
-	end := begin + count
-	if end > len(users) {
-		end = len(users)
+	users, total, err := server.database.SCIMUsers(request.Context(), principalFrom(request.Context()).OrganizationID, filter, database.NormalizePage(count, startIndex-1))
+	if err != nil {
+		writeSCIMError(writer, http.StatusInternalServerError, "the user list could not be read")
+		return
 	}
-	resources := make([]map[string]any, 0, end-begin)
-	for _, user := range users[begin:end] {
+	resources := make([]map[string]any, 0, len(users))
+	for _, user := range users {
 		resources = append(resources, scimUserResponse(user))
 	}
 	writeSCIM(writer, http.StatusOK, map[string]any{
 		"schemas":      []string{scimListResponseSchema},
-		"totalResults": len(users),
-		"startIndex":   begin + 1,
+		"totalResults": total,
+		"startIndex":   startIndex,
 		"itemsPerPage": len(resources),
 		"Resources":    resources,
 	})
 }
 
-// handleSCIMUserCreate answers POST /Users.
+// handleSCIMUserCreate answers POST /Users. The active attribute is
+// readWrite (RFC 7643 §4.1.1): a directory that stages a user as inactive
+// gets a disabled account, never a live one.
 func (server *Server) handleSCIMUserCreate(writer http.ResponseWriter, request *http.Request) {
 	var input scimUserRequest
 	if !decodeSCIM(writer, request, &input) {
@@ -210,8 +212,21 @@ func (server *Server) handleSCIMUserCreate(writer http.ResponseWriter, request *
 			writeSCIMError(writer, http.StatusConflict, "an account with this email or external id already exists")
 			return
 		}
+		if errors.Is(err, database.ErrSeatCeilingExceeded) {
+			writeSCIMError(writer, http.StatusPaymentRequired, "seat count must cover every organization member; purchase more seats before provisioning users")
+			return
+		}
 		writeSCIMError(writer, http.StatusInternalServerError, "the user could not be created")
 		return
+	}
+	if !user.Active {
+		deactivated, setActiveErr := server.database.SCIMSetActive(request.Context(), organizationID, created.ID, false,
+			server.auditInput(request, "scim.user.create_inactive", "user", created.ID, nil))
+		if setActiveErr != nil {
+			writeSCIMError(writer, http.StatusInternalServerError, "the user could not be created")
+			return
+		}
+		created = deactivated
 	}
 	writer.Header().Set("Location", "/v1/scim/v2/Users/"+created.ID)
 	writeSCIM(writer, http.StatusCreated, scimUserResponse(created))
@@ -232,19 +247,40 @@ func (server *Server) handleSCIMUserGet(writer http.ResponseWriter, request *htt
 }
 
 // handleSCIMUserReplace answers PUT /Users/{id}: a full replacement of the
-// idP-controlled fields.
+// idP-controlled fields. An omitted "active" preserves the account's current
+// state, and any transition to or from the disabled state revokes the
+// account's live sessions — deactivation must kill them, and re-enabling must
+// never resurrect tokens issued before the deactivation.
 func (server *Server) handleSCIMUserReplace(writer http.ResponseWriter, request *http.Request) {
 	var input scimUserRequest
 	if !decodeSCIM(writer, request, &input) {
 		return
 	}
-	user, err := scimRequestUser(input, true)
+	organizationID := principalFrom(request.Context()).OrganizationID
+	userID := request.PathValue("userID")
+	current, err := server.database.SCIMUserByID(request.Context(), organizationID, userID)
+	if err != nil {
+		if database.IsNotFound(err) {
+			writeSCIMError(writer, http.StatusNotFound, "the user was not found")
+			return
+		}
+		writeSCIMError(writer, http.StatusInternalServerError, "the user could not be read")
+		return
+	}
+	user, err := scimRequestUser(input, current.Active)
 	if err != nil {
 		writeSCIMError(writer, http.StatusBadRequest, err.Error())
 		return
 	}
-	organizationID := principalFrom(request.Context()).OrganizationID
-	userID := request.PathValue("userID")
+	if err := server.scimGuardSharedAccount(writer, request, organizationID, current, user); err != nil {
+		return
+	}
+	if user.Active && !current.Active {
+		if err := server.scimRevokeSessions(request, organizationID, userID, "scim.user.session_revoke"); err != nil {
+			writeSCIMError(writer, http.StatusInternalServerError, "the user could not be replaced")
+			return
+		}
+	}
 	replaced, err := server.database.SCIMReplaceUser(request.Context(), organizationID, userID, user,
 		server.auditInput(request, "scim.user.replace", "user", userID, map[string]any{"email": user.Email, "active": user.Active}))
 	if err != nil {
@@ -259,13 +295,57 @@ func (server *Server) handleSCIMUserReplace(writer http.ResponseWriter, request 
 		writeSCIMError(writer, http.StatusInternalServerError, "the user could not be replaced")
 		return
 	}
+	if !replaced.Active {
+		if err := server.scimRevokeSessions(request, organizationID, userID, "scim.user.session_revoke"); err != nil {
+			writeSCIMError(writer, http.StatusInternalServerError, "the user could not be replaced")
+			return
+		}
+	}
+	// Attribute sync and deactivation both move the billed seat count; keep
+	// the Stripe quantity in step like the delete path does.
+	server.syncSeatQuantity(request.Context(), organizationID)
 	writeSCIM(writer, http.StatusOK, scimUserResponse(replaced))
+}
+
+// scimRevokeSessions kills every live session of the account through the
+// provisioning store's deactivation transaction, which revokes the account's
+// sessions in the same commit that records the deactivation.
+func (server *Server) scimRevokeSessions(request *http.Request, organizationID, userID, action string) error {
+	_, err := server.database.SCIMSetActive(request.Context(), organizationID, userID, false,
+		server.auditInput(request, action, "user", userID, nil))
+	return err
+}
+
+// scimGuardSharedAccount refuses account-wide changes a single tenant must
+// not make alone. The users row is global: a person who belongs to several
+// organizations (invites, SSO domain joins) must not have their email,
+// external id, or active state rewritten — or their sessions revoked — at one
+// tenant's provisioning whim while another tenant depends on the same
+// account.
+func (server *Server) scimGuardSharedAccount(writer http.ResponseWriter, request *http.Request, organizationID string, current, next database.SCIMUser) error {
+	if strings.EqualFold(next.Email, current.Email) && next.ExternalID == current.ExternalID && next.Active == current.Active {
+		return nil
+	}
+	memberships, err := server.database.Organizations(request.Context(), current.ID, database.NormalizePage(database.MaxPageLimit, 0))
+	if err != nil {
+		writeSCIMError(writer, http.StatusInternalServerError, "the user's memberships could not be read")
+		return err
+	}
+	for _, membership := range memberships {
+		if membership.ID != organizationID {
+			writeSCIMError(writer, http.StatusConflict, "this account is a member of more than one organization; userName, externalId, and active are account-wide and cannot be changed by one organization's provisioning")
+			return errors.New("account is shared across organizations")
+		}
+	}
+	return nil
 }
 
 // handleSCIMUserPatch answers PATCH /Users/{id}. Only the "replace" operation
 // is supported, on the whole attributes this server exposes — no filter paths,
 // no add/remove. Anything else is a 400, which is more honest than silently
-// dropping a change the idP believes it made.
+// dropping a change the idP believes it made. The active attribute follows
+// the same session rules as a full replacement: deactivation revokes, and a
+// re-enable never resurrects.
 func (server *Server) handleSCIMUserPatch(writer http.ResponseWriter, request *http.Request) {
 	var input scimPatchRequest
 	if !decodeSCIM(writer, request, &input) {
@@ -304,9 +384,18 @@ func (server *Server) handleSCIMUserPatch(writer http.ResponseWriter, request *h
 				writeSCIMError(writer, http.StatusBadRequest, "the displayName attribute takes a string value")
 				return
 			}
+			if len(patched.DisplayName) > 200 {
+				writeSCIMError(writer, http.StatusBadRequest, "displayName must be at most 200 characters")
+				return
+			}
 		case "externalid":
 			if err := patchString(value, &patched.ExternalID); err != nil {
 				writeSCIMError(writer, http.StatusBadRequest, "the externalId attribute takes a string value")
+				return
+			}
+			patched.ExternalID = strings.TrimSpace(patched.ExternalID)
+			if len(patched.ExternalID) > 256 {
+				writeSCIMError(writer, http.StatusBadRequest, "externalId must be at most 256 characters")
 				return
 			}
 		case "username":
@@ -321,6 +410,15 @@ func (server *Server) handleSCIMUserPatch(writer http.ResponseWriter, request *h
 			return
 		}
 	}
+	if err := server.scimGuardSharedAccount(writer, request, organizationID, user, patched); err != nil {
+		return
+	}
+	if patched.Active && !user.Active {
+		if err := server.scimRevokeSessions(request, organizationID, userID, "scim.user.session_revoke"); err != nil {
+			writeSCIMError(writer, http.StatusInternalServerError, "the user could not be patched")
+			return
+		}
+	}
 	updated, err := server.database.SCIMReplaceUser(request.Context(), organizationID, userID, patched,
 		server.auditInput(request, "scim.user.patch", "user", userID, map[string]any{"email": patched.Email, "active": patched.Active}))
 	if err != nil {
@@ -328,9 +426,22 @@ func (server *Server) handleSCIMUserPatch(writer http.ResponseWriter, request *h
 			writeSCIMError(writer, http.StatusNotFound, "the user was not found")
 			return
 		}
+		if errors.Is(err, database.ErrSCIMConflict) || database.IsConflict(err) {
+			writeSCIMError(writer, http.StatusConflict, "an account with this email or external id already exists")
+			return
+		}
 		writeSCIMError(writer, http.StatusInternalServerError, "the user could not be patched")
 		return
 	}
+	if !updated.Active {
+		if err := server.scimRevokeSessions(request, organizationID, userID, "scim.user.session_revoke"); err != nil {
+			writeSCIMError(writer, http.StatusInternalServerError, "the user could not be patched")
+			return
+		}
+	}
+	// Patches move the billed seat count as much as deletes do; keep the
+	// Stripe quantity in step.
+	server.syncSeatQuantity(request.Context(), organizationID)
 	writeSCIM(writer, http.StatusOK, scimUserResponse(updated))
 }
 
@@ -359,10 +470,27 @@ func patchEmail(value []byte) (string, error) {
 
 // handleSCIMUserDelete answers DELETE /Users/{id}. In SCIM, deleting a user
 // means deactivating the account: sessions die in the same transaction, but
-// the row survives for the audit trail.
+// the row survives for the audit trail. An account shared with other
+// organizations is not one tenant to disable.
 func (server *Server) handleSCIMUserDelete(writer http.ResponseWriter, request *http.Request) {
 	organizationID := principalFrom(request.Context()).OrganizationID
 	userID := request.PathValue("userID")
+	current, err := server.database.SCIMUserByID(request.Context(), organizationID, userID)
+	if err != nil {
+		if database.IsNotFound(err) {
+			writeSCIMError(writer, http.StatusNotFound, "the user was not found")
+			return
+		}
+		writeSCIMError(writer, http.StatusInternalServerError, "the user could not be read")
+		return
+	}
+	if current.Active {
+		next := current
+		next.Active = false
+		if err := server.scimGuardSharedAccount(writer, request, organizationID, current, next); err != nil {
+			return
+		}
+	}
 	if _, err := server.database.SCIMSetActive(request.Context(), organizationID, userID, false,
 		server.auditInput(request, "scim.user.delete", "user", userID, nil)); err != nil {
 		if database.IsNotFound(err) {
@@ -372,6 +500,8 @@ func (server *Server) handleSCIMUserDelete(writer http.ResponseWriter, request *
 		writeSCIMError(writer, http.StatusInternalServerError, "the user could not be deactivated")
 		return
 	}
+	// Deactivation frees the member's seat; keep the Stripe quantity in step.
+	server.syncSeatQuantity(request.Context(), organizationID)
 	writer.WriteHeader(http.StatusNoContent)
 }
 
@@ -390,7 +520,7 @@ func (server *Server) handleSCIMServiceProviderConfig(writer http.ResponseWriter
 			"name":        "API Key Bearer",
 			"description": "An organization API key with the scim scope, sent as an HTTP bearer token",
 			"specUri":     "https://datatracker.ietf.org/doc/html/rfc7644#section-2.1",
-			"type":        "httpbasic",
+			"type":        "oauthbearertoken",
 			"primary":     true,
 		}},
 	})

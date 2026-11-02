@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -102,10 +103,20 @@ func distributionName() string {
 			values[key] = strings.Trim(value, "\"")
 		}
 	}
+	// The "id-version" vocabulary ("ubuntu-24.04") is what the support
+	// matrix and the compatibility policy match against. PRETTY_NAME point
+	// releases ("Ubuntu 24.04.1 LTS" vs "24.04.2") must not look like
+	// different distributions.
+	if values["ID"] != "" {
+		if values["VERSION_ID"] != "" {
+			return values["ID"] + "-" + values["VERSION_ID"]
+		}
+		return values["ID"]
+	}
 	if values["PRETTY_NAME"] != "" {
 		return values["PRETTY_NAME"]
 	}
-	return strings.TrimSpace(values["ID"] + " " + values["VERSION_ID"])
+	return "linux"
 }
 
 func totalMemory() (uint64, error) {
@@ -187,7 +198,7 @@ func virtualFilesystem(filesystem string) bool {
 
 func inspectCRIU(parent context.Context) model.CRIUCapabilities {
 	capabilities := model.CRIUCapabilities{}
-	path, err := exec.LookPath("criu")
+	path, err := lookPathTrusted("criu")
 	if err != nil {
 		capabilities.Errors = []string{"criu executable not found"}
 		return capabilities
@@ -197,7 +208,7 @@ func inspectCRIU(parent context.Context) model.CRIUCapabilities {
 	defer cancel()
 	versionOutput, err := exec.CommandContext(ctx, path, "--version").CombinedOutput()
 	if err == nil {
-		capabilities.Version = strings.TrimSpace(string(versionOutput))
+		capabilities.Version = parseCRIUVersion(string(versionOutput))
 	}
 	check := exec.CommandContext(ctx, path, "check")
 	output, err := check.CombinedOutput()
@@ -233,12 +244,74 @@ func inspectFeatures() map[string]bool {
 		"mount_namespaces": exists("/proc/self/ns/mnt"),
 		"overlayfs":        filesystemSupported("overlay"),
 		"nftables":         commandExists("nft"),
-		"gnu_tar":          commandExists("tar"),
+		"gnu_tar":          gnuTarAvailable(),
 	}
 	if content, err := os.ReadFile("/proc/sys/vm/unprivileged_userfaultfd"); err == nil {
 		features["unprivileged_userfaultfd"] = strings.TrimSpace(string(content)) == "1"
 	}
 	return features
+}
+
+// gnuTarAvailable reports whether the tar on PATH really is GNU tar. Busybox,
+// bsdtar, and toybox tar all answer `tar --version` with their own banner and
+// silently drop ACLs, xattrs, and ownership on restore — the archive-tool gate
+// must be satisfied by the implementation the restore promise needs, not by
+// any binary named tar.
+func gnuTarAvailable() bool {
+	path, err := lookPathTrusted("tar")
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, path, "--version").CombinedOutput()
+	return err == nil && strings.Contains(string(output), "GNU tar")
+}
+
+// parseCRIUVersion extracts a clean dotted version from a `criu --version`
+// banner ("Version: 4.2 (git 4.2)" → "4.2"), so the compatibility gate floors
+// a version instead of a marketing line. Unparseable banners yield "".
+func parseCRIUVersion(output string) string {
+	versionPattern := regexp.MustCompile(`\d+(?:\.\d+)+`)
+	for _, field := range strings.Fields(output) {
+		if candidate := versionPattern.FindString(field); candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// lookPathTrusted resolves an executable like exec.LookPath but refuses
+// binaries the agent must not trust: device and capability claims come from
+// these tools' output, so a shadowed binary in a user-writable PATH entry
+// would spoof the machine's inventory. The resolved file must be a regular,
+// non-group/world-writable binary owned by root or by the agent's own user.
+func lookPathTrusted(name string) (string, error) {
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return "", err
+	}
+	if !trustedExecutable(path) {
+		return "", fmt.Errorf("%s resolves to %s, which the agent cannot trust", name, path)
+	}
+	return path, nil
+}
+
+// trustedExecutable applies the ownership and mode rules of lookPathTrusted
+// to one resolved path.
+func trustedExecutable(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 {
+		return false
+	}
+	stats, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return stats.Uid == 0 || stats.Uid == uint32(os.Geteuid())
 }
 
 func filesystemSupported(name string) bool {
@@ -271,6 +344,6 @@ func exists(path string) bool {
 }
 
 func commandExists(name string) bool {
-	_, err := exec.LookPath(name)
+	_, err := lookPathTrusted(name)
 	return err == nil
 }

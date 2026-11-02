@@ -31,6 +31,29 @@ type CreateOptions struct {
 	Timeout      time.Duration
 }
 
+// BookkeepingError reports a checkpoint that is durable in the local
+// repository while a post-persistence step failed — the changed-file index,
+// the object-store mirror, or the runtime bookkeeping. The checkpoint exists
+// and is restorable; retrying Create would only duplicate it. Callers should
+// treat the checkpoint as created and retry the bookkeeping (e.g.
+// MirrorCheckpoint) rather than the whole create.
+type BookkeepingError struct {
+	CheckpointID string
+	Err          error
+}
+
+func (e *BookkeepingError) Error() string {
+	return fmt.Sprintf("checkpoint %s is persisted locally but bookkeeping failed: %v", e.CheckpointID, e.Err)
+}
+
+func (e *BookkeepingError) Unwrap() error { return e.Err }
+
+// OutcomeBookkeepingFailed is the diagnostics outcome for a create that
+// persisted its checkpoint but failed in post-persistence bookkeeping —
+// distinct from success and failure so the series never counts a durable
+// checkpoint as a failed one.
+const OutcomeBookkeepingFailed = "bookkeeping_failed"
+
 type Engine interface {
 	Check(context.Context) error
 	Version(context.Context) (string, error)
@@ -53,9 +76,12 @@ type Service struct {
 	logger          *slog.Logger
 	createInFlight  map[string]struct{}
 	createInFlightM sync.Mutex
+	policyMu        sync.Mutex
+	restorePolicy   *RestorePolicy
 }
 
 func NewService(stateDir string, runtimeManager *shiftruntime.Manager, machineIdentity *identity.Identity, inventory *linuxplatform.Inventory, chunks *chunkstore.Store, repository *Repository, criu Engine, logger *slog.Logger) *Service {
+	repository.Trust().TrustLocal(machineIdentity.Machine.ID)
 	return &Service{stateDir: stateDir, runtime: runtimeManager, identity: machineIdentity, inventory: inventory, chunks: chunks, repository: repository, criu: criu, logger: logger, createInFlight: make(map[string]struct{})}
 }
 
@@ -85,6 +111,14 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 			return
 		}
 		if err != nil {
+			// A checkpoint that is durable despite the error is not a failed
+			// checkpoint: it gets its own outcome so the series distinguishes
+			// "persisted, bookkeeping incomplete" from "not created".
+			var persisted *BookkeepingError
+			if errors.As(err, &persisted) {
+				s.diagnostics.CheckpointFinished(OutcomeBookkeepingFailed)
+				return
+			}
 			s.diagnostics.CheckpointFinished(observability.OutcomeFailure)
 			return
 		}
@@ -131,7 +165,7 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 	if options.Kind == model.CheckpointFull && options.ParentID != "" {
 		return model.CheckpointManifest{}, errors.New("full checkpoint cannot have a parent checkpoint")
 	}
-	ctx, cancel := commandTimeout(parent, options.Timeout)
+	ctx, cancel := commandTimeout(parent, options.Timeout, int64(workload.Spec.Resources.MemoryBytes))
 	defer cancel()
 	if err := s.criu.Check(ctx); err != nil {
 		return model.CheckpointManifest{}, err
@@ -329,29 +363,40 @@ func (s *Service) Create(parent context.Context, workloadID string, options Crea
 	if err := s.repository.Save(manifest); err != nil {
 		return model.CheckpointManifest{}, err
 	}
+	// The checkpoint is durable from here on: a later failure is bookkeeping,
+	// not a lost checkpoint. The workload must end exactly as a successful
+	// create leaves it — never resumed when the caller asked for
+	// LeaveRunning — and the caller must be able to tell "persisted, retry
+	// the bookkeeping" apart from "not created".
+	if !resumedEarly {
+		resumeOnFailure = originallyRunning && options.LeaveRunning
+	}
+	bookkeeping := func(failure error) (model.CheckpointManifest, error) {
+		return manifest, &BookkeepingError{CheckpointID: checkpointID, Err: failure}
+	}
 	// The checkpoint exists now, so this instant's file index becomes the
 	// baseline the next checkpoint's changed-file accounting diffs against.
 	if err := os.MkdirAll(filepath.Join(s.stateDir, "indices"), 0o700); err != nil {
-		return model.CheckpointManifest{}, err
+		return bookkeeping(err)
 	}
 	if err := filesystem.SaveIndex(indexPath, currentIndex); err != nil {
-		return model.CheckpointManifest{}, fmt.Errorf("persist changed-file index: %w", err)
+		return bookkeeping(fmt.Errorf("persist changed-file index: %w", err))
 	}
 	if s.mirror != nil {
 		_, mirrorErr := s.MirrorCheckpoint(ctx, checkpointID)
 		if mirrorErr != nil {
-			return model.CheckpointManifest{}, fmt.Errorf("checkpoint %s persisted locally but object-store mirror failed: %w", checkpointID, mirrorErr)
+			return bookkeeping(fmt.Errorf("object-store mirror failed: %w", mirrorErr))
 		}
 	}
 	resume := originallyRunning && options.LeaveRunning && !resumedEarly
 	if resume {
 		if _, err := s.runtime.Resume(workload.Spec.ID); err != nil {
-			return model.CheckpointManifest{}, fmt.Errorf("checkpoint stored but source could not resume: %w", err)
+			return bookkeeping(fmt.Errorf("source could not resume: %w", err))
 		}
 		resumeOnFailure = false
 	}
 	if _, err := s.runtime.MarkCheckpoint(workload.Spec.ID, checkpointID, originallyRunning && options.LeaveRunning); err != nil {
-		return model.CheckpointManifest{}, err
+		return bookkeeping(err)
 	}
 	resumeOnFailure = false
 	s.logger.Info("checkpoint created", "checkpoint_id", checkpointID, "workload_id", workload.Spec.ID, "plain_bytes", metrics.PlainBytes, "stored_bytes", metrics.StoredBytes)
@@ -369,9 +414,13 @@ func (s *Service) materializeParentImages(ctx context.Context, workloadID, paren
 		return fmt.Errorf("load parent checkpoint %s: %w", parentID, err)
 	}
 	if parent.Workload.ID != workloadID {
-		return fmt.Errorf("parent checkpoint %s belongs to workload %s", parentID, parent.Workload.ID)
+		return fmt.Errorf("parent checkpoint %s belongs to workload %s", parent.ID, parent.Workload.ID)
 	}
-	return materializeProcessChain(ctx, s.repository, s.chunks, parent, destination)
+	policy, err := s.activeRestorePolicy()
+	if err != nil {
+		return err
+	}
+	return materializeProcessChain(ctx, s.repository, s.chunks, parent, destination, policy)
 }
 
 func (s *Service) Load(id string) (model.CheckpointManifest, error) {
@@ -480,8 +529,28 @@ func (s *Service) PruneWorkload(workloadID string, keepLast int) ([]string, erro
 	return deleted, nil
 }
 
+// Import admits a checkpoint manifest from a non-peer ingest path (operator
+// import, restored archive). A self-consistent signature is not admission:
+// any key pair mints one, so the signer must be a trust anchor of this
+// destination — this machine, or an operator-pinned source identity.
 func (s *Service) Import(manifest model.CheckpointManifest) error {
+	if err := s.repository.Trust().Admit(manifest); err != nil {
+		return err
+	}
 	return s.repository.Save(manifest)
+}
+
+// PublicManifest returns the control-plane-safe projection of a checkpoint:
+// plaintext environment values, command arguments, declared paths, and
+// unkeyed plaintext chunk digests are removed. The full manifest stays on
+// agents (it is stored encrypted there); this is the only form that may
+// leave the data plane.
+func (s *Service) PublicManifest(id string) (model.CheckpointManifest, error) {
+	manifest, err := s.repository.Load(id)
+	if err != nil {
+		return model.CheckpointManifest{}, err
+	}
+	return manifest.Public(), nil
 }
 
 // MirrorCheckpoint retries object-store publication for a checkpoint that was

@@ -378,3 +378,59 @@ func TestWithdrawNotifiesTheWatcher(t *testing.T) {
 		t.Fatalf("refused withdrawal must not notify, saw %d", len(withdrawals))
 	}
 }
+
+// TestChunkIngestEnforcesQuotaAtAnyEstimate: the size reservation is enforced
+// on every chunk put, and a tiny or missing estimate can never disable it —
+// a zero estimate reserves the default, and both bounds are accounted before
+// the bytes are stored.
+func TestChunkIngestEnforcesQuotaAtAnyEstimate(t *testing.T) {
+	f := newReplicationFixture(t)
+	ctx := context.Background()
+	sessionID, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := f.client.Reserve(ctx, ReserveRequest{
+		ID: sessionID, SourceMachineID: f.machine.Machine.ID, WorkloadID: "workload-1",
+		EstimatedBytes: 1, ExpiresAt: time.Now().Add(30 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := f.client.ImportKey(ctx, session.ID, "workload-1", f.keyVersion, f.workloadKey); err != nil {
+		t.Fatalf("import key: %v", err)
+	}
+	missing, err := f.client.ImportManifest(ctx, session.ID, f.manifest)
+	if err != nil {
+		t.Fatalf("import manifest: %v", err)
+	}
+	if len(missing.Missing) == 0 {
+		t.Fatal("fixture must report missing chunks")
+	}
+	err = f.client.UploadChunk(ctx, session.ID, missing.Missing[0], f.chunks)
+	if err == nil || !strings.Contains(err.Error(), "TRANSFER_QUOTA_EXCEEDED") {
+		t.Fatalf("chunk ingest must enforce the reservation, got %v", err)
+	}
+}
+
+// TestExpiredSessionRejectsIngest: a reservation whose clock ran out stops
+// accepting keys and chunks at the door instead of storing bytes first.
+func TestExpiredSessionRejectsIngest(t *testing.T) {
+	f := newReplicationFixture(t)
+	ctx := context.Background()
+	sessionID, err := model.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := f.client.Reserve(ctx, ReserveRequest{
+		ID: sessionID, SourceMachineID: f.machine.Machine.ID, WorkloadID: "workload-1",
+		ExpiresAt: time.Now().Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	err = f.client.ImportKey(ctx, session.ID, "workload-1", f.keyVersion, f.workloadKey)
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("ingest on an expired reservation must be refused, got %v", err)
+	}
+}

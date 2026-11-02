@@ -18,6 +18,10 @@ type fakeSTS struct {
 	authorization string
 	contentSHA256 string
 	body          []byte
+	// expiration is what the fake issues; tests set it to exercise the
+	// returned-lifetime checks. Zero means one hour from now — the lifetime
+	// the callers below request.
+	expiration time.Time
 }
 
 func (server *fakeSTS) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -41,6 +45,10 @@ func (server *fakeSTS) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	server.body = body
 	// The STS signing scope names the "sts" service, not "s3".
 	server.sawSTS = strings.Contains(server.authorization, "/sts/aws4_request")
+	expiration := server.expiration
+	if expiration.IsZero() {
+		expiration = time.Now().UTC().Add(time.Hour)
+	}
 	writer.Header().Set("Content-Type", "application/xml")
 	_, _ = writer.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
 <AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
@@ -49,7 +57,7 @@ func (server *fakeSTS) ServeHTTP(writer http.ResponseWriter, request *http.Reque
       <AccessKeyId>STSROLED</AccessKeyId>
       <SecretAccessKey>STSROLESECRET</SecretAccessKey>
       <SessionToken>STSROLETOKEN</SessionToken>
-      <Expiration>2030-01-01T00:00:00Z</Expiration>
+      <Expiration>` + expiration.UTC().Format(time.RFC3339) + `</Expiration>
     </Credentials>
   </AssumeRoleResult>
 </AssumeRoleResponse>`))
@@ -59,6 +67,7 @@ func TestAssumeRoleSignsForServiceSTSAndParsesCredentials(t *testing.T) {
 	server := &fakeSTS{}
 	httptestServer := httptest.NewServer(server)
 	defer httptestServer.Close()
+	before := time.Now().UTC()
 	credentials, err := AssumeRole(context.Background(), httptestServer.URL, "test-1", "parent", "parent-secret", `{"Version":"2012-10-17"}`, time.Hour, httptestServer.Client())
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +75,7 @@ func TestAssumeRoleSignsForServiceSTSAndParsesCredentials(t *testing.T) {
 	if credentials.AccessKeyID != "STSROLED" || credentials.SecretAccessKey != "STSROLESECRET" || credentials.SessionToken != "STSROLETOKEN" {
 		t.Fatalf("unexpected credentials: %#v", credentials)
 	}
-	if credentials.Expiration.UTC() != time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC) {
+	if credentials.Expiration.Before(before.Add(59*time.Minute)) || credentials.Expiration.After(time.Now().UTC().Add(61*time.Minute)) {
 		t.Fatalf("unexpected expiration: %v", credentials.Expiration)
 	}
 	if server.policy != `{"Version":"2012-10-17"}` {

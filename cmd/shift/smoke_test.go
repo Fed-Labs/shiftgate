@@ -103,7 +103,7 @@ func TestCLIOverUnixSocket(t *testing.T) {
 		t.Fatalf("unexpected stopped workload: %#v", stopped)
 	}
 
-	runTestCLI(t, endpoint, "workload", "delete", workloadID)
+	runTestCLI(t, endpoint, "workload", "delete", workloadID, "--yes")
 	workloadID = ""
 	output = runTestCLI(t, endpoint, "workload", "list")
 	decodeTestCLIJSON(t, output, &workloads)

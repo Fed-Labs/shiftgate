@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -26,10 +27,14 @@ type Client struct {
 
 // APIError carries the control plane's structured error body. The Code is the
 // machine-readable contract (the same codes the OpenAPI document lists).
+// Refusal bodies also carry the paywall next steps (upgrade_url, trial_url)
+// so the CLI can print a door alongside every wall (plan 2 BR-12).
 type APIError struct {
-	Status  int
-	Code    string
-	Message string
+	Status     int
+	Code       string
+	Message    string
+	UpgradeURL string
+	TrialURL   string
 }
 
 func (e *APIError) Error() string { return e.Code + ": " + e.Message }
@@ -44,8 +49,12 @@ func New(baseURL string, timeout time.Duration) (*Client, error) {
 	if baseURL == "" {
 		baseURL = config.DefaultControlPlaneURL
 	}
-	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
-		return nil, fmt.Errorf("control plane URL must be http(s), got %q", baseURL)
+	parsed, parseErr := url.Parse(baseURL)
+	if parseErr != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return nil, fmt.Errorf("control plane URL must be http(s) with a host, got %q", baseURL)
+	}
+	if parsed.Scheme == "http" && parsed.Hostname() != "127.0.0.1" && parsed.Hostname() != "localhost" && parsed.Hostname() != "::1" {
+		return nil, fmt.Errorf("control plane URL must use https outside local development, got %q", baseURL)
 	}
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -59,6 +68,10 @@ func (c *Client) URL() string { return c.baseURL }
 // do performs one request. accessToken may be empty for the public endpoints
 // (login, plans). A non-2xx response is returned as *APIError.
 func (c *Client) do(ctx context.Context, method, requestPath, accessToken string, input, output any) error {
+	return c.doWithHeaders(ctx, method, requestPath, accessToken, input, output, nil)
+}
+
+func (c *Client) doWithHeaders(ctx context.Context, method, requestPath, accessToken string, input, output any, headers map[string]string) error {
 	var body io.Reader
 	if input != nil {
 		encoded, err := json.Marshal(input)
@@ -76,6 +89,9 @@ func (c *Client) do(ctx context.Context, method, requestPath, accessToken string
 	}
 	if accessToken != "" {
 		request.Header.Set("Authorization", "Bearer "+accessToken)
+	}
+	for key, value := range headers {
+		request.Header.Set(key, value)
 	}
 	response, err := c.http.Do(request)
 	if err != nil {
@@ -97,11 +113,13 @@ func (c *Client) do(ctx context.Context, method, requestPath, accessToken string
 
 func decodeError(response *http.Response) error {
 	var remote struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
+		Code       string `json:"code"`
+		Message    string `json:"message"`
+		UpgradeURL string `json:"upgrade_url"`
+		TrialURL   string `json:"trial_url"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&remote); err == nil && remote.Message != "" {
-		return &APIError{Status: response.StatusCode, Code: remote.Code, Message: remote.Message}
+		return &APIError{Status: response.StatusCode, Code: remote.Code, Message: remote.Message, UpgradeURL: remote.UpgradeURL, TrialURL: remote.TrialURL}
 	}
 	return &APIError{Status: response.StatusCode, Code: "HTTP_ERROR", Message: response.Status}
 }
