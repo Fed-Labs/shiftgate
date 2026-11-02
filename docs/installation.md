@@ -8,17 +8,38 @@ The fastest path on a supported host — no Go toolchain, no compiler:
 curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh | bash
 ```
 
+Every downloaded byte is SHA-256-verified before it runs or installs. When
+you can pin a hash out of band, prefer the verified form:
+
+```sh
+# Pin the installer itself (publish its hash alongside the release announce):
+curl -fsSLO https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh
+curl -fsSLO https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh.sha256
+sha256sum -c install.sh.sha256          # proves the bytes you fetched are the published bytes
+SHIFT_INSTALL_SHA256="$(awk '{print $1}' install.sh.sha256)" sh install.sh
+```
+
+The one-command pipe verifies the same way against the release's
+`install.sh.sha256` sidecar (and against `SHIFT_INSTALL_SHA256` when set);
+the sidecar is same-origin — it proves integrity against corruption and most
+tampering, not authenticity against a compromised release channel. Authen-
+ticity comes from the signed-release ceremony in
+[the release process](release.md) (not yet performed for the launch build —
+see the note there).
+
 The installer (`deployments/dist/install.sh` in the repository):
 
 - verifies Linux x86_64, downloads `shiftgate-linux-amd64.tar.gz`, and refuses to
   install unless its SHA-256 matches the release's `.sha256` sidecar;
-- installs `shiftgate`, `shift-agent`, and `shift-control` under `/usr/local/bin`
-  (sudo is used only when the target prefix needs it — `--prefix` a writable
-  directory and no password is ever asked);
+- installs `shiftgate`, `shift-agent`, `shift-control`, the offline `shift-gc`, the
+  backup-drill verifier `shift-verify`, and the outbound relay `shift-relay`
+  under `/usr/local/bin` (sudo is used only when the target prefix needs it —
+  `--prefix` a writable directory and no password is ever asked);
 - installs CRIU through the distribution's package manager when it is missing;
-- creates the `shift` system group, adds the installing user to it, and the
-  agent hands its Unix socket to that group — so the CLI works unprivileged
-  after one re-login (or `newgrp shift`);
+- creates the `shift` system group and the `shift` system user (the latter
+  for the `shift-control`/`shift-relay` units), adds the installing user to
+  the group, and the agent hands its Unix socket to that group — so the CLI
+  works unprivileged after one re-login (or `newgrp shift`);
 - writes a local-only `/etc/shift/agent.json` — a Unix-socket API with no
   remote listener, so no TLS material is needed — and enables the agent as a
   systemd service.
@@ -39,39 +60,52 @@ A maintainer cuts a release with:
 
 ```sh
 make dist                                                   # dist/shiftgate-linux-amd64.tar.gz + .sha256 + .txt
-gh release create vX.Y.Z dist/shiftgate-linux-amd64.tar.gz \
-                     dist/shiftgate-linux-amd64.tar.gz.sha256 \
-                     dist/shiftgate-linux-amd64.txt \
-                     deployments/dist/install.sh
+gh release create vX.Y.Z \
+    dist/shiftgate-linux-amd64.tar.gz \
+    dist/shiftgate-linux-amd64.tar.gz.sha256 \
+    dist/shiftgate-linux-amd64.txt \
+    install.sh install.sh.sha256 \
+    bin/shiftgate bin/shift-agent bin/shift-control \
+    bin/shift-gc bin/shift-verify bin/shift-relay
 ```
 
-Uploading `install.sh` itself as an asset is what makes the one-command URL
-above work — `releases/latest/download/install.sh` always resolves to the
-newest release's copy. The signing ceremony for agent-driven updates is
-described in [the release process](release.md); it is independent of this
-installer, which pins nothing and relies on TLS plus the checksum sidecar.
+Uploading `install.sh` (and its `install.sh.sha256` sidecar) as assets is
+what makes the one-command URL above work — `releases/latest/download/...`
+always resolves to the newest release's copy. The signing ceremony for
+agent-driven updates is described in [the release process](release.md); the
+installer verifies every fetched artifact's SHA-256 before install, and an
+operator can additionally pin the installer hash via `SHIFT_INSTALL_SHA256`
+as shown above.
 
 ## One-command install (from sources)
 
 From a repository checkout on a supported host:
 
 ```sh
-./install.sh
+sudo ./install.sh
 ```
 
-The installer verifies Linux x86_64, installs distribution packages for Go/CRIU/build tools,
-builds from local sources, verifies every binary checksum, and installs `shiftgate`,
-`shift-agent`, and `shift-control` under `/usr/local/bin`. It does not generate private
-TLS material or expose a remote listener.
+The installer verifies Linux x86_64, installs distribution packages for Go/CRIU/build
+tools, builds from local sources (an integrity check of the build output — provenance
+is the checkout itself), and installs `shiftgate`, `shift-agent`, `shift-control`, the
+offline `shift-gc`, `shift-verify`, and `shift-relay` under `/usr/local/bin`. It reaches
+the same end state as the
+release installer: it creates the `shift` system group and the `shift` system user,
+enrolls the installing user in the group, writes a local-only `/etc/shift/agent.json`
+(mode 0600 — a Unix-socket API with no remote listener, so no TLS material is
+needed) — and enables the agent as a systemd service.
+TLS files are demanded only when the installed configuration actually references them
+(a `remote_listen` deployment); a missing certificate fails with the two remedies
+named (install the files, or remove `remote_listen`/`tls` for a local-only agent).
 
-To install the systemd unit as well, first place the certificate, key, and peer CA at the
-paths in `deployments/systemd/agent.json.example`, then run:
+Flags mirror the release installer: `--no-service` for binaries only, `--prefix
+/custom/path` for a non-system prefix (the service is skipped on a custom prefix —
+the unit expects `/usr/local/bin`). `--systemd` is accepted for compatibility but no
+longer needed; installing the service is the default. When the script is run without a
+checkout (for example `curl | bash` of a source-tree copy), it downloads and delegates
+to the release installer instead.
 
-```sh
-sudo ./install.sh --systemd
-```
-
-Use `--prefix /custom/path` for a non-system prefix. From the moment the
+From the moment the
 installer begins replacing binaries, any failure — a failed step as much as a
 failed service activation — restores the prior installation exactly: replaced
 binaries come back from their `.pre-shift` aside copies, binaries the run
@@ -86,21 +120,25 @@ and the explicit opt-in:
 
 ## Linux agent
 
-Build the binaries with Go 1.24 or newer:
+Build the binaries with Go 1.25 or newer:
 
 ```sh
 make build
 sudo install -m 0755 bin/shift-agent /usr/local/bin/shift-agent
 install -m 0755 bin/shiftgate "$HOME/.local/bin/shiftgate"
 sudo install -d -m 0750 /etc/shift/tls
-sudo install -m 0644 deployments/systemd/agent.json.example /etc/shift/agent.json
+# Mode 0600 is mandatory: the agent's loader refuses any config readable by
+# group or other ("chmod 600") and crash-loops on anything wider.
+sudo install -m 0600 deployments/systemd/agent.json.example /etc/shift/agent.json
 # Optional: configure S3/local checkpoint mirroring.
 sudo install -m 0600 deployments/systemd/agent.env.example /etc/shift/agent.env
 sudo systemctl enable --now shift-agent.service
 ```
 
-Before enabling the service, replace the example TLS paths with certificates issued by
-the private agent CA. For an unprivileged evaluation, use a writable state directory and
+Before enabling the service, either make the config local-only (delete `remote_listen`
+and the `tls` block — the Unix socket API needs no TLS material, and the installers
+write exactly that) or replace the example TLS paths with certificates issued by the
+private agent CA. For an unprivileged evaluation, use a writable state directory and
 Unix socket; CRIU will report missing capabilities accurately.
 
 Leave `/etc/shift/agent.env` absent or keep `SHIFT_OBJECTSTORE_ENABLED` unset to disable
@@ -177,7 +215,10 @@ instance, set `--control-url` / `SHIFT_CONTROL_URL` (CLI, agents) or
 `NEXT_PUBLIC_API_URL` (dashboard) to its address (for a local instance,
 `http://127.0.0.1:8090`, matching the stock listen address above).
 
-The service applies `database/migrations/*.sql` transactionally at startup. Do not expose
+The service applies `database/migrations/*.sql` in the background after the HTTP
+listener opens — it keeps serving during the apply, and `/ready` reports
+`SCHEMA_MIGRATION_FAILED` (with the `shift_schema_migration_failed` metric) until the
+schema is current. Do not expose
 the development HTTP listener directly to the public internet; terminate TLS at a
 reverse proxy and enforce network policy there.
 

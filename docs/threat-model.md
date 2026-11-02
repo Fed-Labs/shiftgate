@@ -66,15 +66,21 @@ source can read and exfiltrate what it already hosts. What it cannot do:
   scoped API key bound to the machine's organization.
 
 Exposed: a compromised source can destroy or leak its own workloads' state, and can sign
-new checkpoints as itself. Recovery is restoring from object-storage mirrors or backups —
-mirrored manifests are verified before publication, so a mirror written by a healthy
-period remains restorable.
+new checkpoints as itself. Recovery is backups — run
+[the backup drill](backup-drill.md) — not object-storage mirrors: mirror
+download is not implemented, so a mirror is not a restore source (mirrored
+manifests are verified before publication and the ciphertext is intact, but
+nothing can pull a checkpoint back yet).
 
 ## 3. Stolen credentials
 
 - **Control-plane tokens.** Only HMAC digests of access and refresh tokens are stored;
-  access tokens live 15 minutes, refresh tokens rotate transactionally on use (a replayed
-  refresh token invalidates the session chain), and logout revokes the session. A stolen
+  access tokens live 15 minutes, refresh tokens rotate transactionally on use. The last
+  five retired refresh digests are remembered, and a token matching **any** of them is
+  treated as refresh-token reuse: the whole session chain is revoked immediately (an old
+  client retrying with a two-generations-old token gets logged out — by design). Only a
+  token older than that five-generation window falls through as an unknown, stale
+  rejection without a session revocation. Logout revokes the session. A stolen
   access token grants at most its TTL; a stolen refresh token is detected at rotation.
 - **API keys.** Scoped (broad `read`/`operate`/`admin` or per-resource), bound to one
   organization, stored only as digests, revocable. A leaked key's blast radius is its scope.
@@ -119,7 +125,9 @@ threat 2); signatures establish provenance, not intent.
 
 Exposed: nothing specific to SHIFT — tampering is detected, and the failure is the real
 error. What SHIFT cannot do is prove a chunk was not *deleted* from object storage; keep
-backend versioning or backups if deletion resistance matters.
+backend versioning or backups if deletion resistance matters. Reference-aware garbage
+collection is conservative and auditable, but deletion resistance still requires provider
+versioning or independent backups.
 
 ## 6. Man-in-the-middle
 
@@ -190,7 +198,22 @@ Mitigations: keep PostgreSQL and the control plane on a private network, monitor
 logs for anomalous sessions and key creation, and scope what the control plane can reach
 at the network layer.
 
-## 10. Malicious local user
+## 10. Fencing and split-brain
+
+Automatic standby restore is admitted only after a monotone workload ownership epoch is
+acquired from the control plane and a configured fencing provider returns `fenced` or
+`already_fenced`. The default provider is disabled; source silence, a stale heartbeat, or
+lease expiry alone is never a fence. Self-fencing is documented as an operator-configured
+watchdog boundary, not as physical fencing. Command providers are bounded and allow-listed,
+and every acquire/fence/failover decision is audited without the opaque ownership token.
+
+A manual trigger is intentionally available for incidents, but it returns an explicit unsafe
+warning and may create two live copies if the source is partitioned. A source returning with
+an old epoch is rejected from ownership/replication operations and requires operator
+resolution. A compromised external fencing provider remains a trust boundary: deployers must
+secure it like power-management or hypervisor fencing infrastructure.
+
+## 11. Malicious local user
 
 - Agent state (master keys, workload keys, identity) is 0600 inside a 0700 state directory;
   another user cannot read keys, checkpoints, or manifests.

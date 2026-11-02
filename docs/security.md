@@ -28,11 +28,71 @@ object storage is enabled, the remote backend receives only encrypted chunk ciph
 the encrypted manifest envelope (plus object-key and size metadata); workload keys and
 plaintext environment values remain on agents.
 
-Control-plane password hashes use Argon2id and a separate pepper. Access and refresh token
-digests, never bearer values, are persisted. Rotate peppers by deploying a migration that
-re-hashes credentials and invalidates sessions; do not place peppers in source control.
+**At-rest confidentiality of the key hierarchy depends on the master-key keyfile.**
+Without one, the agent stores master keys as plaintext base64 in
+`master-keyring.json`, protected only by the state directory's permissions — a
+copied, backed-up, or leaked state directory then exposes every workload data
+key. Production deployments must set `SHIFT_MASTER_KEY_FILE` to a keyfile
+stored *outside* the agent state directory (a root-owned 0600 file on a
+separate secret path); master keys are then sealed under a key derived from
+that file, so a leaked state directory alone yields only ciphertext. The
+keyfile is the key boundary: back it up separately from the state directory,
+and losing it makes existing checkpoints undecryptable. There is no warning or
+refusal at startup for an unprotected keyring today — checking
+`SHIFT_MASTER_KEY_FILE` is part of the production configuration
+checklist.
+
+Control-plane password hashes use Argon2id and a separate pepper. Access and refresh
+tokens and API keys are opaque random values — no JSON Web Tokens are issued or
+accepted anywhere in the system — and only token digests (keyed HMAC-SHA256 with the
+token pepper), never bearer values, are persisted. Do not place peppers in
+source control; rotation is described under
+[Pepper rotation](#pepper-rotation) below.
+
+### Pepper rotation
+
+Password hashes are `Argon2id(HMAC(pepper, password))` — one-way in the
+pepper — so stored hashes cannot be re-hashed from SQL under a new pepper,
+and no dual-pepper verify-and-rehash-on-login path exists today. Rotation is
+therefore asymmetric, and there is no migration that re-hashes credentials:
+
+- **Token pepper (`SHIFT_TOKEN_PEPPER`)**: rotate by deploying the new value
+  and restarting the control plane. Every session and API-key digest becomes
+  unverifiable — a fleet-wide re-login (and API-key reissue), nothing worse.
+- **Password pepper (`SHIFT_PASSWORD_PEPPER`)**: rotating it makes every
+  stored password unverifiable. The only honest procedure today is a forced
+  password reset for every user (out-of-band, with the usual account-
+  verification flow) deployed together with the new pepper. Do not rotate it
+  believing hashes will follow — every login fails until passwords are
+  reset.
+
+Treat both peppers as long-lived, back them up like the keys they are, and
+keep this procedure next to your secret manager's runbook.
 The OIDC client secret is used only at the issuer's token endpoint as HTTP Basic
 authentication, never in a form body or a redirect, and is never logged.
+
+## Cryptography and key management
+
+The primitives are standard and off-the-shelf: HKDF-SHA256 for key derivation,
+AES-256-GCM for chunk and envelope encryption, Ed25519 for machine identity and
+manifest signatures, and TLS 1.3 for transport. No custom cryptography is
+implemented anywhere in the system. Keys are generated and held by the agent in
+its state directory (0600); master keys at rest are plaintext there unless
+`SHIFT_MASTER_KEY_FILE` seals them (see Stored secrets). SHIFT has no
+customer-managed key or external KMS integration — organizations that need one
+must treat the agent state directory, its keyfile, and their backups as the
+key boundary.
+
+## Encryption export posture
+
+The cryptographic implementation uses only standard, publicly available algorithms and
+is therefore intended to fall under standard encryption-export exceptions (for example
+License Exception ENC/TSU for mass-market availability); no dedicated export
+self-classification has been filed. The product, primitives, and key-management
+statement suitable for compliance questionnaires are recorded in
+[docs/legal/export-classification.md](legal/export-classification.md). Operators
+shipping appliances across borders should confirm their own classification — that note
+is not legal advice.
 
 ## Single sign-on and provisioning
 

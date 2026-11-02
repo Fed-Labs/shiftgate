@@ -57,12 +57,23 @@
   the source preserved and running. The final checkpoint remains authoritative and
   the workload is stopped for the final transfer; the pre-dump passes reduce, never
   eliminate, the frozen transfer. Transparent filesystem copy-on-write is not assumed.
-  Plan tiering: live mode dispatched through the control plane — the migration job
-  route or the agent command dispatcher — requires a paid plan (the free tier is
-  cold-only, enforced as `LIVE_MIGRATION_PLAN_REQUIRED`). A peer-to-peer
-  `shiftgate migrate --mode live` between your own agents never touches the control
-  plane, so the platform cannot gate it; the tier applies to platform-mediated
-  migrations only.
+  Plan tiering: live mode is a paid entitlement, enforced at every admission point
+  the product controls. The control plane refuses a live-mode migration job or
+  agent-command dispatch on a cold-only plan (`402 LIVE_MIGRATION_PLAN_REQUIRED`),
+  and the same gate applies to peer-to-peer moves: `shiftgate migrate --mode live`
+  checks the signed-in organization's entitlement before anything is frozen, and the
+  agent's local API refuses a live-mode create unless the entitlement its
+  control-plane identity reports allows live migration — a lapsed or cancelled
+  subscription falls back to cold-only. Cold mode is never gated, and
+  `migrate --dry-run`/`--preflight` stays free so compatibility can always be
+  checked. This is a licensing boundary at the product surface, not DRM: an operator
+  with root on both hosts can run CRIU by hand or edit an open-source agent, and a
+  fully detached agent (no control plane configured) has no entitlement source —
+  air-gapped deployments assert the entitlement explicitly in the agent
+  configuration, and we do not pretend that assertion cannot be forged. What the gate
+  guarantees is that the shipped product surface — CLI, dashboard, and agent API —
+  never performs a live move the organization's plan does not include, so the pricing
+  table and the product agree.
 - Periodic checkpoint policies snapshot a running workload every interval (floor 10
   seconds) without stopping it. Each periodic snapshot is a full checkpoint — every
   retained snapshot restores on its own, at the cost of full-size storage per snapshot —
@@ -76,16 +87,19 @@
   measured from the newest checkpoint and skipped while a workload is not running or a
   migration is in flight; there is no cross-node coordination of policies — each agent
   applies the policies in the workload specs it owns.
-- Warm-standby failover replicates only the newest root checkpoint per scheduler
-  pass over the peer channel — incrementals are not replicated, so the recovery
-  point is the last root checkpoint and the exposure window is one checkpoint
-  interval, not the incremental chain. Failover itself has no fencing: a standby
-  that restores while the source is actually alive runs an independent copy, and
-  SHIFT's defenses are the trigger command's live-source probe warning (an
-  operator's check) and, on the automatic path, the two-signal rule — the
-  standby acts only when the source's peer listener is unreachable and its
-  control-plane presence record is stale (90 seconds without a heartbeat) or
-  offline. That judgment needs both facts: automatic failover requires a control
+- Warm-standby failover replicates only the newest root checkpoint per
+  scheduler pass over the peer channel — incrementals are not replicated, so
+  the recovery point is the last root checkpoint and the exposure window is
+  one checkpoint interval, not the incremental chain. Automatic failover
+  additionally requires a control-plane ownership epoch and a positively
+  returning fencing provider; the default fencing provider is disabled, so
+  lease expiry, source silence, and a self-fence declaration alone do not
+  authorize automatic restore. A standby without a positively returning
+  fence provider never restores automatically; a manual trigger is
+  explicitly unsafe and can produce two live copies if the source is
+  partitioned. When fencing is configured, the automatic path still requires the two-signal rule —
+  the source's peer listener is unreachable and its control-plane presence record
+  is stale (90 seconds without a heartbeat) or offline. That judgment needs both facts: automatic failover requires a control
   plane, both machines reporting presence to it, and the source configured with
   `control_plane.agent_url` (otherwise there is nothing to probe). The source's
   configured `control_plane.machine_id` must equal its agent identity's machine
@@ -200,11 +214,24 @@
   (control-plane credential brokering) enforces the plan quota on credential
   issuance and meters usage by reconciling bucket bytes, but performs no
   per-checkpoint garbage collection in the cloud: mirrored objects are
-  content-addressed chunks retained for restore and deduplication, so deleting
-  a checkpoint does not delete its mirrored objects. Cleanup today is
+  content-addressed chunks retained for deduplication, so deleting a
+  checkpoint does not delete its mirrored objects and does not reduce
+  metered storage usage — deleting checkpoints alone never recovers a
+  quota-blocked organization. Restores read from local agent state only:
+  downloading a checkpoint back out of the mirror is not implemented
+  (`Mirror.Download` is not wired), so a mirror is **not** a recovery path
+  and object storage must not be treated as a backup (use the
+  [backup drill](backup-drill.md)). Cleanup today is
   operator-side (`mc rm --recursive` on the organization's prefix, accepting
   the loss of restore/dedup for those chunks) or a plan upgrade; fine-grained
   cloud GC that tracks live references is planned, not faked here.
+- Platform-mediated (managed) migrations are dispatched by a control-plane worker that
+  must reach the source agent's local API Unix socket (`local_agent_url`, under the
+  worker's `LocalAgentSocketRoot`), so the worker and the source agent currently run on
+  the same host; jobs registered without a local endpoint fail with an actionable error.
+  Peer-to-peer `shiftgate migrate` between agents is unaffected. The fleet-wide
+  consequence — one long managed migration blocks the queue behind it — is a known
+  scaling limit of the current worker.
 - Forking produces an independent workload with its own filesystem copy, its own key
   namespace, its own full checkpoint, and its own virtual network address; SHIFT
   deliberately implements no state-merge operation, and only records the lineage a future
@@ -243,9 +270,14 @@
   collector.
 - Billing covers subscription plans through Stripe: a server-side catalog, hosted checkout
   and billing-portal sessions, signature-verified subscription webhooks, and
-  database-enforced machine/storage entitlements. Metered usage beyond subscription limits
-  is recorded (usage summaries) but not billed by unit, and no proration, invoicing, or
-  dunning logic runs locally — Stripe's portal handles all payment operations.
+  database-enforced machine/storage entitlements. Storage and transfer above
+  the plan's included amounts are metered and billed at the catalog's per-unit
+  rates against a customer-settable spend cap
+  (`OverageStorageCentsPerGB` / `OverageTransferCentsPerGB` /
+  `OverageCapCentsDefault`, `OVERAGE_CAP_REACHED`). What does not exist yet:
+  usage forecasts and threshold notifications beyond the 80% warn flag on the
+  usage summary, and no proration, invoicing, or dunning logic runs locally —
+  Stripe's portal handles all payment operations.
 - Single sign-on federates to exactly one OIDC issuer per control plane: all organizations
   share it, an organization cannot pick a different issuer, and only authorization-code
   flow with PKCE is supported (no implicit, hybrid, device, or CIBA flows). ID tokens must
@@ -258,8 +290,35 @@
   bulk operations, sorting, and ETags are not implemented, and the service provider
   configuration says so. Filters support `eq`, `co`, `sw`, `ew`, and `pr` joined by `and` —
   no `or`, `not`, grouping, or complex value paths — and unsupported shapes are rejected
-  with a `400` rather than approximated. `PATCH` supports only the `replace` operation.
-  SCIM delete deactivates rather than deletes, so an account disabled in the IdP keeps its
-  history (and its unique email) forever unless an operator removes the row directly.
+  with   a `400` rather than approximated. `PATCH` supports only the `replace` operation.
+  SCIM delete deactivates rather than deletes: the row survives so audit trails keep
+  pointing at a real account, but the personal data does not survive forever. A
+  deactivated account's email and connection metadata live only for a 30-day grace
+  window; the retention sweep then anonymizes the row irreversibly
+  (`AnonymizeDeactivatedUsers` in `internal/database/erasure.go`), and a user can
+  erase their own account immediately with `DELETE /v1/users/me` (see
+  [api.md](api.md#account-erasure)).
+- Schema migrations are forward-only. Only one migration ships a companion
+  `.down.sql`, so the down path refuses to revert from the applied head: there
+  is no schema rollback between deploys. Reverting a bad deploy means
+  restoring PostgreSQL from backup while rolling binaries back — plan upgrades
+  around that (see [backup-drill.md](backup-drill.md)).
+- Retention windows are plan-capped, not just tier-priced: Free and Pro
+  organizations can set at most 365 days per window (audit, checkpoints,
+  deleted-storage grace); only Business/Enterprise may run to the 36500-day
+  ceiling. `0` (keep forever) is available on every tier. A window above the
+  cap is refused with `402 RETENTION_PLAN_LIMIT`, never silently shortened
+  (see [operations.md](operations.md#retention)).
+- The audit-event list paginates with `limit` (clamped to 500) and `offset`;
+  deeper walks are sequential only — there is no cursor or date-range seek, so
+  pulling a very large trail is one-page-at-a-time. Export through deployment
+  logging covers the long tail today.
+- Organization membership is add-only through the API:
+  `POST /v1/organizations/{id}/members` upserts a member with a role (a
+  re-post changes the role) and the per-seat ceiling is enforced, but there is
+  no member listing or removal endpoint and the entitlement response does not
+  expose the purchased seat count. The dashboard shows the caller's own
+  membership; managing the full roster goes through support or the database
+  until a members API exists.
 - A workload filesystem root must be explicitly configured and cannot be `/` or an
   unrestricted home directory.

@@ -5,13 +5,19 @@ manifests and migration records carry each metric as it happens, so nothing
 here is a projection, an estimate, or a number a poller approximated
 afterwards. Ranges are three consecutive runs on one machine; the benchmark
 source lives in the repository and the exact commands to reproduce each
-table are at the end.
+table are at the end. The live-mode rows exercise `--mode live`, which is a
+paid plan feature — the free tier is cold-only — but reproducing them needs
+no organization or control plane: the documented harness runs detached
+agents and asserts the live-migration entitlement in agent configuration
+itself ([limitations.md](limitations.md)).
 
 ## Environment
 
 - One machine, 12 logical CPUs. Both `shift-agent` processes and the
   workloads ran inside one privileged `golang:1.24-bookworm` container with
-  CRIU 3.17.1 on a 6.12 kernel.
+  CRIU 3.17.1 on a 6.12 kernel. SHIFT's CRIU policy is CRIU 3.17+ or 4.x;
+  `criu check` must pass; certified lines are listed in
+  [support-matrix.json](support-matrix.json).
 - The two agents are separate processes with separate state directories,
   identities, keys, and cgroup roots — but they share the host's CPUs and
   one NVMe-backed filesystem. The destination is not a second machine with

@@ -5,7 +5,14 @@ authentication (password and single sign-on), organizations, machines, workload 
 checkpoints, migration jobs, migration events, API keys, usage, entitlements, the plan
 catalog, checkout and billing portal, audit events, retention policies, hosted checkpoint
 storage (status, agent credential issuance, usage reconciliation), health, Stripe
-webhooks, and SCIM v2 user provisioning.
+webhooks, the agent command channel (machine-scoped poll/complete), and SCIM v2 user
+provisioning. Also live and typed in the spec: trials (`GET`/`POST
+/v1/organizations/{id}/trial`, `TrialStatus`/`TrialStarted`), referrals (`GET
+/v1/organizations/{id}/referral`, `POST /v1/organizations/{id}/referral/claim`,
+`ReferralStats`), usage rollups (`GET /v1/organizations/{id}/usage/summary`,
+`UsageSummaryReport`), public platform numbers (`GET /v1/public/stats`,
+`PublicStats`), and the admin scoreboard (`GET /v1/admin/scoreboard`,
+`ScoreboardCounters` — platform-admin only).
 
 API keys are opaque `Bearer` credentials. They are bound to the organization in which they
 were created and can carry broad (`read`, `operate`, `admin`) or resource-specific
@@ -16,6 +23,10 @@ lost secret must be revoked and replaced. API-key metadata never contains the se
 Checkpoint registration stores manifest and accounting metadata in PostgreSQL; encrypted
 content-addressed chunks remain on agents. Migration events are append-only and returned in
 sequence order. Usage queries accept inclusive `from` and exclusive `to` ISO-8601 dates.
+Control-plane list endpoints paginate with `limit` (1–500, default 100; values above the
+cap are clamped) and `offset` (records to skip) over a stable newest-first order — the
+audit-event list included (limit clamped at 500, `offset` walks deeper into the trail;
+there is no cursor or date-range seek — see [limitations.md](limitations.md)).
 
 The local agent contract is intentionally separate because it uses Unix peer credentials
 and machine-to-machine TLS. Its endpoints are rooted at `/v1/health`, `/v1/machine`,
@@ -69,7 +80,7 @@ the workload runtime state.
 workload: `interval_seconds` (floor 10) and optional `keep_last` retention count. A
 missing or non-positive interval removes the policy. While the workload runs, the agent
 takes a full `leave_running` checkpoint every interval and, with `keep_last`, prunes the
-oldest snapshots beyond the count — never an ancestor a kept checkpoint still needs.
+oldest checkpoints beyond the count — never an ancestor a kept checkpoint still needs.
 The schedule is measured from the newest checkpoint, so it survives agent restarts, and
 a checkpoint already in flight for the workload makes a concurrent create fail with
 `422 CHECKPOINT_FAILED` rather than queue. The response is the updated workload; an
@@ -85,6 +96,54 @@ unreachable destination is `502 DESTINATION_UNREACHABLE`; a destination that res
 the source machine or to a machine other than the requested id is `422
 DESTINATION_IS_SOURCE` / `422 DESTINATION_IDENTITY_MISMATCH` — the same codes a real
 migration would fail with.
+
+## Migration jobs (control plane)
+
+`POST /v1/organizations/{id}/migrations` registers a platform-mediated migration job:
+`workload_id`, `source_machine_id`, `destination_machine_id`, optional `mode`
+(`cold` (default) or `live`), optional `route` (`direct` or `relay`), an optional
+`idempotency_key` (the `Idempotency-Key` header is preferred), and an optional
+`timeout_seconds`. The job record returned (and returned by the job list/get endpoints)
+carries `route`, and for relay-routed transfers `relay_endpoint` (the relay bridge
+endpoint) and `relay_ticket` (a one-use ticket for the transfer session — never logged).
+Peer-to-peer migrations between an operator's own agents never create a job here.
+
+## Agent command channel
+
+The control plane delivers work to registered agents over a machine-authenticated
+channel. `POST /v1/organizations/{id}/machines/{machineID}/commands` (operator) queues a
+command for the machine's agent; `GET /v1/organizations/{id}/machines/{machineID}/commands/poll`
+lets the agent claim the next queued command (an empty queue is `204`), and
+`POST /v1/organizations/{id}/machines/{machineID}/commands/{commandID}/complete` settles
+it with the agent's outcome. Poll and complete require a machine-scoped API key bound to
+the same organization — user sessions cannot claim or settle commands — so a stolen
+browser session can never impersonate an agent. Delivery is at-most-once per claim: a
+command's delivery window expires, an expired command is never claimed, and a
+completion is accepted only from the machine and claim that polled it.
+
+## Workload ownership and fenced failover
+
+`POST /v1/organizations/{id}/ownership/acquire` returns the next monotone ownership
+`epoch` for a workload on a machine, plus an opaque `token` that is returned exactly
+once and never persisted in plaintext; a second, unexpired owner holding the workload is
+`409`. `POST /v1/organizations/{id}/ownership/fence` confirms a fenced failover: the body
+is `{workload_id, machine_id, epoch, token}` — the epoch and token from `acquire` — and
+a successful response is `200 {state: "fenced", epoch}`. A stale epoch or a wrong token
+is an ownership conflict (`409`). This is the fencing path automatic standby restore
+requires (see [threat-model.md](threat-model.md)); lease expiry or source silence alone
+never substitutes for it.
+
+## Account erasure
+
+`DELETE /v1/users/me` is the account-erasure mechanism: it irreversibly anonymizes the
+calling user's personal data (email, display name, password hash, session tokens, and
+audit IP/user-agent metadata) and revokes every session. The user row itself survives as
+a pseudonymous stub so audit trails, organization membership, and billing history keep
+valid references. The response is an erasure report of counts only —
+`{user_id, email_anonymized, sessions_removed, api_keys_removed, audit_ips_scrubbed}` —
+never the destroyed data. Accounts deactivated through SCIM reach the same end state through the
+retention sweep's anonymization pass after a 30-day grace window (see
+[limitations.md](limitations.md)).
 
 ## Fleet capability queries and retention
 
@@ -102,7 +161,10 @@ The projection is rebuilt inside the same transaction as each machine write
 windows in days. `PUT` with the same path accepts any subset of
 `audit_retention_days`, `checkpoint_retention_days`, and
 `deleted_storage_retention_days`; omitted fields keep their value, `0` is the
-deliberate keep-forever policy, and values must be 0–36500. Changes are audited as
+deliberate keep-forever policy (every tier), and values must be 0–36500 — but
+are plan-capped: Free and Pro windows above 365 days are refused with
+`402 RETENTION_PLAN_LIMIT` (Business/Enterprise may use the full range;
+see [operations.md](operations.md#retention)). Changes are audited as
 `retention.update` with the resulting windows in the metadata.
 
 The control plane enforces the windows on a background sweep
@@ -116,12 +178,23 @@ soft-deleted are purged after their grace window.
 `GET /v1/plans` is public and returns the plan catalog: each tier's name, price in cents
 (`0` free, `-1` custom), seat model, description, advertised features, and the machine and
 storage limits the control plane enforces. Each plan also carries `live_migration` —
-false on the free tier — which the control plane enforces on platform-mediated
-migrations: a live-mode `POST /v1/organizations/{id}/migrations` or `migrate` agent
-command dispatch for a cold-only plan is refused with
-`402 LIVE_MIGRATION_PLAN_REQUIRED`. Peer-to-peer migrations between your own agents
-never touch the control plane and are not tier-gated. The catalog is the single source
-of plan truth — the pricing page renders it and entitlement checks use it.
+false on the free tier — which the product enforces at every admission point: a live-mode
+`POST /v1/organizations/{id}/migrations`, a live-mode `migrate` agent-command dispatch,
+and a peer-to-peer live move driven through the CLI or the agent's local API are all
+refused for a cold-only plan with `402 LIVE_MIGRATION_PLAN_REQUIRED` (the CLI reports the
+same code as a failed command). Cold mode is never gated. The catalog is the single
+source of plan truth — the pricing page renders it and entitlement checks use it.
+
+## Organization members and seats
+
+`POST /v1/organizations/{id}/members` (admin) upserts one membership by email with a
+role (owner cannot be assigned by this endpoint; the owner role is immutable through
+it). On per-seat plans the purchased seat quantity is the ceiling: an add past it is
+`402 SEATS_EXCEEDED`, and a role change to an existing member never consumes a seat.
+Member listing and removal are not part of the API today, and the entitlement
+response does not carry the purchased seat count — the dashboard shows the
+caller's own membership, and additions go through this endpoint; see
+[limitations.md](limitations.md).
 
 `POST /v1/organizations/{id}/billing/checkout` (admin) opens a Stripe-hosted checkout
 session for a catalog plan and returns `{url, session_id, plan}`. The request supplies the
@@ -224,7 +297,10 @@ refused rather than mis-executed. `PATCH` supports only the `replace` operation 
 are `400`s, never silently dropped.
 
 SCIM delete means deactivation: the account's live sessions are revoked in the same
-transaction, and the row survives so audit trails keep pointing at a real account. Every
+transaction, and the row survives so audit trails keep pointing at a real account. The
+deactivated account's personal data does not survive forever — see
+[Account erasure](#account-erasure) for the grace-window sweep and `DELETE
+/v1/users/me`. Every
 provisioning mutation is audited (`scim.user.create`, `scim.user.replace`,
 `scim.user.patch`, `scim.user.delete`). Only the Users resource is implemented; Groups is
 not — see [limitations](limitations.md).

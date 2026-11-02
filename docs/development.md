@@ -9,6 +9,10 @@ environment that runs the real CRIU end-to-end suite on one machine.
 cmd/shift           CLI client (local agent + fleet operations)
 cmd/shift-agent     the agent daemon
 cmd/shift-control   the control-plane server
+cmd/shift-gc        offline chunk garbage collector
+cmd/shift-verify    encrypted-state / support-matrix verifier
+cmd/shift-release   release document signing tooling
+cmd/shift-relay     migration relay
 internal/agent      local API (Unix socket), peer API (TLS), service wiring
 internal/checkpoint CRIU engine, manifests, restore transactions, forks
 internal/chunkstore content-addressed encrypted chunk storage
@@ -29,7 +33,7 @@ tests/integration   the real-workload e2e and stress suites
 ## Build and unit tests
 
 ```bash
-make build        # all three binaries into ./bin
+make build        # all six binaries into ./bin
 make test         # unit tests
 make test-race    # race detector
 make vet
@@ -118,7 +122,7 @@ tmpfs, and a cgroup OOM kill.
 ```bash
 make desktop        # frontend type-check+bundle, then cargo build
 make test-desktop   # the Rust agent-transport tests (HTTP/1.1 over the socket)
-python3 scripts/make-icon.py   # regenerate src-tauri/icons/icon.png if needed
+python3 apps/desktop/scripts/make-icon.py   # regenerate src-tauri/icons/icon.png if needed
 ```
 
 The icon script needs no third-party packages — it is a stdlib PNG writer.

@@ -133,7 +133,7 @@ A workload's spec can carry a checkpoint policy (interval, optional retention co
 scheduler goroutine in the agent reconsiders policies every 5 seconds: a running workload
 whose interval has elapsed — measured from its newest checkpoint, or its creation when
 none exists — gets a full `leave_running` checkpoint, after which retention deletes the
-oldest snapshots beyond the count, never an ancestor a kept checkpoint still needs. The
+oldest checkpoints beyond the count, never an ancestor a kept checkpoint still needs. The
 schedule is derived from persisted facts only, so it survives agent restarts; workloads
 that are not running or have a migration in flight are skipped. Policies are per-agent
 and per-workload — there is no cross-node coordination, because each agent is the
@@ -166,10 +166,18 @@ rollback on failure), marks the duty failed-over with the reason, and clears the
 workload's failover policy while leaving its checkpoint schedule — the restored workload
 is live but unprotected until re-armed. A failed attempt is recorded on the duty and
 retried a minute later. The operator path, `standby trigger`, runs the same restore but
-starts by probing the source and says so when the source answers. There is no fencing
-mechanism — nothing revokes the source's claim to the workload — so a failover during a
-live source runs an independent copy; the probe warning and the staleness bound are the
-documented defenses, not a guarantee.
+starts by probing the source and says so when the source answers. Before an
+*automatic* failover the standby must additionally acquire a control-plane
+ownership epoch and get a positive `fenced`/`already_fenced` answer from the
+configured fencing provider (`fencing.provider` in the agent config). The
+default provider is `disabled` and never fences, so on a default deployment
+automatic failover is blocked outright ("no fencing provider is
+configured"); only a `command` integration that positively fences the source
+unlocks it. A manual `standby trigger` is explicitly unsafe — nothing
+revokes the source's claim, so triggering during a live source can run an
+independent copy. The epoch, the probe warning, and the staleness bound are
+layered defenses, not a standalone guarantee (see
+[threat-model.md](threat-model.md) §10).
 
 ## Observability
 

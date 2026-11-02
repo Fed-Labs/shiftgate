@@ -10,11 +10,13 @@ something the system reports about itself.
 shiftgate doctor
 ```
 
-It runs the same checks the agent exposes at `GET /v1/doctor`: CRIU
-installed and healthy, kernel capabilities, state directory writable,
-chunk store reachable, object store (when configured) reachable. Start here
-before reading anything else; most "migration failed" reports end in one
-of the doctor checks.
+It runs the same checks the agent exposes at `GET /v1/doctor`: platform,
+privileges, CRIU installed and healthy, cgroup v2, and GNU tar availability
+— plus `peer_listener_tls` when a remote listener is configured (and an
+environment `inventory` dump when something failed). It does not check
+chunk-store or object-store reachability; verify those separately before
+backups and migrations. Start here before reading anything else; most
+"migration failed" reports end in one of the doctor checks.
 
 ## "CRIU is not installed" / checkpoint fails
 
@@ -34,8 +36,10 @@ create a netlink socket: Address family not supported by protocol` /
 `Could not initialize kernel features detection` — the unit's seccomp filter
 (`RestrictAddressFamilies`) is missing `AF_NETLINK`, which CRIU needs to
 enumerate network state. The shipped unit allows it since v0.1.4; reinstall
-the current release (`curl -fsSL …/install.sh | bash` restarts the service on
-upgrade) or add `AF_NETLINK` to `RestrictAddressFamilies` in
+the current release with the release installer (`curl -fsSL
+https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh |
+bash` — the repository's `./install.sh` builds from source and behaves the same
+way on upgrade) or add `AF_NETLINK` to `RestrictAddressFamilies` in
 `/etc/systemd/system/shift-agent.service` and `systemctl daemon-reload &&
 systemctl restart shift-agent`.
 
@@ -44,8 +48,8 @@ systemctl restart shift-agent`.
 `shift` is a POSIX shell builtin (it shifts positional parameters), so a
 binary by that name can never be typed — that is why the CLI is called
 `shiftgate`. A v0.1.0 install left a `/usr/local/bin/shift` that no shell
-ever ran; the current installer removes it. Run `shiftgate` (the binary is
-`shiftgate`, not `shift`).
+ever ran; the current installer renames it aside to `shift.pre-shiftgate`.
+Run `shiftgate` (the binary is `shiftgate`, not `shift`).
 
 ## Dashboard login fails with "Failed to fetch"
 
@@ -135,7 +139,7 @@ Run the restore and read the error; it names the failing step:
 ## Desktop client cannot reach the agent
 
 - The socket path in Settings must match the agent's `listen` path.
-  `SHIFT_AGENT_ENDPOINT` overrides it at startup.
+  `SHIFT_AGENT_ENDPOINT (or SHIFT_AGENT)` overrides it at startup.
 - Verify the socket exists and is readable by your group: the agent creates
   it mode 0660 with group ownership per its service setup.
 - The client's Health indicator polls every 10 s; give it one cycle after
@@ -158,7 +162,8 @@ not during a migration, restore, fork, or incoming transfer. Check:
 shiftgate update status
 ```
 
-`pending_restart` means exactly that; it swaps at the next safe point.
+`pending restart: <version>` (JSON field `pending_version`) means exactly
+that; it swaps at the next safe point.
 `shiftgate update rollback` undoes a completed swap; the undone version is
 blocked from reinstalling until `shiftgate update unblock VERSION`.
 
@@ -176,7 +181,7 @@ With `SHIFT_OBJECTSTORE_BACKEND=control-plane`, two failure shapes exist:
   organization is over its plan limit and the control plane is refusing to
   issue credentials (403 `STORAGE_QUOTA_EXCEEDED`). Usage is metered from
   the bucket, so start with the dashboard's Storage page (or
-  `shiftgate control storage`) — if the reconciled number looks wrong,
+  `shiftgate storage`) — if the reconciled number looks wrong,
   force a recount with `POST /v1/organizations/{org}/storage/reconcile`.
   Mirroring resumes once usage is genuinely below the limit or the plan is
   upgraded; local checkpointing is never suspended by a quota.
@@ -184,6 +189,34 @@ With `SHIFT_OBJECTSTORE_BACKEND=control-plane`, two failure shapes exist:
 A control plane that does not host storage answers the credential route with
 `STORAGE_NOT_CONFIGURED` — the agent's backend should be `s3` or `local`
 there, not `control-plane`.
+
+## The disk is filling with checkpoint chunks
+
+Chunk growth is normal (deduplication helps but repeated checkpoints of
+changing state accumulate). **Online garbage collection is shipped**: run
+`shiftgate gc` as root and the agent reclaims unreferenced chunks while it
+keeps serving, under the same write lock its checkpoint writers hold:
+
+```sh
+sudo shiftgate gc --grace 24h --dry-run        # plan only
+sudo shiftgate gc --grace 24h --dry-run=false  # delete orphans past the grace period
+```
+
+If the agent refuses an online sweep (`GC_ROOT_REQUIRED` means rerun with
+sudo) or the agent is down entirely, run the offline sweeper with the agent
+stopped — `shiftgate gc` prints these exact commands:
+
+```sh
+sudo systemctl stop shift-agent
+sudo shift-gc --state-dir /var/lib/shift --grace 24h --dry-run        # plan only
+sudo shift-gc --state-dir /var/lib/shift --grace 24h --dry-run=false  # delete orphans past the grace period
+sudo systemctl start shift-agent
+```
+
+Only chunks unreferenced by every retained checkpoint manifest and past the
+grace period are deleted; a chunk orphaned moments ago is recorded and swept
+on a later run. Mirrored cloud objects are not touched by this (see
+[Operations](operations.md#garbage-collecting-checkpoint-chunks)).
 
 ## Where the facts live
 
