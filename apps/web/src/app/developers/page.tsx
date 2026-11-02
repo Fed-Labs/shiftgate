@@ -37,13 +37,13 @@ const cliCommands = [
 ];
 
 const apiEndpoints = [
-  { method: "GET", path: "/api/v1/machines", description: "List machines" },
-  { method: "GET", path: "/api/v1/workloads", description: "List workloads" },
-  { method: "POST", path: "/api/v1/checkpoints", description: "Create checkpoint" },
-  { method: "POST", path: "/api/v1/migrations", description: "Start migration" },
-  { method: "GET", path: "/api/v1/migrations/:id", description: "Get migration status" },
-  { method: "DELETE", path: "/api/v1/migrations/:id", description: "Cancel migration" },
-  { method: "GET", path: "/api/v1/audit", description: "Query audit logs" },
+  { method: "GET", path: "/v1/organizations/{organizationID}/machines", description: "List registered machines" },
+  { method: "GET", path: "/v1/organizations/{organizationID}/workloads", description: "List workload metadata" },
+  { method: "POST", path: "/v1/organizations/{organizationID}/checkpoints", description: "Register an agent-created checkpoint" },
+  { method: "POST", path: "/v1/organizations/{organizationID}/migrations", description: "Queue a migration job (202 Accepted)" },
+  { method: "GET", path: "/v1/organizations/{organizationID}/migrations/{migrationID}/events", description: "Read ordered migration events" },
+  { method: "POST", path: "/v1/organizations/{organizationID}/migrations/{migrationID}/cancel", description: "Request cancellation" },
+  { method: "GET", path: "/v1/organizations/{organizationID}/audit", description: "Query admin audit events" },
 ];
 
 const methodColors: Record<string, string> = {
@@ -73,7 +73,7 @@ export default function DevelopersPage() {
                 Built for the command line.
               </h1>
               <p className="text-lg text-text-secondary leading-relaxed max-w-2xl">
-                SHIFTGATE is a CLI-first tool with a REST API underneath.
+                SHIFT is a CLI-first tool with a REST API underneath.
                 Script it, automate it, integrate it. The interface stays out
                 of your way.
               </p>
@@ -214,9 +214,9 @@ export default function DevelopersPage() {
   -H "Content-Type: application/json" \\
   -d '{
     "workload_id": "training-run-7",
-    "target_machine": "gpu-node-1",
-    "encrypted": true,
-    "verify_after_restore": true
+    "source_machine_id": "machine-source",
+    "destination_machine_id": "machine-target",
+    "mode": "cold"
   }'`}
                   </pre>
                 </div>
@@ -236,43 +236,37 @@ export default function DevelopersPage() {
                 Programmatic access.
               </h2>
               <p className="text-text-secondary max-w-2xl mb-8">
-                A TypeScript SDK wraps the REST API for use in your own tools
-                and automation.
+                No supported SDK is published yet. Generate a client from OpenAPI or use the CLI.
               </p>
-              <Badge variant="info">Conceptual — API subject to change</Badge>
+              <Badge variant="warning">No supported SDK published</Badge>
             </motion.div>
 
             <motion.div {...fadeUp} className="mt-8">
               <Card className="p-6">
                 <div className="bg-bg rounded-md border border-border-subtle p-4 overflow-x-auto">
                   <pre className="text-sm text-text-secondary leading-relaxed">
-{`import { Shiftgate } from "@shiftgate/sdk";
+{`/* No supported SDK is published yet. Generate a client from the OpenAPI file or use shiftgate. */
 
-const sg = new Shiftgate({
-  apiKey: process.env.SHIFTGATE_API_KEY,
-});
+The control plane API is documented at /api/openapi.yaml.
+The local agent API is protected by Unix peer credentials or mTLS.
 
 // List machines
-const machines = await sg.machines.list();
+curl https://shiftgate.dev/v1/organizations/ORG_ID/machines \
+  -H "Authorization: Bearer $SHIFT_TOKEN";
 
 // Create a checkpoint
-const checkpoint = await sg.checkpoints.create({
-  workloadId: "training-run-7",
-});
+Migration creation queues metadata; the agent performs the state transfer.
 
 // Wait for checkpoint to complete
-await checkpoint.waitForReady();
+
 
 // Migrate to target
-const migration = await sg.migrations.create({
-  checkpointId: checkpoint.id,
-  targetMachine: "gpu-node-1",
-});
+curl -X POST https://shiftgate.dev/v1/organizations/ORG_ID/migrations \
+  -H "Authorization: Bearer $SHIFT_TOKEN" \
+  -H "Idempotency-Key: migration-unique-key" \
+  -d '{"workload_id":"WORKLOAD_ID","source_machine_id":"SOURCE","destination_machine_id":"TARGET","mode":"cold"}'
 
-// Stream migration events
-for await (const event of migration.events()) {
-  console.log(event.stage, event.progress);
-}`}
+Read events from /v1/organizations/{organizationID}/migrations/{migrationID}/events.`}
                   </pre>
                 </div>
               </Card>

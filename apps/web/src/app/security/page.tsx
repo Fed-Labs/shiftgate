@@ -25,23 +25,23 @@ const securitySections = [
     icon: Key,
     title: "Machine identity",
     content:
-      "Every machine running the SHIFTGATE agent generates a unique Ed25519 key pair on first boot. The public key is the machine's identity — used for authentication, key exchange, and checkpoint encryption. Private keys never leave the machine.",
+      "Every machine running the SHIFT agent generates a unique Ed25519 key pair on first boot. The public key is the machine's self-certifying identity — used for authentication and checkpoint manifest signatures. Private keys never leave the machine.",
     details: [
       "Ed25519 key pairs generated locally",
+      "Machine identity is derived from the public key",
       "Public key registered with the control plane",
-      "Private key stored in kernel keyring (keyctl)",
-      "Key rotation supported without downtime",
+      "Private key stored in the agent state directory with restrictive permissions",
     ],
   },
   {
     icon: Lock,
     title: "Encrypted state",
     content:
-      "Checkpoint data is encrypted at rest and in transit. Each checkpoint is encrypted with a unique symmetric key derived from the target machine's public key. Even the control plane cannot read checkpoint contents.",
+      "Checkpoint data is encrypted at rest and in transit. Each workload's data keys are derived with HKDF-SHA256 from a master keyring held on the agent, and a workload's keys reach a destination only inside the mutually authenticated TLS session during migration. Even the control plane cannot read checkpoint contents.",
     details: [
       "AES-256-GCM for data encryption",
-      "X25519 for key exchange",
-      "Unique key per checkpoint",
+      "HKDF-SHA256 key derivation from an agent-held master key",
+      "Per-workload keys with per-purpose derivation",
       "Encrypted at rest — never written plaintext to disk",
     ],
   },
@@ -49,12 +49,12 @@ const securitySections = [
     icon: Shield,
     title: "Authentication",
     content:
-      "All API access is authenticated. Session tokens for interactive use, API keys for automation. Tokens are short-lived and scoped. API keys can be restricted to specific machines and operations.",
+      "All API access is authenticated. Session tokens for interactive use, API keys for automation. Access tokens are short-lived; API keys can be restricted to operation scopes and carry optional expiry.",
     details: [
-      "JWT session tokens (15-minute expiry)",
-      "API keys with optional scope restrictions",
+      "Opaque, digest-stored session tokens (15-minute access, rotating 30-day refresh)",
+      "API keys with scope restrictions and optional expiry",
       "Machine-level authentication via agent certificates",
-      "OAuth 2.0 support for SSO integration",
+      "OIDC single sign-on with PKCE",
     ],
   },
   {
@@ -85,10 +85,10 @@ const securitySections = [
     icon: Server,
     title: "Secure transport",
     content:
-      "Agent-to-agent communication uses mutually authenticated TLS 1.3. Both the source and target agents present certificates. The control plane never sees checkpoint data — it only coordinates the transfer.",
+      "Agent-to-agent communication uses mutually authenticated TLS 1.3. Both the source and target agents present certificates, and identities are bound to each session. The control plane never sees checkpoint data — it only coordinates the transfer.",
     details: [
       "TLS 1.3 with mutual authentication",
-      "Certificate pinning between agents",
+      "Session-bound machine identities on every connection",
       "No checkpoint data through the control plane",
       "Forward secrecy via ephemeral key exchange",
     ],
@@ -97,11 +97,11 @@ const securitySections = [
     icon: Eye,
     title: "Audit events",
     content:
-      "Every action is logged — authentication attempts, migrations, key rotations, configuration changes. Logs are structured (JSON), signed, and can be exported to your SIEM. Tamper-evident via hash chaining.",
+      "Operational actions are recorded in structured audit events. Retention and export depend on the configured control-plane deployment; no signed hash-chain claim is made here.",
     details: [
       "Structured JSON logs",
-      "Hash-chained for tamper detection",
-      "Exportable to syslog, CloudWatch, Datadog",
+      "Available through the audit API",
+      "Export through your deployment logging pipeline",
       "Configurable retention policies",
     ],
   },
@@ -131,7 +131,7 @@ export default function SecurityPage() {
               </h1>
               <p className="text-lg text-text-secondary leading-relaxed max-w-2xl">
                 Moving process state between machines means moving sensitive
-                data. Every layer of SHIFTGATE is designed around that reality.
+                data. Every layer of SHIFT is designed around that reality.
               </p>
             </motion.div>
           </Container>
@@ -224,12 +224,11 @@ export default function SecurityPage() {
                     {[
                       { perm: "View machines and workloads", roles: [true, true, true, true] },
                       { perm: "Create migrations", roles: [true, true, true, false] },
-                      { perm: "Manage machines", roles: [true, true, false, false] },
+                      { perm: "Manage machines (register, commands)", roles: [true, true, true, false] },
                       { perm: "Manage users and roles", roles: [true, true, false, false] },
                       { perm: "Manage API keys", roles: [true, true, false, false] },
                       { perm: "View audit logs", roles: [true, true, false, false] },
-                      { perm: "Organization settings", roles: [true, false, false, false] },
-                      { perm: "Delete organization", roles: [true, false, false, false] },
+                      { perm: "Organization settings (retention, SSO)", roles: [true, true, false, false] },
                     ].map((row) => (
                       <tr key={row.perm}>
                         <td className="p-4 text-text-secondary">{row.perm}</td>
@@ -257,12 +256,13 @@ export default function SecurityPage() {
             <motion.div {...fadeUp}>
               <div className="bg-bg-elevated border border-border rounded-lg p-6">
                 <p className="text-sm text-text-secondary leading-relaxed">
-                  SHIFTGATE does not claim compliance certifications we
+                  SHIFT does not claim compliance certifications we
                   don&apos;t have. The system is designed with security best
                   practices — encrypted transport, least privilege, audit
                   logging — but we leave compliance attestation to the
-                  organizations deploying it. The code is open source. Audit it
-                  yourself.
+                  organizations deploying it. The code is source-available:
+                  everything on your machines is Apache-2.0 and the fleet
+                  control plane is Elastic License 2.0. Audit it yourself.
                 </p>
               </div>
             </motion.div>

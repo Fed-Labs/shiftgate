@@ -13,7 +13,8 @@ import {
 import { useAuth } from "@/lib/store";
 import { api } from "@/lib/api";
 import { Card, Badge, Mono, EmptyState } from "@/components/ui";
-import { timeAgo } from "@/lib/utils";
+import { PlanRequiredState } from "@/components/state";
+import { formatTime, isPlanRequired, timeAgo } from "@/lib/utils";
 import Link from "next/link";
 
 /* ------------------------------------------------------------------ */
@@ -37,14 +38,17 @@ export default function SecurityPage() {
   const orgId = useAuth((s) => s.organization?.id || "");
   const { user, principal, tokens } = useAuth();
 
-  const { data: keys } = useQuery({
+  const { data: keys, error: keysError } = useQuery({
     queryKey: ["api-keys", orgId],
     queryFn: () => api.listAPIKeys(orgId),
     enabled: !!orgId,
   });
 
-  const { data: events } = useQuery({
-    queryKey: ["audit-events", orgId],
+  const { data: events, error: eventsError } = useQuery({
+    // Key carries the page + limit: the Activity page fetches the full
+    // (paged) log under its own key, so the 10-row preview here can never be
+    // served its cache — or vice versa.
+    queryKey: ["audit-events", orgId, "security-preview", 10],
     queryFn: () => api.listAuditEvents(orgId, 10),
     enabled: !!orgId,
   });
@@ -52,7 +56,7 @@ export default function SecurityPage() {
   const activeKeys = keys?.filter((k) => !k.revoked_at) || [];
 
   return (
-    <div>
+    <div className="max-w-6xl mx-auto px-5 md:px-10 py-10">
       {/* Header */}
       <div className="mb-8">
         <h1 className="text-2xl font-semibold text-text">Security</h1>
@@ -86,7 +90,12 @@ export default function SecurityPage() {
           <div>
             <p className="text-xs text-text-muted uppercase tracking-wider">Expires</p>
             <p className="text-sm text-text mt-1">
-              {tokens?.expires_at ? timeAgo(tokens.expires_at) : "—"}
+              {tokens?.expires_at ? (
+                <>
+                  {formatTime(tokens.expires_at)}
+                  <span className="text-text-muted"> ({timeAgo(tokens.expires_at)})</span>
+                </>
+              ) : "—"}
             </p>
           </div>
         </div>
@@ -107,6 +116,13 @@ export default function SecurityPage() {
             </Link>
           </div>
 
+          {keysError ? (
+            isPlanRequired(keysError) ? (
+              <PlanRequiredState feature="API key management" plan="Business" />
+            ) : (
+              <EmptyState title="Failed to load API keys" description="Could not fetch API keys." />
+            )
+          ) : (
           <div className="flex items-center gap-6">
             <div>
               <p className="text-2xl font-bold text-text">{activeKeys.length}</p>
@@ -117,6 +133,7 @@ export default function SecurityPage() {
               <p className="text-xs text-text-muted">Revoked</p>
             </div>
           </div>
+          )}
 
           {activeKeys.length > 0 && (
             <div className="mt-4 space-y-2">
@@ -159,7 +176,9 @@ export default function SecurityPage() {
           </div>
 
           <p className="text-xs text-text-muted mt-3">
-            Session tokens are stored locally and refreshed automatically.
+            The rotating refresh credential is an httpOnly cookie the browser never exposes
+            to page script; the short-lived access token is refreshed automatically before it
+            expires.
           </p>
         </Card>
       </div>
@@ -178,7 +197,13 @@ export default function SecurityPage() {
           </Link>
         </div>
 
-        {!events || events.length === 0 ? (
+        {eventsError ? (
+          isPlanRequired(eventsError) ? (
+            <PlanRequiredState feature="Audit logging" plan="Business" />
+          ) : (
+            <EmptyState title="Failed to load activity" description="Could not fetch audit events." />
+          )
+        ) : !events || events.length === 0 ? (
           <EmptyState title="No recent activity" description="Audit events will appear here." />
         ) : (
           <div className="space-y-1">
@@ -187,7 +212,7 @@ export default function SecurityPage() {
                 <div className="flex items-center gap-3">
                   <Badge variant={actionVariant(event.action)}>{event.action}</Badge>
                   <span className="text-sm text-text-secondary">{event.resource_type}</span>
-                  <Mono className="text-xs text-text-muted">{event.resource_id.slice(0, 8)}</Mono>
+                  <Mono className="text-xs text-text-muted">{(event.resource_id ?? "").slice(0, 8)}</Mono>
                 </div>
                 <span className="text-xs text-text-muted">{timeAgo(event.created_at)}</span>
               </div>

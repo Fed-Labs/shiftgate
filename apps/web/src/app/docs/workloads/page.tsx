@@ -3,16 +3,18 @@ import { Container, Section } from "@/components/ui";
 
 export const metadata: Metadata = {
   title: "Workloads",
-  description: "Workload specs, lifecycle, resource requirements, device policies, and network policies in SHIFTGATE.",
+  description: "Workload specs, lifecycle, resource requirements, device policies, and network policies in SHIFT.",
 };
 
 const LIFECYCLE_STATES = [
   { state: "registered", description: "Spec recorded by the local agent; process is not running." },
+  { state: "starting", description: "Agent is launching the process and adopting its process group." },
   { state: "running", description: "Agent launched the process and adopted its process group." },
   { state: "paused", description: "Process group stopped for checkpoint or failure handling." },
   { state: "checkpointed", description: "Execution state captured. Process may be paused." },
   { state: "restoring", description: "State is being restored on a target machine." },
   { state: "stopped", description: "Process terminated. State may still exist as a checkpoint." },
+  { state: "failed", description: "The process died with an error — including an OOM kill inside its cgroup, reported with the kernel's reason, never as a clean stop." },
 ];
 
 export default function WorkloadsPage() {
@@ -27,7 +29,7 @@ export default function WorkloadsPage() {
             Workloads
           </h1>
           <p className="text-text-secondary max-w-2xl text-lg leading-relaxed">
-            A workload is the unit of portable computation in SHIFTGATE. It
+            A workload is the unit of portable computation in SHIFT. It
             encapsulates a running process along with its resource requirements,
             file system paths, device policies, and network configuration.
           </p>
@@ -54,7 +56,7 @@ export default function WorkloadsPage() {
   "root_path": "/absolute/path/to/demo",
   "working_dir": "/absolute/path/to/demo",
   "resources": {
-    "cpu_cores": 2,
+    "cpu_count": 2,
     "memory_bytes": 2147483648,
     "storage_bytes": 104857600
   },
@@ -136,11 +138,34 @@ export default function WorkloadsPage() {
           </div>
         </div>
 
+        {/* Lifecycle commands */}
+        <div className="mb-12">
+          <h2 className="text-xl font-semibold mb-4">Lifecycle commands</h2>
+          <div className="rounded-lg border border-border bg-bg-elevated overflow-hidden">
+            <table className="w-full text-sm">
+              <tbody className="divide-y divide-border-subtle">
+                {[
+                  ["shiftgate workload start | pause | resume ID", "Launch the process, stop the process group temporarily, or continue it."],
+                  ["shiftgate workload stop ID [--timeout DURATION]", "Stop the process group and release the runtime record after the grace period."],
+                  ["shiftgate workload delete ID [--yes]", "Remove the workload. Destructive: prompts on a terminal, requires --yes in scripts."],
+                  ["shiftgate workload logs ID [--tail N]", "Show the captured stdout/stderr trailing lines (default 200)."],
+                  ["shiftgate workload inspect ID", "Show the full spec and runtime state as JSON."],
+                ].map(([cmd, desc]) => (
+                  <tr key={cmd}>
+                    <td className="px-5 py-3 font-mono text-xs text-accent whitespace-nowrap">{cmd}</td>
+                    <td className="px-5 py-3 text-xs text-text-secondary">{desc}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         {/* Resource requirements */}
         <div>
           <h2 className="text-xl font-semibold mb-4">Resource requirements</h2>
           <p className="text-sm text-text-secondary leading-relaxed mb-4">
-            SHIFTGATE compares declared resources with a destination&apos;s inventory
+            SHIFT compares declared resources with a destination&apos;s inventory
             before restore. It does not schedule workloads onto another host.
           </p>
           <div className="rounded-lg border border-border bg-bg-elevated overflow-hidden">
@@ -154,9 +179,10 @@ export default function WorkloadsPage() {
               </thead>
               <tbody className="divide-y divide-border-subtle">
                 {[
-                  ["cpu_cores", "Number", "2"],
+                  ["cpu_count", "Number", "2"],
                   ["memory_bytes", "Integer", "2147483648"],
                   ["storage_bytes", "Integer", "1073741824"],
+                  ["pids", "Integer", "4096"],
                   ["gpus", "Array of GPU requirements", "[]"],
                 ].map(([resource, format, example]) => (
                   <tr key={resource}>

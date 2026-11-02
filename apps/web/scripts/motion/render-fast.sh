@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+out="$(cd "$(dirname "$0")/../../public/media" && pwd)"
+font=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+mono=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+filter=/tmp/shiftgate-film-filter.txt
+cat > "$filter" <<'FILTER'
+drawgrid=w=80:h=80:t=1:c=0x19191e@0.35,
+drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='SHIFTGATE':x=100:y=70:fontsize=24:fontcolor=0x14e0b0:enable='between(t,0,35)',
+drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:text='MOVE':x=100:y=275:fontsize=132:fontcolor=0xe9e7e2:enable='between(t,0,4.67)':alpha='min(1,t/1.2)',
+drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:text='THE WORK':x=100:y=410:fontsize=132:fontcolor=0x14e0b0:enable='between(t,0,4.67)':alpha='min(1,t/1.2)',
+drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='A RUNNING WORKLOAD HAS STATE.':x=104:y=505:fontsize=24:fontcolor=0x9c9c9f:enable='between(t,0,4.67)':alpha='min(1,t/1.4)',
+drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='SOURCE':x=120:y=290:fontsize=16:fontcolor=0x63636a:enable='gte(t,4.67)',
+drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='DESTINATION':x=1800:y=290:fontsize=16:fontcolor=0x63636a:enable='gte(t,4.67)':text_align=right,
+drawbox=x=120:y=350:w=520:h=470:color=0x101012@0.95:t=2:enable='gte(t,4.67)',drawbox=x=1280:y=350:w=520:h=470:color=0x101012@0.95:t=2:enable='gte(t,4.67)',
+drawbox=x=120:y=350:w=520:h=470:color=0x14e0b0@0.18:t=2:enable='between(t,4.67,25.67)',drawbox=x=1280:y=350:w=520:h=470:color=0x14e0b0@0.65:t=2:enable='gte(t,26.83)',
+drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='PROCESS':x=180:y=440:fontsize=13:fontcolor=0x63636a:enable='gte(t,4.67)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='MEMORY':x=180:y=488:fontsize=13:fontcolor=0x63636a:enable='gte(t,4.67)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='FILESYSTEM':x=180:y=536:fontsize=13:fontcolor=0x63636a:enable='gte(t,4.67)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='NETWORK':x=180:y=584:fontsize=13:fontcolor=0x63636a:enable='gte(t,4.67)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='DEVICE':x=180:y=632:fontsize=13:fontcolor=0x63636a:enable='gte(t,4.67)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='ENVIRONMENT':x=180:y=680:fontsize=13:fontcolor=0x63636a:enable='gte(t,4.67)',
+drawbox=x=180:y=460:w='max(0,min(420,(t-4.67)*70))':h=10:color=0x14e0b0:t=fill:enable='gte(t,4.67)',drawbox=x=180:y=508:w='max(0,min(420,(t-6.0)*70))':h=10:color=0x14e0b0:t=fill:enable='gte(t,6.0)',drawbox=x=180:y=556:w='max(0,min(420,(t-7.3)*70))':h=10:color=0x14e0b0:t=fill:enable='gte(t,7.3)',
+drawbox=x=640:y=584:w=640:h=2:color=0x3a3a42:t=fill:enable='gte(t,4.67)',drawbox=x='660+mod((t-18.67)*170,600)':y=575:w=18:h=18:color=0x14e0b0:t=fill:enable='between(t,18.67,26.83)',drawbox=x='660+mod((t-18.67)*170+130,600)':y=575:w=18:h=18:color=0x14e0b0:t=fill:enable='between(t,18.67,26.83)',drawbox=x='660+mod((t-18.67)*170+260,600)':y=575:w=18:h=18:color=0x14e0b0:t=fill:enable='between(t,18.67,26.83)',
+drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='CHECKPOINT  >  TRANSFER  >  VERIFY  >  RESTORE':x=960:y=650:fontsize=16:fontcolor=0x9c9c9f:text_align=center:enable='gte(t,18.67)',
+drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='CAPTURING STATE':x=960:y=290:fontsize=20:fontcolor=0x14e0b0:text_align=center:enable='between(t,9.5,18.67)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='ENCRYPTING CHUNKS':x=960:y=290:fontsize=20:fontcolor=0xd6a83b:text_align=center:enable='between(t,14,22)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='RESTORING / HEALTH VALIDATED':x=960:y=710:fontsize=18:fontcolor=0x14e0b0:text_align=center:enable='gte(t,26.83)',
+drawbox=x=430:y='820+(t-28)*20':w=260:h=1:color=0x14e0b0:t=fill:enable='between(t,28,31.5)',drawbox=x=830:y='820+(t-28)*25':w=260:h=1:color=0xd6a83b:t=fill:enable='between(t,28,31.5)',drawbox=x=1230:y='820+(t-28)*20':w=260:h=1:color=0xe9e7e2:t=fill:enable='between(t,28,31.5)',drawbox=x=430:y=900:w=180:h=42:color=0x14e0b0@0.9:t=2:enable='gte(t,29)',drawbox=x=870:y=900:w=180:h=42:color=0xd6a83b@0.9:t=2:enable='gte(t,29)',drawbox=x=1310:y=900:w=180:h=42:color=0xe9e7e2@0.9:t=2:enable='gte(t,29)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='CLONE':x=520:y=927:fontsize=14:fontcolor=0x14e0b0:text_align=center:enable='gte(t,29)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='PARK':x=960:y=927:fontsize=14:fontcolor=0xd6a83b:text_align=center:enable='gte(t,29)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='FAILOVER':x=1400:y=927:fontsize=14:fontcolor=0xe9e7e2:text_align=center:enable='gte(t,29)',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:text='LINUX X86_64 / CRIU-BASED / COMPATIBILITY-CHECKED':x=1820:y=980:fontsize=14:fontcolor=0x63636a:text_align=right:enable='gte(t,31.5)'
+[v]
+FILTER
+rm -f "$out/shiftgate-continuity.mp4" "$out/shiftgate-continuity.webm" "$out/shiftgate-continuity-poster.webp"
+ffmpeg -y -v error -f lavfi -i "color=c=0x0a0a0b:s=1920x1080:r=30:d=35" -filter_complex_script "$filter" -map '[v]' -an -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -movflags +faststart "$out/shiftgate-continuity.mp4"
+ffmpeg -y -v error -i "$out/shiftgate-continuity.mp4" -vf "select='eq(n,700)'" -frames:v 1 -c:v libwebp -quality 90 "$out/shiftgate-continuity-poster.webp"
+ffmpeg -y -v error -i "$out/shiftgate-continuity.mp4" -c:v libvpx-vp9 -b:v 0 -crf 32 -pix_fmt yuv420p -an "$out/shiftgate-continuity.webm"
+rm -f "$filter"
+ffprobe -v error -show_entries format=duration:stream=codec_name,width,height,pix_fmt,r_frame_rate,nb_frames -of default=noprint_wrappers=1 "$out/shiftgate-continuity.mp4"

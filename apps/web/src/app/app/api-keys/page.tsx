@@ -17,7 +17,7 @@ import { useAuth } from "@/lib/store";
 import { api } from "@/lib/api";
 import type { APIKey, APIKeyScope, APIKeyCreated } from "@/lib/types";
 import { Card, Badge, Mono, Button, EmptyState } from "@/components/ui";
-import { timeAgo } from "@/lib/utils";
+import { errorMessage, timeAgo } from "@/lib/utils";
 
 /* ------------------------------------------------------------------ */
 /*  Config                                                             */
@@ -31,6 +31,8 @@ const ALL_SCOPES: { value: APIKeyScope; label: string; description: string }[] =
   { value: "workloads", label: "Workloads", description: "Workload management" },
   { value: "migrations", label: "Migrations", description: "Migration management" },
   { value: "checkpoints", label: "Checkpoints", description: "Checkpoint management" },
+  { value: "compute", label: "Compute", description: "Compute marketplace offers and placements" },
+  { value: "scim", label: "SCIM", description: "Directory provisioning through the SCIM v2 endpoints" },
 ];
 
 function keyStatus(key: APIKey): "active" | "expired" | "revoked" {
@@ -54,12 +56,16 @@ function statusVariant(status: string): "success" | "warning" | "error" {
 
 export default function APIKeysPage() {
   const orgId = useAuth((s) => s.organization?.id || "");
+  const role = useAuth((s) => s.organization?.role || "viewer");
+  const canManage = role === "owner" || role === "admin";
   const queryClient = useQueryClient();
 
+  // The API keys endpoints require the admin role server-side — a viewer must
+  // see an explanatory state, not a list that only ever fails to load.
   const { data: keys, isLoading, error } = useQuery({
     queryKey: ["api-keys", orgId],
     queryFn: () => api.listAPIKeys(orgId),
-    enabled: !!orgId,
+    enabled: !!orgId && canManage,
   });
 
   const [showCreate, setShowCreate] = React.useState(false);
@@ -67,6 +73,7 @@ export default function APIKeysPage() {
   const [selectedScopes, setSelectedScopes] = React.useState<APIKeyScope[]>(["read"]);
   const [createdKey, setCreatedKey] = React.useState<APIKeyCreated | null>(null);
   const [copied, setCopied] = React.useState(false);
+  const [copyFailed, setCopyFailed] = React.useState(false);
   const [revokeConfirm, setRevokeConfirm] = React.useState<string | null>(null);
 
   const createKey = useMutation({
@@ -97,14 +104,36 @@ export default function APIKeysPage() {
     );
   };
 
+  if (!canManage) {
+    return (
+      <div className="max-w-6xl mx-auto px-5 md:px-10 py-10">
+        <div className="mb-6">
+          <h1 className="text-2xl font-semibold text-text">API Keys</h1>
+          <p className="text-sm text-text-muted mt-1">Manage API keys for programmatic access</p>
+        </div>
+        <EmptyState
+          title="Admin access required"
+          description={`Managing API keys requires the admin or owner role — your role is ${role}. Ask an organization admin to create keys or change your role.`}
+        />
+      </div>
+    );
+  }
+
   const copySecret = async (secret: string) => {
-    await navigator.clipboard.writeText(secret);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setCopyFailed(false);
+    try {
+      await navigator.clipboard.writeText(secret);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Non-secure contexts throw here — fall back to manual selection so the
+      // copy affordance is never silently dead.
+      setCopyFailed(true);
+    }
   };
 
   return (
-    <div>
+    <div className="max-w-6xl mx-auto px-5 md:px-10 py-10">
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
@@ -135,7 +164,11 @@ export default function APIKeysPage() {
                     Copy this secret now. It will not be shown again.
                   </p>
                 </div>
-                <button onClick={() => setCreatedKey(null)} className="ml-auto p-1 hover:bg-bg-hover rounded">
+                <button
+                  onClick={() => setCreatedKey(null)}
+                  aria-label="Dismiss"
+                  className="ml-auto p-1 hover:bg-bg-hover rounded"
+                >
                   <X className="w-3.5 h-3.5 text-text-muted" />
                 </button>
               </div>
@@ -147,6 +180,7 @@ export default function APIKeysPage() {
                 <Button
                   variant="secondary"
                   size="sm"
+                  aria-label={copied ? "Secret copied" : "Copy secret"}
                   onClick={() => copySecret(createdKey.secret)}
                 >
                   {copied ? (
@@ -156,6 +190,11 @@ export default function APIKeysPage() {
                   )}
                 </Button>
               </div>
+              {copyFailed && (
+                <p className="text-xs text-status-warning mt-2">
+                  Could not access the clipboard — select the secret above and copy it manually.
+                </p>
+              )}
             </Card>
           </motion.div>
         )}
@@ -175,8 +214,14 @@ export default function APIKeysPage() {
 
               <div className="space-y-4">
                 <div>
-                  <label className="text-xs text-text-muted uppercase tracking-wider block mb-1.5">Name</label>
+                  <label
+                    htmlFor="api-key-name"
+                    className="text-xs text-text-muted uppercase tracking-wider block mb-1.5"
+                  >
+                    Name
+                  </label>
                   <input
+                    id="api-key-name"
                     type="text"
                     value={newName}
                     onChange={(e) => setNewName(e.target.value)}
@@ -186,12 +231,13 @@ export default function APIKeysPage() {
                 </div>
 
                 <div>
-                  <label className="text-xs text-text-muted uppercase tracking-wider block mb-2">Scopes</label>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                  <span className="text-xs text-text-muted uppercase tracking-wider block mb-2">Scopes</span>
+                  <div role="group" aria-label="Scopes" className="grid grid-cols-2 md:grid-cols-4 gap-2">
                     {ALL_SCOPES.map((scope) => (
                       <button
                         key={scope.value}
                         onClick={() => toggleScope(scope.value)}
+                        aria-pressed={selectedScopes.includes(scope.value)}
                         className={`p-2.5 rounded-lg border text-left transition-all ${
                           selectedScopes.includes(scope.value)
                             ? "border-accent bg-accent/5"
@@ -228,6 +274,12 @@ export default function APIKeysPage() {
                     Cancel
                   </Button>
                 </div>
+
+                {createKey.isError && (
+                  <p role="alert" className="text-sm text-status-error">
+                    {errorMessage(createKey.error, "Could not create the API key.")}
+                  </p>
+                )}
               </div>
             </Card>
           </motion.div>
@@ -235,6 +287,11 @@ export default function APIKeysPage() {
       </AnimatePresence>
 
       {/* Keys list */}
+      {revokeKey.isError && (
+        <p role="alert" className="text-sm text-status-error mb-4">
+          {errorMessage(revokeKey.error, "Could not revoke the API key.")}
+        </p>
+      )}
       {isLoading ? (
         <div className="flex items-center justify-center py-32">
           <Loader2 className="w-6 h-6 text-accent animate-spin" />
@@ -244,7 +301,7 @@ export default function APIKeysPage() {
       ) : !keys || keys.length === 0 ? (
         <EmptyState
           title="No API keys"
-          description="Create an API key to enable programmatic access to the SHIFTGATE API."
+          description="Create an API key to enable programmatic access to the SHIFT API."
           action={
             <Button variant="primary" onClick={() => setShowCreate(true)}>
               <Plus className="w-4 h-4 mr-1.5" />
@@ -298,7 +355,12 @@ export default function APIKeysPage() {
                               </Button>
                             </div>
                           ) : (
-                            <Button variant="ghost" size="sm" onClick={() => setRevokeConfirm(key.id)}>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              aria-label={`Revoke API key ${key.name}`}
+                              onClick={() => setRevokeConfirm(key.id)}
+                            >
                               <Trash2 className="w-3.5 h-3.5 text-text-muted" />
                             </Button>
                           )}

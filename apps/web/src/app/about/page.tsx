@@ -6,7 +6,7 @@ import { ArrowRight } from "lucide-react";
 export const metadata: Metadata = {
   title: "About",
   description:
-    "SHIFTGATE moves running computation between machines. Here is why we built it.",
+    "SHIFT moves running computation between machines. Here is why we built it.",
 };
 
 export default function AboutPage() {
@@ -18,7 +18,7 @@ export default function AboutPage() {
           <Container narrow>
             <div className="space-y-8">
               <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">
-                About SHIFTGATE
+                About SHIFT
               </h1>
 
               <div className="space-y-5 text-text-secondary leading-relaxed">
@@ -28,7 +28,7 @@ export default function AboutPage() {
                 </p>
 
                 <p>
-                  We built SHIFTGATE because moving workloads between machines
+                  We built SHIFT because moving workloads between machines
                   is still unnecessarily painful. Processes accumulate state —
                   memory, file handles, network connections — and that state
                   makes migration feel like a hard problem. It is not as hard as
@@ -36,7 +36,7 @@ export default function AboutPage() {
                 </p>
 
                 <p>
-                  SHIFTGATE checkpoints running processes with CRIU, transfers encrypted
+                  SHIFT checkpoints running processes with CRIU, transfers encrypted
                   chunks between agents, and restores them after validation. Live mode uses
                   real pre-copy before its final stop; cold mode makes that stop explicit.
                 </p>
@@ -60,7 +60,7 @@ export default function AboutPage() {
             <div className="space-y-6">
               <h2 className="text-xl font-semibold">Team</h2>
               <p className="text-text-secondary leading-relaxed">
-                SHIFTGATE is built by a small team of engineers with backgrounds
+                SHIFT is built by a small team of engineers with backgrounds
                 in systems programming, distributed infrastructure, and Linux
                 kernel development. We care about getting the details right
                 rather than shipping fast and breaking things.

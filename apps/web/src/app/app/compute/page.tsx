@@ -4,7 +4,8 @@ import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "@/lib/store";
 import { api } from "@/lib/api";
 import { Badge, Card, EmptyState, Mono } from "@/components/ui";
-import { formatBytes } from "@/lib/utils";
+import { ErrorState } from "@/components/state";
+import { errorMessage, formatBytes } from "@/lib/utils";
 import type { ComputeOffer, ComputeReservation, ComputeResources } from "@/lib/types";
 
 // resourceSummary names the capacity an offer exposes or a reservation holds,
@@ -20,21 +21,27 @@ function resourceSummary(resources: ComputeResources): string[] {
 }
 
 // priceLabel renders an offer's pricing honestly: every rate at zero is free
-// (the case for a machine exposed to its own organization), otherwise the
-// per-CPU-hour rate in whole currency units.
+// (the case for a machine exposed to its own organization); otherwise each
+// non-zero rate is listed with its own resource label — a GPU-only offer must
+// never render as "0.00 USD/CPU·hr".
 function priceLabel(offer: ComputeOffer): string {
   const pricing = offer.pricing;
-  const rates = [
-    pricing.cpu_hour_micros,
-    pricing.memory_gib_hour_micros,
-    pricing.storage_gib_hour_micros,
-    pricing.gpu_hour_micros,
-    pricing.egress_gib_micros,
-    pricing.minimum_charge_micros,
-  ];
-  if (rates.every((rate) => !rate)) return "free";
   const currency = (pricing.currency || "USD").toUpperCase();
-  return `${((pricing.cpu_hour_micros ?? 0) / 1_000_000).toFixed(2)} ${currency}/CPU·hr`;
+  const per = (micros: number) => `${(micros / 1_000_000).toFixed(2)} ${currency}`;
+  const rates: Array<[string, number | undefined]> = [
+    ["/CPU·hr", pricing.cpu_hour_micros],
+    ["/GiB·hr", pricing.memory_gib_hour_micros],
+    ["/storage GiB·hr", pricing.storage_gib_hour_micros],
+    ["/GPU·hr", pricing.gpu_hour_micros],
+    ["/egress GiB", pricing.egress_gib_micros],
+  ];
+  const priced = rates
+    .filter(([, rate]) => !!rate)
+    .map(([label, rate]) => `${per(rate ?? 0)}${label}`);
+  if (priced.length === 0 && !pricing.minimum_charge_micros) return "free";
+  if (priced.length === 0) return `min ${per(pricing.minimum_charge_micros ?? 0)}`;
+  if (pricing.minimum_charge_micros) priced.push(`min ${per(pricing.minimum_charge_micros)}`);
+  return priced.join(" · ");
 }
 
 function OfferCard({ offer }: { offer: ComputeOffer }) {
@@ -106,19 +113,19 @@ function ReservationRow({ reservation }: { reservation: ComputeReservation }) {
 export default function ComputePage() {
   const orgId = useAuth((s) => s.organization?.id || "");
 
-  const { data: inventory, isLoading } = useQuery({
+  const { data: inventory, isLoading, error: inventoryError, refetch: refetchInventory } = useQuery({
     queryKey: ["compute-inventory", orgId],
     queryFn: () => api.computeInventory(orgId),
     enabled: !!orgId,
   });
 
-  const { data: offers } = useQuery({
+  const { data: offers, error: offersError, refetch: refetchOffers } = useQuery({
     queryKey: ["compute-offers", orgId],
     queryFn: () => api.listComputeOffers(orgId),
     enabled: !!orgId,
   });
 
-  const { data: reservations } = useQuery({
+  const { data: reservations, error: reservationsError, refetch: refetchReservations } = useQuery({
     queryKey: ["compute-reservations", orgId],
     queryFn: () => api.listComputeReservations(orgId),
     enabled: !!orgId,
@@ -144,7 +151,7 @@ export default function ComputePage() {
           <h1 className="font-display text-3xl font-medium text-text">Compute</h1>
         </div>
         <span className="font-mono text-[11px] text-text-muted">
-          {inventory?.offers.length ?? 0} SCHEDULABLE
+          {inventoryError && !inventory ? "INVENTORY UNAVAILABLE" : `${inventory?.offers.length ?? 0} SCHEDULABLE`}
         </span>
       </div>
 
@@ -164,10 +171,18 @@ export default function ComputePage() {
       </Card>
 
       <h2 className="tlabel mb-4">Inventory</h2>
-      {!inventory || inventory.offers.length === 0 ? (
+      {inventoryError && !inventory ? (
+        <div className="mb-10">
+          <ErrorState
+            title="COULD NOT LOAD THE COMPUTE INVENTORY"
+            message={errorMessage(inventoryError, "The control plane did not answer the query. This is a connection or service problem — not an empty marketplace.")}
+            onRetry={() => void refetchInventory()}
+          />
+        </div>
+      ) : !inventory || inventory.offers.length === 0 ? (
         <EmptyState
           title="No offers to schedule against"
-          description="Expose a machine's resources to make them schedulable for migrations."
+          description="Expose a machine's resources to make them schedulable for migrations — from the CLI (shiftgate marketplace publish) or the API (POST /v1/organizations/{id}/compute/offers)."
         />
       ) : (
         <div className="grid md:grid-cols-2 gap-5 mb-10">
@@ -178,10 +193,18 @@ export default function ComputePage() {
       )}
 
       <h2 className="tlabel mb-4">Published offers</h2>
-      {!offers || offers.length === 0 ? (
+      {offersError && !offers ? (
+        <div className="mb-10">
+          <ErrorState
+            title="COULD NOT LOAD PUBLISHED OFFERS"
+            message={errorMessage(offersError, "The control plane did not answer the query.")}
+            onRetry={() => void refetchOffers()}
+          />
+        </div>
+      ) : !offers || offers.length === 0 ? (
         <EmptyState
           title="No offers published"
-          description="Publishing a machine's resources puts them in this organization's inventory."
+          description="Publishing a machine's resources puts them in this organization's inventory — from the CLI (shiftgate marketplace publish) or the API (POST /v1/organizations/{id}/compute/offers)."
         />
       ) : (
         <div className="grid md:grid-cols-2 gap-5 mb-10">
@@ -192,10 +215,18 @@ export default function ComputePage() {
       )}
 
       <h2 className="tlabel mb-4">Reservations</h2>
-      {activeReservations.length === 0 ? (
+      {reservationsError && !reservations ? (
+        <div className="mb-12">
+          <ErrorState
+            title="COULD NOT LOAD RESERVATIONS"
+            message={errorMessage(reservationsError, "The control plane did not answer the query.")}
+            onRetry={() => void refetchReservations()}
+          />
+        </div>
+      ) : activeReservations.length === 0 ? (
         <EmptyState
           title="No active reservations"
-          description="A migration reserves capacity on its destination machine for the duration of the move."
+          description="A migration reserves capacity on its destination machine for the duration of the move. Release a stuck reservation with shiftgate marketplace release."
         />
       ) : (
         <Card className="divide-y divide-border mb-12">

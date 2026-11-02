@@ -3,26 +3,29 @@
 import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "@/lib/store";
 import { api } from "@/lib/api";
-import { MachineView, StateObject } from "@/components/state";
-import { formatBytes, timeAgo } from "@/lib/utils";
+import { MachineView, StateObject, ErrorState } from "@/components/state";
+import { errorMessage, formatBytes, timeAgo } from "@/lib/utils";
+import { normalizeWorkloadState } from "@/lib/workload-status";
 import Link from "next/link";
 import type { Machine, Workload } from "@/lib/types";
 
 function workloadState(w: Workload): string {
-  return ((w.status as { state?: string })?.state ?? "registered").toLowerCase();
+  return normalizeWorkloadState(w.status);
 }
 
 export default function DashboardPage() {
   const { organization } = useAuth();
   const orgId = organization?.id || "";
 
-  const machinesQuery = useQuery({ queryKey: ["machines", orgId], queryFn: () => api.listMachines(orgId), enabled: !!orgId });
-  const workloadsQuery = useQuery({ queryKey: ["workloads", orgId], queryFn: () => api.listWorkloads(orgId), enabled: !!orgId });
-  const migrationsQuery = useQuery({ queryKey: ["migrations", orgId], queryFn: () => api.listMigrations(orgId), enabled: !!orgId });
+  const machinesQuery = useQuery({ queryKey: ["machines", orgId], queryFn: () => api.listMachines(orgId), enabled: !!orgId, refetchInterval: 15_000 });
+  const workloadsQuery = useQuery({ queryKey: ["workloads", orgId], queryFn: () => api.listWorkloads(orgId), enabled: !!orgId, refetchInterval: 15_000 });
+  const migrationsQuery = useQuery({ queryKey: ["migrations", orgId], queryFn: () => api.listMigrations(orgId), enabled: !!orgId, refetchInterval: 15_000 });
   const checkpointsQuery = useQuery({ queryKey: ["checkpoints", orgId], queryFn: () => api.listCheckpoints(orgId), enabled: !!orgId });
 
   const machines = machinesQuery.data || [];
-  const workloads = workloadsQuery.data || [];
+  // Deleted workloads are tombstones, not fleet members — they must not
+  // inflate the running count or the overview lists.
+  const workloads = (workloadsQuery.data || []).filter((w) => workloadState(w) !== "deleted");
   const migrations = migrationsQuery.data || [];
   const checkpoints = checkpointsQuery.data || [];
 
@@ -54,6 +57,19 @@ export default function DashboardPage() {
 
       {loading ? (
         <p className="font-mono text-[11px] text-text-muted">READING FLEET…</p>
+      ) : machinesQuery.isError || workloadsQuery.isError ? (
+        // An API failure is not an empty fleet: say which it is, with a retry.
+        <ErrorState
+          title="COULD NOT LOAD THE FLEET"
+          message={errorMessage(
+            (machinesQuery.isError ? machinesQuery : workloadsQuery).error,
+            "The control plane did not answer the query. This is a connection or session problem — not an empty fleet."
+          )}
+          onRetry={() => {
+            if (machinesQuery.isError) void machinesQuery.refetch();
+            if (workloadsQuery.isError) void workloadsQuery.refetch();
+          }}
+        />
       ) : machines.length === 0 ? (
         <EmptyFleet />
       ) : (
@@ -74,7 +90,9 @@ export default function DashboardPage() {
                     active={m.status === "online"}
                   >
                     <span className="font-mono text-[11px] text-text-muted">
-                      {workloadsOn(m.id).length} workload{workloadsOn(m.id).length === 1 ? "" : "s"}
+                      {/* Workloads reference machines by the agent-side slug,
+                          not the row UUID — match on machine_id. */}
+                      {workloadsOn(m.machine_id).length} workload{workloadsOn(m.machine_id).length === 1 ? "" : "s"}
                     </span>
                   </MachineView>
                 </Link>

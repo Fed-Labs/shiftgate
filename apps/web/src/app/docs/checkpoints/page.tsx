@@ -3,7 +3,7 @@ import { Container, Section } from "@/components/ui";
 
 export const metadata: Metadata = {
   title: "Checkpoints",
-  description: "Full and incremental checkpoints, manifest structure, storage, deduplication, and restore behavior in SHIFTGATE.",
+  description: "Full and incremental checkpoints, manifest structure, storage, deduplication, and restore behavior in SHIFT.",
 };
 
 export default function CheckpointsPage() {
@@ -97,28 +97,29 @@ export default function CheckpointsPage() {
             <div className="p-5">
               <pre className="text-sm text-text-secondary whitespace-pre-wrap">
                 <code>{`{
-  "checkpoint_id": "ckpt_a1b2c3d4",
-  "workload_id": "wl_k8m2p4q7",
-  "type": "incremental",
+  "format": "shift-state",
+  "format_version": "1.0.0",
+  "id": "ckpt_a1b2c3d4",
   "parent_id": "ckpt_z9y8x7w6",
+  "kind": "incremental",
   "created_at": "2026-08-20T14:30:00Z",
-  "machine_id": "mach_7f3a2b1c",
   "assets": [
     {
       "name": "process-state",
-      "sha256": "e3b0c44298fc1c149afbf4c8996fb924...",
       "chunks": ["..."]
     }
   ],
   "state_inventory": [
-    { "name": "memory", "class": "portable", "adapter": "criu" },
+    { "name": "memory", "class": "portable", "adapter": "criu", "required": true },
     { "name": "gpu_state", "class": "machine_specific", "adapter": "vendor-checkpoint" }
   ],
   "security": {
-    "algorithm": "Ed25519+SHA-256",
-    "key_version": 1
+    "key_version": 1,
+    "manifest_signature": "base64-ed25519-signature",
+    "signer_machine_id": "mach_7f3a2b1c",
+    "algorithm": "Ed25519+SHA-256"
   },
-  "encrypted": true
+  "metrics": { "plain_bytes": 0, "stored_bytes": 0, "chunk_count": 0 }
 }`}</code>
               </pre>
             </div>
@@ -133,10 +134,13 @@ export default function CheckpointsPage() {
               Create a checkpoint of a running workload. Incremental capture is
               explicit: pass the parent checkpoint ID so CRIU can use retained
               parent images. The CLI infers incremental mode from that parent.
+              The workload keeps running by default ({`--leave-running`});
+              {` --stop-when-done`} is the explicit way to ask for the opposite.
             </p>
             <pre className="text-sm">
               <code className="text-accent">{`shiftgate checkpoint create demo --leave-running
-shiftgate checkpoint create demo --parent ckpt_a1b2c3d4`}</code>
+shiftgate checkpoint create demo --parent ckpt_a1b2c3d4
+shiftgate checkpoint list          # KIND full|incremental · SIZE · STORED`}</code>
             </pre>
             <div className="my-3 h-px bg-border-subtle" />
             <pre className="text-sm text-text-secondary whitespace-pre-wrap">
@@ -230,6 +234,55 @@ The CLI reports this workload's actual bytes and duration.`}</code>
                 <p className="text-lg font-mono font-semibold">{item.value}</p>
               </div>
             ))}
+          </div>
+        </div>
+
+        {/* Restore-target policy */}
+        <div className="mb-12">
+          <h2 className="text-xl font-semibold mb-4">Restore-target policy</h2>
+          <p className="text-sm text-text-secondary leading-relaxed mb-4">
+            A checkpoint is untrusted input — its manifest is signed by the
+            source, and a compromised source signs hostile manifests
+            legitimately — so the destination enforces admission rules before
+            anything is materialized (for restore, fork, and clone targets).
+            The zero policy fails closed: no target outside a workload root
+            already registered on the machine is ever replaced.
+          </p>
+          <div className="rounded-lg border border-status-warning/20 bg-status-warning/5 p-5 mb-4">
+            <p className="text-sm text-status-warning font-medium mb-2">
+              Absolute system-path denylist
+            </p>
+            <p className="text-sm text-text-secondary leading-relaxed">
+              Host system trees —{" "}
+              <code className="font-mono text-xs bg-bg-surface px-1.5 py-0.5 rounded">/bin /boot /dev /etc /lib /proc /root /run /sbin /sys /usr /var</code>{" "}
+              and their lib variants — may never be a checkpoint target,
+              whatever any allowlist says. Replacing one as root would be total
+              compromise of the destination, so the refusal is absolute and
+              touches nothing.
+            </p>
+          </div>
+          <div className="rounded-lg border border-border bg-bg-elevated p-5">
+            <p className="text-sm text-text-secondary leading-relaxed mb-4">
+              Operators pre-register additional targets through{" "}
+              <code className="font-mono text-xs bg-bg-surface px-1.5 py-0.5 rounded">{"<state-dir>/metadata/restore-policy.json"}</code>{" "}
+              (a missing file means the fail-closed zero policy). The file must
+              be owned by root or the agent user and must not be group- or
+              world-writable; anything else is refused rather than trusted.
+            </p>
+            <pre className="text-sm text-text-secondary whitespace-pre-wrap">
+              <code>{`{
+  "allowed_root_prefixes": ["/srv/workloads"],
+  "allow_root_workload": false,
+  "allow_device_nodes": false,
+  "allow_setuid": false
+}`}</code>
+            </pre>
+            <div className="my-3 h-px bg-border-subtle" />
+            <ul className="text-sm text-text-secondary space-y-1.5">
+              <li>• <code className="font-mono text-xs bg-bg-surface px-1.5 py-0.5 rounded">allowed_root_prefixes</code> — absolute prefixes (never the filesystem root, never inside a system directory) that checkpoint targets may live under when they are not already a registered workload root.</li>
+              <li>• <code className="font-mono text-xs bg-bg-surface px-1.5 py-0.5 rounded">allow_root_workload</code> — without it a manifest declaring UID 0 is refused outright: the restored process would otherwise run the manifest&apos;s command with full privileges.</li>
+              <li>• <code className="font-mono text-xs bg-bg-surface px-1.5 py-0.5 rounded">allow_device_nodes</code> / <code className="font-mono text-xs bg-bg-surface px-1.5 py-0.5 rounded">allow_setuid</code> — without them, device nodes in an archive are refused during extraction and setuid/setgid bits are stripped.</li>
+            </ul>
           </div>
         </div>
 

@@ -4,7 +4,7 @@ import { ArrowRight } from "lucide-react";
 
 export const metadata: Metadata = {
   title: "Quickstart",
-  description: "Install SHIFTGATE with one command and run a real checkpoint/restore workflow on Linux.",
+  description: "Install SHIFT with one command and run a real checkpoint/restore workflow on Linux.",
 };
 
 const STEPS = [
@@ -12,7 +12,7 @@ const STEPS = [
     number: "01",
     title: "Install",
     description:
-      "One command on an x86_64 Linux host: it downloads the release, verifies its SHA-256, installs CRIU through your package manager when it is missing, and enables the agent as a systemd service. Building from a repository checkout works too (`make build`, then `sudo ./install.sh`).",
+      "One command on an x86_64 Linux host: it downloads the release, verifies its SHA-256, installs shiftgate, shift-agent, shift-control, and the offline shift-gc, installs CRIU through your package manager when it is missing, and enables the agent as a systemd service with a local-only configuration. A repository checkout reaches the same end state with sudo ./install.sh (it builds from source); both installers take --no-service for binaries only and --prefix DIR for another location.",
     command:
       "curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh | bash",
     output: `==> Installing binaries to /usr/local/bin
@@ -27,7 +27,7 @@ If you were added to the 'shift' group, log out and back in once
     number: "02",
     title: "Check the machine",
     description:
-      "Verify the machine can actually checkpoint: CRIU health, kernel features, tar, and privileges. Doctor reports real gaps instead of substituting a fake checkpoint.",
+      "Verify the machine can actually checkpoint: CRIU health, kernel features, tar, and privileges. Doctor reports real gaps instead of substituting a fake checkpoint, and exits 3 when a required check fails.",
     command: "shiftgate doctor",
     output: `OK    platform linux/amd64
 OK    privileges agent effective uid 0
@@ -39,7 +39,8 @@ OK    archive GNU tar available`,
     number: "03",
     title: "Create and start a scoped workload",
     description: "Attach one explicit directory as the workload root. Commands run under the agent, and only that approved root is captured.",
-    command: `shiftgate workload create demo \\
+    command: `mkdir -p ~/demo
+shiftgate workload create demo \\
   --path "$HOME/demo" --start -- python3 -m http.server 8080`,
     output: `Workload wl_example created.
 Status: running
@@ -48,8 +49,9 @@ Root:   /home/you/demo`,
   {
     number: "04",
     title: "Checkpoint and restore locally",
-    description: "Create an encrypted, content-addressed checkpoint while leaving the source running, then restore it to validate that process and filesystem state round-trip on this host.",
+    description: "Create an encrypted, content-addressed checkpoint while leaving the source running (--leave-running is the default), list the retained checkpoints to find its id, then restore to validate that process and filesystem state round-trip on this host.",
     command: `shiftgate checkpoint create demo --leave-running
+shiftgate checkpoint list
 shiftgate restore CHECKPOINT_ID`,
     output: `Checkpoint ckpt_example created.
 Plain:  ... Stored: ...
@@ -57,15 +59,23 @@ Checkpoint restored and committed. Process PID: 12345`,
   },
   {
     number: "05",
+    title: "Make it automatic",
+    description: "Arm a periodic checkpoint policy: the agent checkpoints the workload every interval without stopping it and prunes the oldest beyond the keep count. The interval floor is 10 seconds and the schedule is measured from the newest checkpoint, so it survives agent restarts. workload policy demo --off removes it.",
+    command: "shiftgate workload policy demo --every 5m --keep 3",
+    output: `Policy installed: every 5m, keep 3.`,
+  },
+  {
+    number: "06",
     title: "Move between two agents",
-    description: "After both hosts pass `doctor`, migrate over mutually authenticated HTTPS. Use cold mode for the simplest path or live mode to invoke CRIU pre-copy before its authoritative final dump.",
-    command: `shiftgate migrate demo \\
+    description: "After both hosts pass `doctor`, migrate over mutually authenticated HTTPS. Save the destination under an alias first (or pass an explicit peer URL). `--preflight` (alias `--dry-run`) answers whether the migration would be admitted without moving anything. Cold mode pauses for the whole transfer; `--mode live` runs CRIU pre-dump passes while the workload keeps running and freezes it only for the final delta. Direct mTLS peer connections are the supported remote path today; the authenticated relay ships its ticket primitives but is not enabled by default.",
+    command: `shiftgate connect gpu-west \\
   --to https://destination.example:8443 \\
-  --machine-id DESTINATION_MACHINE_ID \\
-  --mode cold`,
+  --machine-id DESTINATION_MACHINE_ID
+shiftgate migrate demo --to gpu-west --preflight
+shiftgate migrate demo --to gpu-west --mode live --pre-copy-passes 4`,
     output: `Migration mig_example created.
-SNAPSHOT → PREPARE → TRANSFER → VERIFY → RESTORE
-POST_VALIDATE → SWITCH → COMMIT → COMPLETED`,
+CREATED → DISCOVER → VALIDATE → SNAPSHOT → PREPARE → TRANSFER
+VERIFY → RESTORE → POST_VALIDATE → SWITCH → COMMIT → COMPLETED`,
   },
 ];
 
@@ -81,7 +91,7 @@ export default function QuickstartPage() {
             Quickstart
           </h1>
           <p className="text-text-secondary max-w-2xl text-lg leading-relaxed">
-            Run a real checkpoint-backed workflow in five steps. The examples use
+            Run a real checkpoint-backed workflow in six steps. The examples use
             the installed agent&apos;s default socket; production agents require
             mutual TLS.
           </p>
@@ -150,6 +160,10 @@ export default function QuickstartPage() {
             <li className="flex items-center gap-2">
               <ArrowRight size={14} className="text-accent shrink-0" />
               <span>Learn about <a href="/docs/migration" className="text-text hover:text-accent transition-colors">migration modes</a> and their actual stop-the-world boundaries</span>
+            </li>
+            <li className="flex items-center gap-2">
+              <ArrowRight size={14} className="text-accent shrink-0" />
+              <span>Read <a href="/docs/operations" className="text-text hover:text-accent transition-colors">Operations</a> for offline chunk GC, updates, and retention</span>
             </li>
           </ul>
         </div>

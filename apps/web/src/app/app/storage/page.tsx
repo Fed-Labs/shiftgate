@@ -5,7 +5,6 @@ import { useQuery } from "@tanstack/react-query";
 import {
   HardDrive,
   Database,
-  ArrowRightLeft,
   FileBox,
   Loader2,
   Cloud,
@@ -17,7 +16,18 @@ import { useAuth } from "@/lib/store";
 import { api } from "@/lib/api";
 import type { StorageStatus } from "@/lib/types";
 import { Card, Mono, EmptyState } from "@/components/ui";
-import { formatBytes, formatNumber } from "@/lib/utils";
+import { formatBytes, formatDateTime, formatNumber } from "@/lib/utils";
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Date-only API strings ("2006-01-02") are formatted from their components.
+// `new Date(...)` parses them as UTC midnight and shifts the rendered day in
+// negative-UTC timezones.
+function formatDateOnly(value: string): string {
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return value;
+  return `${MONTHS[month - 1]} ${day}, ${year}`;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Storage Breakdown Card                                             */
@@ -134,7 +144,7 @@ function HostedStorageCard({ status }: { status: StorageStatus }) {
           <Clock className="w-3.5 h-3.5 text-text-muted" />
           <p className="text-xs text-text-muted">
             Metered from the bucket — last reconciled{" "}
-            {new Date(status.last_reconciled_at).toLocaleString()}
+            {formatDateTime(status.last_reconciled_at)}
           </p>
         </div>
       )}
@@ -245,12 +255,21 @@ export default function StoragePage() {
     ? (entitlement.used_storage_bytes / entitlement.max_storage_bytes) * 100
     : 0;
 
-  // Break down usage by kind
-  const checkpointUsage = usage?.find((u) => u.kind === "checkpoint_storage");
-  const transferUsage = usage?.find((u) => u.kind === "transfer_bytes");
-  const checkpointBytes = checkpointUsage?.quantity ?? 0;
-  const transferBytes = transferUsage?.quantity ?? 0;
-  const otherBytes = Math.max(0, entitlement.used_storage_bytes - checkpointBytes - transferBytes);
+  // Sum every period bucket per kind — the default window routinely spans two
+  // monthly buckets. Network transfer is not storage, so it is excluded from
+  // the breakdown below and the rows sum to Total Storage.
+  const quantityByKind = new Map<string, { quantity: number; from: string; to: string }>();
+  for (const record of usage ?? []) {
+    const entry = quantityByKind.get(record.kind) ?? { quantity: 0, from: record.period_start, to: record.period_end };
+    entry.quantity += record.quantity;
+    if (record.period_start < entry.from) entry.from = record.period_start;
+    if (record.period_end > entry.to) entry.to = record.period_end;
+    quantityByKind.set(record.kind, entry);
+  }
+  const checkpointBytes = quantityByKind.get("checkpoint_storage")?.quantity ?? 0;
+  const transferBytes = quantityByKind.get("transfer_bytes")?.quantity ?? 0;
+  const otherBytes = Math.max(0, entitlement.used_storage_bytes - checkpointBytes);
+  const usageByKind = [...quantityByKind.entries()].map(([kind, entry]) => ({ kind, ...entry }));
 
   return (
     <div>
@@ -280,9 +299,9 @@ export default function StoragePage() {
             <div>
               <p className="text-xs text-text-muted uppercase tracking-wider">Total Storage</p>
               <p className="text-xl font-semibold text-text">
-                {formatBytes(entitlement.used_storage_bytes)}{" "}
+                {formatBytes(Math.max(0, entitlement.used_storage_bytes))}{" "}
                 <span className="text-sm font-normal text-text-muted">
-                  / {formatBytes(entitlement.max_storage_bytes)}
+                  / {entitlement.max_storage_bytes < 0 ? "unlimited" : formatBytes(entitlement.max_storage_bytes)}
                 </span>
               </p>
             </div>
@@ -306,12 +325,15 @@ export default function StoragePage() {
 
         <div className="flex items-center justify-between mt-2">
           <p className="text-xs text-text-muted">
-            {formatBytes(Math.max(0, entitlement.max_storage_bytes - entitlement.used_storage_bytes))} remaining
+            {entitlement.max_storage_bytes < 0
+              ? "Unlimited quota"
+              : `${formatBytes(Math.max(0, entitlement.max_storage_bytes - entitlement.used_storage_bytes))} remaining`}
           </p>
         </div>
       </Card>
 
-      {/* Breakdown */}
+      {/* Breakdown — storage only: network transfer is metered separately and
+          must not be charted as a share of stored bytes. */}
       <Card className="p-5 mb-6">
         <h2 className="text-sm font-medium text-text-secondary uppercase tracking-wider mb-2">Breakdown</h2>
         <div className="divide-y divide-border">
@@ -322,32 +344,30 @@ export default function StoragePage() {
             totalBytes={entitlement.used_storage_bytes}
           />
           <BreakdownItem
-            icon={ArrowRightLeft}
-            label="Transfers"
-            bytes={transferBytes}
-            totalBytes={entitlement.used_storage_bytes}
-          />
-          <BreakdownItem
             icon={FileBox}
             label="Other"
             bytes={otherBytes}
             totalBytes={entitlement.used_storage_bytes}
           />
         </div>
+        <p className="text-xs text-text-muted mt-3">
+          Network transfer is metered separately from storage —{" "}
+          {formatBytes(transferBytes)} transferred in this window (see All Usage below).
+        </p>
       </Card>
 
       {/* Usage by kind */}
-      {usage && usage.length > 0 && (
+      {usageByKind.length > 0 && (
         <>
           <h2 className="text-sm font-medium text-text-secondary uppercase tracking-wider mb-3">All Usage</h2>
           <Card className="overflow-hidden mb-12">
             <div className="divide-y divide-border">
-              {usage.map((u) => (
+              {usageByKind.map((u) => (
                 <div key={u.kind} className="flex items-center justify-between p-4">
                   <div>
                     <p className="text-sm font-medium text-text">{u.kind.replace(/_/g, " ")}</p>
                     <p className="text-xs text-text-muted mt-0.5">
-                      {new Date(u.period_start).toLocaleDateString()} – {new Date(u.period_end).toLocaleDateString()}
+                      {formatDateOnly(u.from)} – {formatDateOnly(u.to)}
                     </p>
                   </div>
                   <Mono className="text-sm text-text">

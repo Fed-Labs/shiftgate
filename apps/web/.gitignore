@@ -24,14 +24,20 @@
 .DS_Store
 *.pem
 
+# python bytecode (scripts/motion tooling)
+__pycache__/
+
 # debug
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files — keep local overrides private; ship the documented example and
+# the production defaults (report 23)
 .env*
+!.env.example
+!.env.production
 
 # vercel
 .vercel

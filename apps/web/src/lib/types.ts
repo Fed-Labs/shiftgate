@@ -1,4 +1,7 @@
-// SHIFTGATE API types — generated from the control plane OpenAPI spec.
+// SHIFT API types — hand-maintained to match the control plane OpenAPI spec
+// (api/openapi/shift.yaml). scripts/sync-openapi.mjs copies the spec into
+// public/ for clients; it does not generate these types, so keep them in sync
+// with the spec and the Go response shapes by hand.
 
 export type Role = "owner" | "admin" | "operator" | "viewer";
 
@@ -16,7 +19,15 @@ export type MigrationStage =
 export type CheckpointKind = "full" | "incremental";
 export type CheckpointStatus = "creating" | "available" | "corrupt" | "deleted";
 
-export type Plan = "free" | "pro" | "business" | "enterprise" | "paid";
+/**
+ * Entitlement plan keys as the server reports them (Entitlement.plan).
+ * "paid" is the legacy/negotiated-tier label (billing_routes.go); the public
+ * catalog never sells it — catalog keys are CatalogPlan / Plan.key. Defined as
+ * a named union with a Plan alias so the types-drift gate does not confuse it
+ * with the Plan schema (which is the catalog entry, keyed by CatalogPlan).
+ */
+export type EntitlementPlan = "free" | "pro" | "business" | "enterprise" | "paid";
+export type Plan = EntitlementPlan;
 
 /** Plan keys the server-side catalog can contain. */
 export type CatalogPlan = "free" | "pro" | "business" | "enterprise";
@@ -26,17 +37,44 @@ export interface PlanCatalogEntry {
   key: CatalogPlan;
   name: string;
   price_cents: number; // -1 = custom, 0 = free
+  /** Prepay price for a full year (two months free). 0 = no annual offer, -1 = custom. */
+  price_cents_annual?: number;
+  /** Legacy per-seat billing shape; Business is flat with included seats. */
   per_seat?: boolean;
+  /** Seats the flat price covers before seat_overage_cents applies per extra seat. */
+  included_seats?: number;
+  seat_overage_cents?: number;
+  seat_derived_storage?: boolean;
+  storage_per_seat_bytes?: number;
+  storage_cap_bytes?: number;
   description: string;
   features: string[];
   max_machines: number; // -1 = unlimited
   max_storage_bytes: number; // -1 = unlimited
   live_migration: boolean; // false on the free (cold-only) tier
+  team_members?: boolean;
+  audit_logging?: boolean;
+  sso_and_scim?: boolean;
+  periodic_policies?: boolean;
+  failover?: boolean;
+  sourceguard?: boolean;
+  sourceguard_credits_months?: number;
+  storage_reclaim?: boolean;
+  relay_allowance_bytes?: number;
+  overage_storage_cents_per_gb?: number;
+  overage_transfer_cents_per_gb?: number;
+  overage_cap_cents_default?: number;
+  max_api_requests_per_day?: number; // -1 = unlimited
+  max_api_requests_per_hour?: number; // -1 = unlimited
+  max_migrations_per_day?: number; // -1 = unlimited
+  history_retention_days?: number;
+  trial_eligible?: boolean;
 }
 
 export type APIKeyScope =
   | "read" | "operate" | "admin"
-  | "machines" | "workloads" | "migrations" | "checkpoints";
+  | "machines" | "workloads" | "migrations" | "checkpoints"
+  | "compute" | "scim";
 
 export type UsageKind = "checkpoint_storage" | "transfer_bytes" | "machine_hours" | "api_requests";
 
@@ -48,7 +86,7 @@ export interface User {
   id: string;
   email: string;
   display_name: string;
-  disabled_at: string | null;
+  disabled_at?: string | null;
   created_at: string;
 }
 
@@ -62,7 +100,10 @@ export interface Organization {
 export interface SessionTokens {
   session_id: string;
   access_token: string;
-  refresh_token: string;
+  // Optional/writeOnly per the spec: cookie-based browser sessions never see
+  // the rotating refresh token — it lives only in the httpOnly `shift_rt`
+  // cookie — so responses legitimately omit it.
+  refresh_token?: string;
   token_type: "Bearer";
   expires_at: string;
 }
@@ -130,11 +171,17 @@ export interface Machine {
   machine_id: string;
   name: string;
   agent_url: string;
+  local_agent_url?: string;
   capabilities: MachineCapabilitiesPayload;
   status: MachineStatus;
   last_seen_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** Heartbeat response (POST /machines/{id}/heartbeat): Machine plus the gate. */
+export interface MachineHeartbeatResponse extends Machine {
+  live_migration_allowed: boolean;
 }
 
 export interface WorkloadSpec {
@@ -189,9 +236,19 @@ export interface MigrationJob {
   source_machine_id: string;
   destination_machine_id: string;
   mode: MigrationMode;
+  route?: "direct" | "relay";
+  relay_endpoint?: string;
+  relay_ticket?: string;
   status: MigrationStatus;
   progress: MigrationProgress;
   error_message?: string;
+  idempotency_key?: string;
+  attempt_count: number;
+  lease_owner?: string;
+  lease_expires_at?: string | null;
+  agent_migration_id?: string;
+  managed: boolean;
+  cancel_requested: boolean;
   created_by: string;
   created_at: string;
   updated_at: string;
@@ -252,6 +309,59 @@ export interface Entitlement {
   used_storage_bytes: number;
   max_machines: number;
   stripe_customer_id?: string;
+  /** True while a 14-day no-card Business trial is running (expires_at in the future). */
+  trial_active?: boolean;
+}
+
+/** Trial state (GET /v1/organizations/{id}/trial). */
+export interface TrialStatus {
+  organization_id: string;
+  /** True when a trial row exists — including an already-expired trial. */
+  trial: boolean;
+  eligible: boolean;
+  started_at?: string;
+  expires_at?: string;
+  /** Floored whole days remaining per the API; derive display from expires_at. */
+  days_left?: number;
+  converted?: boolean;
+}
+
+/** Trial start response (POST /v1/organizations/{id}/trial). */
+export interface TrialStarted {
+  organization_id: string;
+  plan: string;
+  trial: boolean;
+  started_at: string;
+  expires_at: string;
+}
+
+/** Self-serve usage summary (GET /v1/organizations/{id}/usage/summary). */
+export interface UsageSummaryResponse {
+  period: { from: string; to: string };
+  storage: { used_bytes: number; max_bytes: number; pct: number };
+  transfer: {
+    bytes_30d: number;
+    limit_bytes: number;
+    by_channel: Record<string, number>;
+    throttle: "ok" | "warn" | "exceeded";
+    resets_at: string;
+  };
+  machines: { online: number; total: number };
+  migrations_7d: Record<string, number>;
+  seats: { included: number; purchased: number; members: number };
+  api: { requests_today: number; daily_budget: number };
+}
+
+/** Stripe checkout body (POST /v1/organizations/{id}/billing/checkout). */
+export interface CheckoutOptions {
+  plan: string;
+  success_url: string;
+  cancel_url: string;
+  seats?: number;
+  interval?: "month" | "year";
+  addons?: string[];
+  coupon?: string;
+  spend_cap_cents?: number;
 }
 
 // Control-plane-hosted checkpoint storage status. When enabled is false the
@@ -273,7 +383,7 @@ export interface AuditEvent {
   actor_user_id?: string;
   action: string;
   resource_type: string;
-  resource_id: string;
+  resource_id?: string;
   metadata: Record<string, unknown>;
   request_id?: string;
   remote_addr?: string;
@@ -286,9 +396,9 @@ export interface APIKey {
   name: string;
   prefix: string;
   scopes: APIKeyScope[];
-  expires_at: string | null;
-  last_used_at: string | null;
-  revoked_at: string | null;
+  expires_at?: string | null;
+  last_used_at?: string | null;
+  revoked_at?: string | null;
   created_at: string;
 }
 
@@ -316,6 +426,15 @@ export interface ApiError {
   request_id?: string;
 }
 
+/** Counts-only GDPR erasure summary (DELETE /v1/users/me). */
+export interface ErasureReport {
+  user_id: string;
+  email_anonymized: boolean;
+  sessions_removed: number;
+  api_keys_removed: number;
+  audit_ips_scrubbed: number;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Compute marketplace                                                */
 /* ------------------------------------------------------------------ */
@@ -329,7 +448,7 @@ export interface ComputeResources {
 }
 
 export interface ComputePricing {
-  currency?: string;
+  currency: string;
   cpu_hour_micros?: number;
   memory_gib_hour_micros?: number;
   storage_gib_hour_micros?: number;
@@ -348,11 +467,13 @@ export interface ComputeOffer {
   committed: ComputeResources;
   available: ComputeResources;
   pricing: ComputePricing;
-  geography?: { region?: string; country?: string; zone?: string };
+  geography: { region?: string; country?: string; zone?: string };
   policy: { visibility: string; [key: string]: unknown };
   availability: { status: string; last_seen_at?: string };
   trust: string;
   identity_verified: boolean;
+  /** Hardware and CRIU capabilities from the machine registry, not the publisher. */
+  capabilities: Record<string, unknown>;
   created_at: string;
   updated_at: string;
   withdrawn_at?: string;

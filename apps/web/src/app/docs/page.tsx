@@ -8,15 +8,20 @@ import {
   Box,
   Camera,
   ArrowLeftRight,
+  Database,
+  Store,
   Braces,
   Terminal,
   Shield,
   Wrench,
+  Layers,
+  Cog,
+  History,
 } from "lucide-react";
 
 export const metadata: Metadata = {
   title: "Documentation",
-  description: "SHIFTGATE documentation — guides, references, and concepts for moving running computation between machines.",
+  description: "SHIFT documentation — guides, references, and concepts for moving running computation between machines.",
 };
 
 const CATEGORIES = [
@@ -30,13 +35,19 @@ const CATEGORIES = [
     title: "Concepts",
     slug: "concepts",
     icon: Lightbulb,
-    description: "Core ideas behind SHIFTGATE — workloads, machines, checkpoints, and state classes.",
+    description: "Core ideas behind SHIFT — workloads, machines, checkpoints, and state classes.",
   },
   {
     title: "Machines",
     slug: "machines",
     icon: Monitor,
     description: "System requirements, registration, capabilities, heartbeats, and GPU compatibility.",
+  },
+  {
+    title: "Platforms and Compatibility",
+    slug: "platforms",
+    icon: Layers,
+    description: "Certified platforms, the CRIU support policy, GPU evidence rules, and compatibility refusal codes.",
   },
   {
     title: "Workloads",
@@ -55,6 +66,24 @@ const CATEGORIES = [
     slug: "migration",
     icon: ArrowLeftRight,
     description: "Cold and live migration, the pipeline, compatibility, failure handling, warm-standby failover, and lazy restore.",
+  },
+  {
+    title: "Storage",
+    slug: "storage",
+    icon: Database,
+    description: "Encrypted checkpoint storage — self-hosted S3 mirroring and platform-hosted storage with reconciled, quota-enforced usage.",
+  },
+  {
+    title: "Operations",
+    slug: "operations",
+    icon: Cog,
+    description: "Offline chunk garbage collection, agent updates, retention windows, and plan entitlements.",
+  },
+  {
+    title: "Compute Marketplace",
+    slug: "marketplace",
+    icon: Store,
+    description: "Publish spare machine capacity as offers, reserve capacity from other organizations, and place workloads on it.",
   },
   {
     title: "API Reference",
@@ -80,6 +109,12 @@ const CATEGORIES = [
     icon: Wrench,
     description: "Common issues, diagnostics, and how to get help when something goes wrong.",
   },
+  {
+    title: "Versioning",
+    slug: "versioning",
+    icon: History,
+    description: "Semver policy before 1.0, state-format compatibility, the N-1 upgrade window, and deprecations.",
+  },
 ];
 
 export default function DocsIndexPage() {
@@ -91,7 +126,7 @@ export default function DocsIndexPage() {
             Documentation
           </p>
           <h1 className="text-3xl md:text-4xl font-bold tracking-tight mb-4">
-            SHIFTGATE documentation
+            SHIFT documentation
           </h1>
           <p className="text-text-secondary max-w-2xl text-lg leading-relaxed">
             Everything you need to move running computation between machines.

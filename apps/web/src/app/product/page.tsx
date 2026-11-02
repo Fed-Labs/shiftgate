@@ -54,7 +54,7 @@ const migratableItems = [
     icon: Network,
     title: "Network connections",
     description:
-      "Listeners and sockets follow CRIU where supported. Otherwise SHIFTGATE reports the boundary and applies drain or reconnect behavior from workload policy.",
+      "Listeners and sockets follow CRIU where supported. Otherwise SHIFT reports the boundary and applies drain or reconnect behavior from workload policy.",
     detail: "Capability-gated",
   },
   {
@@ -75,12 +75,12 @@ const limitations = [
   {
     title: "Linux only",
     description:
-      "SHIFTGATE uses CRIU (Checkpoint/Restore In Userspace) which is Linux-specific. macOS and Windows support is on the roadmap but not available today.",
+      "SHIFT uses CRIU (Checkpoint/Restore In Userspace) which is Linux-specific. macOS and Windows are not supported and are out of scope today.",
   },
   {
     title: "Kernel feature requirements",
     description:
-      "Certain features require specific kernel versions. ptrace-based memory access needs Linux 4.11+. Userfaultfd for live migration needs 4.3+. We check these at install time.",
+      "Checkpoint/restore relies on CRIU and the kernel features it needs. Lazy restore additionally needs userfaultfd (Linux 4.3+). shiftgate doctor runs criu check — and criu check --feature uffd for lazy restore — and reports real gaps instead of substituting a fake checkpoint.",
   },
   {
     title: "Some kernel objects are not migratable",
@@ -122,7 +122,7 @@ const useCases = [
   {
     title: "Warm-standby failover",
     description:
-      "Give a workload a failover policy and every checkpoint replicates to a standby agent that watches the source. When the source is confirmed gone — unreachable and stale at the control plane — the standby restores the newest checkpoint there automatically.",
+      "Give a workload a checkpoint and failover policy to replicate the newest root checkpoint to a standby. Automatic restore requires ownership and a positively returning fencing provider; the default is fail-closed.",
     workflow: ["shiftgate workload failover api --to https://standby:8443 --keep 3", "shiftgate standby list"],
   },
 ];
@@ -150,7 +150,7 @@ export default function ProductPage() {
                 between machines.
               </h1>
               <p className="text-lg text-text-secondary leading-relaxed max-w-2xl">
-                SHIFTGATE checkpoints running computation — processes, memory,
+                SHIFT checkpoints running computation — processes, memory,
                 file descriptors, network policy — within the limits reported by
                 CRIU and device adapters — and restores it on a different
                 machine.
@@ -173,10 +173,10 @@ export default function ProductPage() {
                 What moves
               </p>
               <h2 className="text-3xl md:text-4xl font-bold tracking-tight mb-4">
-                Everything about a running process.
+                The supported state of a running Linux workload.
               </h2>
               <p className="text-text-secondary max-w-2xl mb-12">
-                When SHIFTGATE migrates a workload, it captures the full
+                When SHIFT migrates a workload, it captures the full
                 execution state. Not just the binary — the live state of a
                 running system.
               </p>
@@ -252,7 +252,7 @@ export default function ProductPage() {
                 Where it fits.
               </h2>
               <p className="text-text-secondary max-w-2xl mb-12">
-                SHIFTGATE is for workloads that are expensive to restart and
+                SHIFT is for workloads that are expensive to restart and
                 need to move between machines.
               </p>
             </motion.div>
@@ -294,7 +294,7 @@ export default function ProductPage() {
                 Computation should be fluid.
               </h2>
               <p className="text-text-secondary leading-relaxed mb-8">
-                Machines are temporary. Your work is what matters. SHIFTGATE
+                Machines are temporary. Your work is what matters. SHIFT
                 makes computation portable — encrypted, verified, and fast.
               </p>
               <div className="flex flex-wrap justify-center gap-6 text-sm">
@@ -308,7 +308,7 @@ export default function ProductPage() {
                 </div>
                 <div className="flex items-center gap-2">
                   <Check className="w-4 h-4 text-accent" />
-                  <span className="text-text-secondary">No daemon required</span>
+                  <span className="text-text-secondary">Requires the privileged shift-agent service</span>
                 </div>
               </div>
             </motion.div>

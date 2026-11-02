@@ -7,9 +7,9 @@ import { cn } from "@/lib/utils";
 import { useState } from "react";
 
 const nav = [
-  { href: "/technology", label: "Technology" },
+  { href: "/product", label: "Product" },
+  { href: "/technology", label: "How it works" },
   { href: "/developers", label: "Developers" },
-  { href: "/pricing", label: "Pricing" },
   { href: "/docs", label: "Docs" },
 ];
 
@@ -23,7 +23,7 @@ export function SiteHeader() {
         <Link href="/" className="flex items-center shrink-0 group">
           <Image
             src="/logo.png"
-            alt="SHIFTGATE"
+            alt="SHIFT"
             width={120}
             height={28}
             className="h-6 w-auto"
@@ -62,6 +62,10 @@ export function SiteHeader() {
           className="md:hidden font-mono text-[11px] text-text-muted"
           onClick={() => setMobileOpen(!mobileOpen)}
           aria-label="Toggle menu"
+          aria-expanded={mobileOpen}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setMobileOpen(false);
+          }}
         >
           {mobileOpen ? "CLOSE" : "MENU"}
         </button>
@@ -105,14 +109,10 @@ export function SiteFooter() {
           <div>
             <p className="tlabel mb-4">SYSTEM</p>
             <div className="font-mono text-[11px] text-text-muted leading-relaxed">
-              <div className="flex items-center gap-2 mb-1">
-                <span className="w-[5px] h-[5px] bg-status-healthy" /> CONTROL PLANE
-              </div>
-              <div className="flex items-center gap-2 mb-1">
-                <span className="w-[5px] h-[5px] bg-status-healthy" /> API
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="w-[5px] h-[5px] bg-status-healthy" /> STORAGE
+              <div className="text-text-muted leading-relaxed">
+                SERVICE STATUS NOT CONNECTED
+                <br />
+                <span className="text-text-faint">static site / no live telemetry</span>
               </div>
             </div>
           </div>
@@ -120,11 +120,15 @@ export function SiteFooter() {
 
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 pt-8 border-t border-border-subtle">
           <div className="flex items-center gap-3">
-            <Image src="/icon.png" alt="SHIFTGATE" width={20} height={20} className="h-5 w-5" />
-            <span className="font-mono text-[12px] tracking-[0.2em] text-text">SHIFTGATE</span>
+            <Image src="/icon.png" alt="SHIFT" width={20} height={20} className="h-5 w-5" />
+            <span className="font-mono text-[12px] tracking-[0.2em] text-text">SHIFT</span>
           </div>
-          <p className="font-mono text-[10px] text-text-faint">
-            © {new Date().getFullYear()} — COMPUTATION SHOULD MOVE FREELY
+          <p className="font-mono text-[10px] text-text-faint" suppressHydrationWarning>
+            © {new Date().getFullYear()}{" "}
+            <a href="https://fed-labs.xyz" className="hover:text-text-secondary" target="_blank" rel="noopener noreferrer">
+              Fed Labs, Ltd.
+            </a>{" "}
+            — COMPUTATION SHOULD MOVE FREELY
           </p>
         </div>
       </div>

@@ -1,0 +1,8 @@
+This directory is licensed under the Elastic License 2.0 (source-available),
+not the Apache-2.0 license that covers the machine-side core.
+
+Full text: ../../LICENSE-ELv2 (also LICENSE.elastic.txt at the repository root).
+License map: ../../NOTICE and docs/legal/licensing.md.
+
+You may use, modify, and run this code internally. You may not provide it to
+third parties as a hosted or managed service.

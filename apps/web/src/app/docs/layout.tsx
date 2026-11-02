@@ -13,26 +13,35 @@ import {
   Box,
   Camera,
   ArrowLeftRight,
+  Database,
+  Store,
   Braces,
   Terminal,
   Shield,
   Wrench,
   Menu,
   X,
-  Search,
+  Layers,
+  Cog,
+  History,
 } from "lucide-react";
 
 const NAV_SECTIONS = [
   { title: "Quickstart", slug: "quickstart", icon: Rocket },
   { title: "Concepts", slug: "concepts", icon: Lightbulb },
   { title: "Machines", slug: "machines", icon: Monitor },
+  { title: "Platforms", slug: "platforms", icon: Layers },
   { title: "Workloads", slug: "workloads", icon: Box },
   { title: "Checkpoints", slug: "checkpoints", icon: Camera },
   { title: "Migration", slug: "migration", icon: ArrowLeftRight },
+  { title: "Storage", slug: "storage", icon: Database },
+  { title: "Operations", slug: "operations", icon: Cog },
+  { title: "Marketplace", slug: "marketplace", icon: Store },
   { title: "API", slug: "api", icon: Braces },
   { title: "CLI", slug: "cli", icon: Terminal },
   { title: "Security", slug: "security", icon: Shield },
   { title: "Troubleshooting", slug: "troubleshooting", icon: Wrench },
+  { title: "Versioning", slug: "versioning", icon: History },
 ];
 
 export default function DocsLayout({ children }: { children: React.ReactNode }) {
@@ -49,6 +58,11 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
             onClick={() => setSidebarOpen(!sidebarOpen)}
             className="fixed bottom-6 right-6 z-50 flex h-12 w-12 items-center justify-center rounded-full bg-accent text-bg shadow-lg md:hidden"
             aria-label="Toggle navigation"
+            aria-expanded={sidebarOpen}
+            aria-controls="docs-sidebar"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setSidebarOpen(false);
+            }}
           >
             {sidebarOpen ? <X size={20} /> : <Menu size={20} />}
           </button>
@@ -63,6 +77,10 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
 
           {/* Sidebar */}
           <aside
+            id="docs-sidebar"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setSidebarOpen(false);
+            }}
             className={cn(
               "fixed top-14 bottom-0 z-40 w-72 shrink-0 border-r border-border-subtle bg-bg overflow-y-auto transition-transform duration-200 md:sticky md:top-14 md:h-[calc(100vh-3.5rem)] md:translate-x-0",
               sidebarOpen ? "translate-x-0" : "-translate-x-full"
@@ -75,10 +93,6 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
                   <span className="text-sm font-semibold tracking-tight">
                     Documentation
                   </span>
-                </div>
-                <div className="flex items-center gap-2 rounded-md border border-border bg-bg-surface px-3 py-2 text-sm text-text-muted">
-                  <Search size={14} />
-                  <span>Search docs…</span>
                 </div>
               </div>
 

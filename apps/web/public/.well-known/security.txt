@@ -1,0 +1,5 @@
+Contact: https://github.com/Fed-Labs/shiftgate/security/advisories/new
+Policy: https://github.com/Fed-Labs/shiftgate/blob/main/SECURITY.md
+Preferred-Languages: en
+Expires: 2027-12-31T23:59:59Z
+Canonical: https://shiftgate.dev/.well-known/security.txt

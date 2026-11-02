@@ -15,7 +15,7 @@ import { ComputeNotifyForm } from "./notify-form";
 export const metadata: Metadata = {
   title: "Compute Marketplace",
   description:
-    "Find machines by CPU, RAM, GPU, price, and latency. The SHIFTGATE compute marketplace concept — on-demand portable compute.",
+    "Find machines by CPU, RAM, GPU, price, and latency. The SHIFT compute marketplace concept — on-demand portable compute.",
 };
 
 const FILTER_OPTIONS = [
@@ -29,11 +29,11 @@ const FILTER_OPTIONS = [
 const CONCEPT_CARDS = [
   {
     title: "How it works",
-    body: "Publish your workload requirements — CPU, RAM, GPU, network, storage — and SHIFTGATE finds compatible machines in the marketplace. You set a maximum price, and the system matches you with the best available option based on cost, latency, and availability.",
+    body: "Publish your workload requirements — CPU, RAM, GPU, network, storage — and SHIFT finds compatible machines in the marketplace. You set a maximum price, and the system matches you with the best available option based on cost, latency, and availability.",
   },
   {
     title: "For machine owners",
-    body: "Register your machines with the marketplace and set your pricing. Earn revenue from idle capacity. SHIFTGATE handles scheduling, migration, and billing — you provide the hardware.",
+    body: "Register your machines with the marketplace and set your pricing. Earn revenue from idle capacity. SHIFT handles scheduling, migration, and billing — you provide the hardware.",
   },
   {
     title: "For workload owners",

@@ -4,7 +4,7 @@ import { Container, Section, Card, Badge, Mono } from "@/components/ui";
 
 export const metadata: Metadata = {
   title: "Changelog",
-  description: "Version history and release notes for SHIFTGATE.",
+  description: "Version history and release notes for SHIFT.",
 };
 
 interface ChangelogEntry {
@@ -25,7 +25,7 @@ const entries: ChangelogEntry[] = [
       "Hosted checkpoint storage: per-organization encrypted mirroring with reconciled, quota-enforced usage; agents fetch short-lived scoped credentials from the control plane.",
       "Live migration: CRIU pre-copy runs before the authoritative final checkpoint (--mode live).",
       "Lazy restore: the process starts before its memory is fully loaded and pages stream in on demand through a userfaultfd-backed daemon (shiftgate restore --lazy).",
-      "Warm-standby failover: failover policies replicate checkpoints to a standby agent that restores the newest copy when the source is confirmed gone (shiftgate workload failover, shiftgate standby).",
+      "Warm-standby failover: failover policies replicate checkpoints to a standby agent that restores the newest copy on your command, or automatically when the source is confirmed gone and a fencing provider is configured (shiftgate workload failover, shiftgate standby).",
       "Clone sets: derive up to 128 independent running workloads from one checkpoint on the same machine, with reflink-copied filesystems and an all-or-nothing transaction (shiftgate clone).",
       "One-click migration from the dashboard: dispatch a migration from the workloads fleet or a workload's detail page.",
       "shiftgate.dev is the default control plane endpoint; --control-plane is optional.",

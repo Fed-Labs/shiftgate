@@ -1,5 +1,7 @@
 import type { MetadataRoute } from "next";
 
+const BASE = process.env.NEXT_PUBLIC_SITE_URL || "https://shiftgate.dev";
+
 export default function robots(): MetadataRoute.Robots {
   return {
     rules: [
@@ -9,6 +11,6 @@ export default function robots(): MetadataRoute.Robots {
         disallow: ["/app/", "/login", "/signup"],
       },
     ],
-    sitemap: "https://shiftgate.dev/sitemap.xml",
+    sitemap: `${BASE}/sitemap.xml`,
   };
 }

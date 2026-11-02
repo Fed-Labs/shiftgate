@@ -1,12 +1,16 @@
 {
   "name": "web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build --webpack",
+    "dev": "node scripts/sync-openapi.mjs && next dev",
+    "build": "node scripts/sync-openapi.mjs && next build --webpack",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "sync-openapi": "node scripts/sync-openapi.mjs",
+    "validate-content": "node scripts/sync-openapi.mjs && node scripts/validate-content.mjs",
+    "test:content": "node scripts/validate-content.mjs",
+    "test:smoke": "node --test src/lib/helpers.test.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
@@ -14,7 +18,7 @@
     "date-fns": "^4.4.0",
     "framer-motion": "^13.1.1",
     "lucide-react": "^1.33.0",
-    "next": "16.3.1",
+    "next": "^16.4.1",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "tailwind-merge": "^3.6.0",
@@ -26,7 +30,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.3.1",
+    "eslint-config-next": "^16.4.1",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

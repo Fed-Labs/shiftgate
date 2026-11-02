@@ -5,7 +5,7 @@ import { Container, Section, Card, Badge } from "@/components/ui";
 
 export const metadata: Metadata = {
   title: "Download",
-  description: "Install SHIFTGATE with one command on Linux x86_64, or build from source.",
+  description: "Install SHIFT with one command on Linux x86_64, or build from source.",
 };
 
 export default function DownloadPage() {
@@ -18,7 +18,7 @@ export default function DownloadPage() {
             <div className="relative text-center space-y-4 mb-12">
               <div className="absolute left-1/2 top-0 -z-10 h-[280px] w-[620px] max-w-full -translate-x-1/2 rounded-full bg-accent/10 blur-[120px]" aria-hidden />
               <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">
-                Install SHIFTGATE
+                Install SHIFT
               </h1>
               <p className="text-text-secondary text-lg">
                 One command installs the release. Building from source is one command too.

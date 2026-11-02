@@ -14,7 +14,7 @@ import { EnterpriseContactForm } from "./contact-form";
 export const metadata: Metadata = {
   title: "Enterprise",
   description:
-    "SHIFTGATE for organizations that need self-hosted deployment, custom data residency, dedicated support, and compliance controls.",
+    "SHIFT for organizations that need self-hosted deployment, deployment control, and contract-based support terms.",
 };
 
 const FEATURES = [
@@ -22,37 +22,37 @@ const FEATURES = [
     icon: Server,
     title: "Self-hosted",
     description:
-      "Deploy the full SHIFTGATE control plane in your own infrastructure. Your data never leaves your network.",
+      "Deploy the full SHIFT control plane in your own infrastructure. Your data never leaves your network. Self-hosting is also how you keep checkpoint storage and audit data inside a region you choose.",
   },
   {
     icon: Globe,
-    title: "Custom data residency",
+    title: "Deployment location",
     description:
-      "Choose where your data lives. Meet regulatory requirements with region-specific deployments and data isolation.",
+      "Self-hosted deployments keep all data wherever you run them. The hosted service is single-region today — there is no per-customer region pinning on the hosted platform. For residency requirements, deploy self-hosted or talk to us.",
   },
   {
     icon: HeadphonesIcon,
-    title: "Dedicated support",
+    title: "Contract-based support",
     description:
-      "Direct access to the SHIFTGATE engineering team. SLA-backed response times for critical issues.",
+      "Direct access to the SHIFT engineering team under a support agreement. Response times and channels are defined in your contract — there is no published SLA today.",
   },
   {
     icon: FileCheck,
-    title: "SLA",
+    title: "Agreement terms",
     description:
-      "Contractual guarantees on availability, performance, and support response. Custom SLAs for enterprise requirements.",
+      "Availability and support terms are defined per agreement. We do not sell an off-the-shelf SLA; if your procurement needs one, we negotiate it with you.",
   },
   {
     icon: KeyRound,
     title: "SSO integration",
     description:
-      "Connect your identity provider. OIDC single sign-on and SCIM user provisioning for seamless authentication across your organization.",
+      "OIDC single sign-on (authorization-code flow with PKCE) and SCIM user provisioning. Each deployment federates to one OIDC issuer; per-customer identity providers are a self-hosted capability. SCIM covers the Users resource only.",
   },
   {
     icon: ClipboardList,
     title: "Audit controls",
     description:
-      "Extended audit logging, custom retention policies, and integration with your SIEM for compliance monitoring.",
+      "Audit events are available through the audit API with configurable retention per organization (default 365 days). Export runs through your deployment's logging pipeline — there is no built-in SIEM connector today.",
   },
 ];
 
@@ -72,9 +72,11 @@ export default function EnterprisePage() {
                 For organizations that need control
               </h1>
               <p className="text-text-secondary text-lg leading-relaxed">
-                SHIFTGATE Enterprise is for organizations that need to run
-                the full platform in their own infrastructure, with custom
-                data residency, compliance controls, and dedicated support.
+                SHIFT Enterprise is for organizations that need to run the
+                full platform in their own infrastructure, with deployment
+                control and support terms defined by contract. Everything on
+                this page describes what the product does today; nothing is
+                promised that we do not implement.
               </p>
             </div>
 

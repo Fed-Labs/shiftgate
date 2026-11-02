@@ -137,8 +137,8 @@ export function MachineView({
 
         {/* Spec footer */}
         <div className="px-3 py-2 border-t border-border-subtle flex flex-wrap gap-x-4 gap-y-1">
-          {specs.map((s) => (
-            <span key={s} className="font-mono text-[10px] text-text-muted">{s}</span>
+          {specs.map((s, i) => (
+            <span key={`${s}-${i}`} className="font-mono text-[10px] text-text-muted">{s}</span>
           ))}
         </div>
       </div>
@@ -185,120 +185,85 @@ export function ResourceReadout({
 }
 
 /* ------------------------------------------------------------------ */
-/*  MigrationPath — state travelling across a line                     */
+/*  Query states — loading, error-with-retry, and status messages      */
 /* ------------------------------------------------------------------ */
 
-export function MigrationPath({
-  from,
-  to,
-  progress, // 0..1
-  active = false,
-  vertical = false,
-  className,
-}: {
-  from: string;
-  to: string;
-  progress: number;
-  active?: boolean;
-  vertical?: boolean;
-  className?: string;
-}) {
+export function LoadingState({ label }: { label: string }) {
   return (
-    <div className={cn("relative", vertical ? "flex flex-col items-center" : "flex items-center", className)}>
-      <span className="font-mono text-[10px] text-text-muted tracking-[0.12em]">{from}</span>
-      <div className={cn("relative flex-1 mx-3", vertical ? "w-px self-stretch my-2" : "h-px")}>
-        <div className={cn("absolute inset-0", vertical ? "w-px bg-border" : "h-px bg-border")} />
-        {/* travelling state */}
-        <div
-          className={cn("absolute", vertical ? "left-[-2px] w-[5px] h-[5px]" : "top-[-2px] w-[5px] h-[5px]", active ? "bg-accent" : "bg-text-muted")}
-          style={vertical ? { top: `${progress * 100}%` } : { left: `${progress * 100}%` }}
-        />
-      </div>
-      <span className="font-mono text-[10px] text-text-muted tracking-[0.12em]">{to}</span>
+    <div className="flex items-center gap-3 py-10" role="status" aria-live="polite">
+      <span className="inline-block w-3 h-3 border border-accent border-t-transparent rounded-full animate-spin" aria-hidden="true" />
+      <span className="font-mono text-[11px] text-text-muted">{label}</span>
     </div>
   );
 }
 
-/* ------------------------------------------------------------------ */
-/*  StateTimeline — checkpoints as moments on a line                   */
-/* ------------------------------------------------------------------ */
-
-export interface TimelinePoint {
-  id: string;
-  time: string;
-  label: string;
-  branch?: string;
-}
-
-export function StateTimeline({
-  points,
-  selected,
-  onSelect,
-  className,
+export function ErrorState({
+  title,
+  message,
+  onRetry,
 }: {
-  points: TimelinePoint[];
-  selected?: string;
-  onSelect?: (id: string) => void;
-  className?: string;
+  title: string;
+  message?: string;
+  onRetry?: () => void;
 }) {
   return (
-    <div className={cn("relative", className)}>
-      <div className="absolute left-[3px] top-1 bottom-1 w-px bg-border" />
-      <div className="flex flex-col gap-4">
-        {points.map((p) => (
-          <button
-            key={p.id}
-            onClick={() => onSelect?.(p.id)}
-            className="relative flex items-center gap-3 text-left group cursor-pointer pl-0"
-          >
-            <span
-              className={cn(
-                "relative z-10 w-[7px] h-[7px] shrink-0 transition-colors",
-                selected === p.id ? "bg-accent" : "bg-border-strong group-hover:bg-text-muted"
-              )}
-            />
-            <span className="font-mono text-[11px] text-text-muted tabular-nums">{p.time}</span>
-            <span className={cn("font-mono text-[11px]", selected === p.id ? "text-accent" : "text-text-secondary")}>
-              {p.label}
-            </span>
-            {p.branch && (
-              <span className="font-mono text-[10px] text-accent-dim">↳ {p.branch}</span>
-            )}
-          </button>
-        ))}
-      </div>
+    <div className="border border-status-error/30 bg-status-error/5 py-14 px-6 text-center" role="alert">
+      <p className="font-mono text-[12px] text-status-error mb-2">{title}</p>
+      {message && <p className="text-text-muted text-sm mb-6 max-w-lg mx-auto leading-relaxed">{message}</p>}
+      {onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="font-mono text-[11px] tracking-[0.16em] text-accent border border-accent/40 px-5 py-2.5 hover:bg-accent hover:text-bg transition-colors"
+        >
+          RETRY
+        </button>
+      )}
     </div>
   );
 }
 
-/* ------------------------------------------------------------------ */
-/*  SystemStatus — service line                                        */
-/* ------------------------------------------------------------------ */
-
-export function SystemStatus({
-  name,
-  state,
-  detail,
-}: {
-  name: string;
-  state: "operational" | "degraded" | "down";
-  detail?: string;
-}) {
+// FEATURE_PLAN_REQUIRED (402) is a plan gate, not an outage: name the feature,
+// the plan that unlocks it, and link the upgrade path.
+export function PlanRequiredState({ feature, plan }: { feature: string; plan?: string }) {
   return (
-    <div className="flex items-center justify-between py-2.5 border-b border-border-subtle last:border-0">
-      <div className="flex items-center gap-3">
-        <span
-          className={cn(
-            "w-[6px] h-[6px]",
-            state === "operational" ? "bg-status-healthy" : state === "degraded" ? "bg-status-warning" : "bg-status-error"
-          )}
-        />
-        <span className="text-sm text-text">{name}</span>
-      </div>
-      <div className="flex items-center gap-4">
-        {detail && <span className="font-mono text-[10px] text-text-muted">{detail}</span>}
-        <span className="tlabel">{state}</span>
-      </div>
+    <div className="border border-accent/30 bg-accent/5 py-14 px-6 text-center" role="status">
+      <p className="font-mono text-[12px] text-accent mb-2">{feature.toUpperCase()} IS A { (plan || "PAID").toUpperCase() }-PLAN FEATURE</p>
+      <p className="text-text-muted text-sm mb-6 max-w-lg mx-auto leading-relaxed">
+        Your current plan does not include {feature.toLowerCase()}. Upgrade to unlock it —
+        this is a plan limit, not a service problem.
+      </p>
+      <a
+        href="/app/billing"
+        className="inline-block font-mono text-[11px] tracking-[0.16em] text-bg bg-accent px-5 py-2.5 hover:bg-accent-dim transition-colors"
+      >
+        UPGRADE PLAN
+      </a>
     </div>
+  );
+}
+
+// Mutation outcome lines carry their own success/error flag — coloring never
+// depends on matching substrings of the message.
+export function MessageLine({
+  pendingLabel,
+  message,
+  pending,
+  success,
+}: {
+  pendingLabel: string;
+  message: string | null;
+  pending: boolean;
+  success: boolean;
+}) {
+  if (!pending && !message) return null;
+  return (
+    <p
+      role="status"
+      aria-live="polite"
+      className={cn("font-mono text-[11px]", pending ? "text-accent" : success ? "text-status-healthy" : "text-status-error")}
+    >
+      {pending ? pendingLabel : message}
+    </p>
   );
 }

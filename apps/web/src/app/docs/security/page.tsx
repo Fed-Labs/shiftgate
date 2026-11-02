@@ -18,7 +18,7 @@ export default function SecurityPage() {
             Security
           </h1>
           <p className="text-text-secondary max-w-2xl text-lg leading-relaxed">
-            SHIFTGATE is designed around a zero-trust model. Every machine
+            SHIFT is designed around a zero-trust model. Every machine
             authenticates with a cryptographic identity, all transport is
             encrypted, and checkpoint data is encrypted at rest.
           </p>
@@ -103,11 +103,17 @@ Public key:  /var/lib/shift/identity/identity-public.pem`}</code>
 
         {/* API authentication */}
         <div className="mb-12">
-          <h2 className="text-xl font-semibold mb-4">API authentication</h2>
+          <h2 className="text-xl font-semibold mb-4">API authentication and sessions</h2>
           <p className="text-sm text-text-secondary leading-relaxed mb-4">
-            The API uses Bearer token authentication. API keys are scoped to
-            specific operations and can be set to expire. Each key is tied to
-            a role that determines which endpoints it can access.
+            The API uses Bearer credentials: opaque session access tokens and
+            opaque API keys — no JSON Web Tokens are issued or accepted anywhere
+            in the system, and only keyed HMAC digests of tokens and keys are
+            ever persisted, never bearer values. API keys are scoped to specific
+            operations and can be set to expire. Browser sessions are stricter
+            still: the dashboard&apos;s rotating refresh token travels only in
+            an httpOnly, Secure, SameSite=Strict cookie scoped to the auth
+            paths (<code className="font-mono text-xs bg-bg-surface px-1.5 py-0.5 rounded">/v1/auth</code>),
+            so an XSS cannot read it from script-accessible storage or JSON.
           </p>
           <div className="rounded-lg border border-border bg-bg-elevated p-5">
             <pre className="text-sm text-text-secondary whitespace-pre-wrap">
@@ -119,8 +125,8 @@ Broad scopes:
   admin            — administrative operations
 
 Resource scopes:
-  machines         workloads
-  migrations       checkpoints`}</code>
+  machines    workloads    migrations
+  checkpoints compute      scim`}</code>
             </pre>
           </div>
         </div>
@@ -129,7 +135,7 @@ Resource scopes:
         <div className="mb-12">
           <h2 className="text-xl font-semibold mb-4">Role-based access control</h2>
           <p className="text-sm text-text-secondary leading-relaxed mb-4">
-            SHIFTGATE supports four built-in roles. Each role grants a specific
+            SHIFT supports four built-in roles. Each role grants a specific
             set of permissions across the organization&apos;s resources.
           </p>
           <div className="rounded-lg border border-border bg-bg-elevated overflow-hidden">
@@ -161,10 +167,14 @@ Resource scopes:
         <div className="mb-12">
           <h2 className="text-xl font-semibold mb-4">Audit logging</h2>
           <p className="text-sm text-text-secondary leading-relaxed mb-4">
-            Every action in SHIFTGATE is recorded in an append-only audit log.
+            Every action in SHIFT is recorded in an append-only audit log.
             This includes API calls, machine registrations, workload lifecycle
-            events, migrations, and key rotations. Audit logs are retained for
-            90 days on standard plans and indefinitely on enterprise plans.
+            events, and migrations. Audit logs are retained per your
+            organization&apos;s retention window — 365 days by default,
+            configurable from 0 (keep forever) to 36500 days. The window is
+            plan-capped: Free and Pro up to 365 days, Business and Enterprise
+            up to 36500. Audit events intentionally omit secrets and checkpoint
+            contents.
           </p>
           <div className="rounded-lg border border-border bg-bg-elevated p-5">
             <pre className="text-sm text-text-secondary whitespace-pre-wrap">
@@ -174,7 +184,8 @@ Resource scopes:
   "org_id": "org_a1b2c3",
   "workload_id": "wl_k8m2p4q7",
   "source_machine": "mach_7f3a2b1c",
-  "target_machine": "mach_9e4d8c2a",
+  "source_machine_id": "mach_source",
+  "destination_machine_id": "mach_target",
   "duration_ms": 5600,
   "timestamp": "2026-08-20T14:30:05Z",
   "ip": "203.0.113.42"
@@ -183,16 +194,41 @@ Resource scopes:
           </div>
         </div>
 
+        {/* Account erasure */}
+        <div className="mb-12">
+          <h2 className="text-xl font-semibold mb-4">Account erasure and privacy</h2>
+          <p className="text-sm text-text-secondary leading-relaxed mb-4">
+            <code className="font-mono text-xs bg-bg-surface px-1.5 py-0.5 rounded">DELETE /v1/users/me</code>{" "}
+            is the account-erasure mechanism. It irreversibly anonymizes the
+            calling user&apos;s personal data — email, display name, password
+            hash, session tokens, and audit IP/user-agent metadata — and revokes
+            every session. The user row itself survives as a pseudonymous stub
+            so audit trails, organization membership, and billing history keep
+            valid references. The response is a counts-only report (
+            <code className="font-mono text-xs bg-bg-surface px-1.5 py-0.5 rounded">{"{user_id, email_anonymized, sessions_removed, audit_ips_scrubbed}"}</code>
+            ), never the destroyed data.
+          </p>
+          <p className="text-sm text-text-secondary leading-relaxed">
+            Accounts deactivated through SCIM reach the same end state through
+            the retention sweep&apos;s anonymization pass after a 30-day grace
+            window: SCIM delete revokes sessions immediately and keeps the row
+            for audit integrity, and the personal data does not survive the
+            grace period.
+          </p>
+        </div>
+
         {/* Key rotation */}
         <div>
           <h2 className="text-xl font-semibold mb-4">Key rotation</h2>
           <p className="text-sm text-text-secondary leading-relaxed">
-            SHIFTGATE supports both automatic and manual key rotation. Machine
-            identity keys can be rotated without downtime — the new key is
-            registered before the old one is revoked. API keys support
+            Key management covers what is implemented today. API keys support
             overlapping rotation: create a new key, update your integrations,
-            then revoke the old key. Organization KEKs can be rotated to
-            re-encrypt all checkpoint data with a new master key.
+            then revoke the old key. Workload data keys can be rotated, which
+            versions the keyring and re-keys the workload&apos;s subsequent
+            checkpoints. Machine identity keys are generated once per agent
+            state directory; identity-key rotation and organization-wide
+            master-key rotation are not implemented today — the keyring is
+            versioned so they can be added later.
           </p>
         </div>
       </Container>

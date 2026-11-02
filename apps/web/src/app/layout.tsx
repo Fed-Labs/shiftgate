@@ -3,14 +3,16 @@ import { Space_Grotesk, IBM_Plex_Mono } from "next/font/google";
 import { Providers } from "@/lib/providers";
 import "./globals.css";
 
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://shiftgate.dev";
+
 const display = Space_Grotesk({
-  variable: "--font-display",
+  variable: "--font-shift-display",
   subsets: ["latin"],
   weight: ["400", "500", "600", "700"],
 });
 
 const mono = IBM_Plex_Mono({
-  variable: "--font-mono",
+  variable: "--font-shift-mono",
   subsets: ["latin"],
   weight: ["400", "500"],
 });
@@ -18,34 +20,34 @@ const mono = IBM_Plex_Mono({
 export const metadata: Metadata = {
   title: {
     default: "SHIFT — Move supported computation between Linux machines",
-    template: "%s — SHIFTGATE",
+    template: "%s — SHIFT",
   },
   description:
     "SHIFT moves running computation between Linux machines with encrypted checkpoints, validated restore, and explicit compatibility boundaries.",
-  metadataBase: new URL("https://shiftgate.dev"),
+  metadataBase: new URL(SITE_URL),
   icons: {
     icon: "/favicon.png",
     apple: "/favicon.png",
   },
   openGraph: {
-    title: "SHIFTGATE",
+    title: "SHIFT",
     description: "Move supported computation between Linux machines with validated checkpoint/restore.",
     type: "website",
     locale: "en_US",
     images: [
       {
-        url: "/logo.png",
+        url: "/og.png",
         width: 1200,
         height: 630,
-        alt: "SHIFTGATE",
+        alt: "SHIFT",
       },
     ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "SHIFTGATE",
+    title: "SHIFT",
     description: "Move computation between machines.",
-    images: ["/logo.png"],
+    images: ["/og.png"],
   },
   robots: {
     index: true,

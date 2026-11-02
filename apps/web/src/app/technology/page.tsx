@@ -46,7 +46,7 @@ const migrationStages = [
   { stage: "VERIFY", description: "Validate manifest signatures on target" },
   { stage: "RESTORE", description: "CRIU restore on target machine" },
   { stage: "POST_VALIDATE", description: "Verify restored process state" },
-  { stage: "SWITCH", description: "Redirect clients, update routing" },
+  { stage: "SWITCH", description: "Destination becomes authoritative; source preserved and stopped" },
   { stage: "COMMIT", description: "Finalize migration, acknowledge completion" },
   { stage: "CLEANUP", description: "Remove checkpoint data from source" },
   { stage: "COMPLETED", description: "Migration finished successfully" },
@@ -70,7 +70,7 @@ export default function TechnologyPage() {
                 Technology
               </p>
               <h1 className="text-4xl md:text-5xl font-bold tracking-tight mb-6">
-                How SHIFTGATE works.
+                How SHIFT works.
               </h1>
               <p className="text-lg text-text-secondary leading-relaxed max-w-2xl">
                 Built on CRIU (Checkpoint/Restore In Userspace). Encrypted
@@ -144,7 +144,7 @@ export default function TechnologyPage() {
                     <div className="space-y-1">
                       <div className="text-text-muted font-mono">CRIU restore</div>
                       <div className="text-text-muted font-mono">State validation</div>
-                      <div className="text-text-muted font-mono">Client redirect</div>
+                      <div className="text-text-muted font-mono">Source preserved</div>
                     </div>
                   </div>
                 </div>
@@ -164,7 +164,7 @@ export default function TechnologyPage() {
                 Three kinds of state.
               </h2>
               <p className="text-text-secondary max-w-2xl mb-12">
-                Not all state is equal. SHIFTGATE classifies process state into
+                Not all state is equal. SHIFT classifies process state into
                 three categories to determine migration strategy.
               </p>
             </motion.div>
@@ -314,13 +314,13 @@ export default function TechnologyPage() {
                   icon: Lock,
                   title: "Encrypted transport",
                   description:
-                    "All checkpoint data encrypted with AES-256-GCM. Keys derived per-migration.",
+                    "All checkpoint data encrypted with AES-256-GCM. Per-workload keys with per-purpose derivation.",
                 },
                 {
                   icon: Key,
                   title: "Per-machine keys",
                   description:
-                    "Each machine has its own key pair. Checkpoints encrypted for the target only.",
+                    "Each machine has its own key pair. Keys reach a destination only inside the mutually authenticated TLS session.",
                 },
                 {
                   icon: Shield,
@@ -338,7 +338,7 @@ export default function TechnologyPage() {
                   icon: Shield,
                   title: "No plaintext at rest",
                   description:
-                    "Checkpoint data is never written to disk unencrypted. Keys stored in kernel keyring.",
+                    "Checkpoint chunks and manifest envelopes are encrypted before persistence. Plaintext workload state exists locally while the workload runs.",
                 },
                 {
                   icon: FileCheck,
@@ -369,8 +369,9 @@ export default function TechnologyPage() {
                 Built for engineers.
               </h2>
               <p className="text-text-secondary leading-relaxed">
-                SHIFTGATE is open source. Read the code, audit the crypto,
-                understand the tradeoffs. No black boxes.
+                Everything on your machines is Apache-2.0; the fleet control
+                plane is source-available (Elastic License 2.0). Read the code,
+                audit the crypto, understand the tradeoffs. No black boxes.
               </p>
             </motion.div>
           </Container>

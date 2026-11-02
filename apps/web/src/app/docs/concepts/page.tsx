@@ -3,7 +3,7 @@ import { Container, Section } from "@/components/ui";
 
 export const metadata: Metadata = {
   title: "Concepts",
-  description: "Core concepts behind SHIFTGATE — workloads, machines, checkpoints, migrations, and state classes.",
+  description: "Core concepts behind SHIFT — workloads, machines, checkpoints, migrations, and state classes.",
 };
 
 const CONCEPTS = [
@@ -11,9 +11,9 @@ const CONCEPTS = [
     id: "workloads",
     title: "Workloads",
     subtitle: "The unit of portable computation",
-    body: `A workload is the fundamental unit SHIFTGATE manages. It wraps a running process — its command, file system paths, resource requirements, and device policies — into a portable entity that can be moved between machines without the process knowing.
+    body: `A workload is the fundamental unit SHIFT manages. It wraps a running process — its command, file system paths, resource requirements, and device policies — into a portable entity that can be moved between machines without the process knowing.
 
-Workloads are not containers or VMs. They are process-level abstractions. SHIFTGATE captures the execution state CRIU and the configured device adapters can represent, then validates it before restoring on a different machine.`,
+Workloads are not containers or VMs. They are process-level abstractions. SHIFT captures the execution state CRIU and the configured device adapters can represent, then validates it before restoring on a different machine.`,
     diagram: (
       <div className="flex items-center gap-3 flex-wrap">
         <div className="rounded-md border border-border bg-bg-surface px-4 py-3 text-sm font-mono">
@@ -37,10 +37,10 @@ Workloads are not containers or VMs. They are process-level abstractions. SHIFTG
   {
     id: "machines",
     title: "Machines",
-    subtitle: "Registered computers running the SHIFTGATE agent",
-    body: `A machine is any computer that runs the SHIFTGATE agent and has been registered with your organization. Machines report their capabilities — CPU, memory, GPU model, kernel version — and send periodic heartbeats to the control plane.
+    subtitle: "Registered computers running the SHIFT agent",
+    body: `A machine is any computer that runs the SHIFT agent and has been registered with your organization. Machines report their capabilities — CPU, memory, GPU model, kernel version — and send periodic heartbeats to the control plane.
 
-Machines are the source and destination for migrations. SHIFTGATE uses machine capabilities to determine compatibility before attempting a migration.`,
+Machines are the source and destination for migrations. SHIFT uses machine capabilities to determine compatibility before attempting a migration.`,
     diagram: (
       <div className="grid grid-cols-3 gap-3">
         {["mach_a1b2c3", "mach_d4e5f6", "mach_g7h8i9"].map((id, i) => (
@@ -62,9 +62,9 @@ Machines are the source and destination for migrations. SHIFTGATE uses machine c
     id: "checkpoints",
     title: "Checkpoints",
     subtitle: "Captured execution state",
-    body: `A checkpoint is a snapshot of a workload's execution state at a point in time. It includes the CRIU process image, explicitly scoped filesystem data, and a state inventory that records network and device adapters.
+    body: `A checkpoint captures a workload's execution state at a point in time. It includes the CRIU process image, explicitly scoped filesystem data, and a state inventory that records network and device adapters.
 
-SHIFTGATE supports two types of checkpoints:
+SHIFT supports two types of checkpoints:
 
 • Full checkpoints capture the entire state independently. Larger, but self-contained.
 • Incremental checkpoints capture only the pages that changed since the last checkpoint. Smaller and faster, but depend on the parent checkpoint.`,
@@ -94,10 +94,10 @@ SHIFTGATE supports two types of checkpoints:
     subtitle: "Moving a workload between machines",
     body: `A migration is the process of transferring a workload from one machine to another. The pipeline has distinct stages: checkpoint the source, transfer state, restore on the target, validate, and switch.
 
-SHIFTGATE supports two migration modes:
+SHIFT supports two migration modes:
 
 • Cold migration: the workload is paused, checkpointed, transferred, and restored. Simple and reliable, but the process is interrupted.
-• Live migration: SHIFTGATE performs a CRIU pre-copy before the authoritative final checkpoint. The final checkpoint still has a stop phase, and network or device state follows its adapter.`,
+• Live migration: SHIFT performs a CRIU pre-copy before the authoritative final checkpoint. The final checkpoint still has a stop phase, and network or device state follows its adapter.`,
     diagram: (
       <div className="flex items-center gap-1.5 flex-wrap text-xs font-mono">
         {["snapshot", "transfer", "restore", "validate", "switch"].map((stage, i) => (
@@ -119,7 +119,7 @@ SHIFTGATE supports two migration modes:
 
 • Portable state can move freely between machines. This includes process memory, CPU registers, and open file contents. Most application state is portable.
 
-• Machine-specific state is tied to hardware. GPU memory, NUMA topology, and device-specific mappings fall into this category. SHIFTGATE checks compatibility and invokes a vendor adapter when one is available.
+• Machine-specific state is tied to hardware. GPU memory, NUMA topology, and device-specific mappings fall into this category. SHIFT checks compatibility and invokes a vendor adapter when one is available.
 
 • External state lives outside the workload. Database connections, network sockets to external services, and shared file system mounts are reconnected or drained according to workload policy.
 
@@ -155,7 +155,7 @@ export default function ConceptsPage() {
             Core concepts
           </h1>
           <p className="text-text-secondary max-w-2xl text-lg leading-relaxed">
-            SHIFTGATE is built around a small number of primitives.
+            SHIFT is built around a small number of primitives.
             Understanding these concepts makes everything else click.
           </p>
         </div>
