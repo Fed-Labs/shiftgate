@@ -8,8 +8,6 @@ machinery evacuates a maintenance-window host without losing the job running on
 it. The same commit gate makes every move safe — **state moves, and a failed
 move never destroys the source.**
 
-
-
 ```bash
 curl -fsSL https://github.com/Fed-Labs/shiftgate/releases/latest/download/install.sh | bash
 ```
