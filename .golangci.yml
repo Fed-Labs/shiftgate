@@ -1,9 +1,11 @@
 # golangci-lint configuration for SHIFT.
 #
 # The project is deliberately stdlib-heavy; the enabled linters enforce the
-# invariants its own spec demands: no stray prints (structured logging only),
-# no ignored errors, no leaked bodies or rows, no context-less HTTP requests,
-# and formatted, vet-clean code. Everything here must pass `make lint-ci`.
+# invariants its own spec demands: no ignored errors, no leaked bodies or
+# rows, no context-less HTTP requests, and formatted, vet-clean code. The
+# "structured logging only, no stray prints" rule (CONTRIBUTING.md) is a
+# review convention — no print-forbidding linter is configured here.
+# Everything here must pass `make lint-ci`.
 
 version: "2"
 
