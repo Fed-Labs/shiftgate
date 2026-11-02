@@ -1,8 +1,10 @@
-// Control-plane client. Requests run through the official Tauri HTTP plugin
-// (its Rust side performs the transport, including TLS — the WebView itself
-// has no network access), with the same JSON shapes as the web dashboard.
+// Control-plane client. Requests run through the Rust `control_request`
+// command, which pins every target to the configured control plane (https,
+// verified; plain http only for loopback) — the WebView itself makes no
+// network connections and holds no HTTP permission. JSON shapes match the
+// web dashboard.
 
-import { fetch } from "@tauri-apps/plugin-http";
+import { invoke } from "./backend";
 import { useAuth } from "./store";
 
 export interface ControlMachine {
@@ -49,35 +51,85 @@ export class ControlError extends Error {
   }
 }
 
+/** The raw control-plane exchange: status + body text, nothing interpreted. */
+export interface ControlResponse {
+  status: number;
+  body: string;
+}
+
+/**
+ * One request against the configured control plane. The Rust side owns the
+ * target URL; this only names the path. Errors carry "<CODE>: <message>".
+ */
+export function requestRaw(
+  method: string,
+  path: string,
+  body?: unknown,
+  authenticated = true
+): Promise<ControlResponse> {
+  const { tokens } = useAuth.getState();
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (authenticated && tokens?.access_token) {
+    headers.authorization = `Bearer ${tokens.access_token}`;
+  }
+  return invoke<ControlResponse>("control_request", {
+    method,
+    path,
+    body: body === undefined ? null : body,
+    headers,
+  });
+}
+
 async function request<T>(
   method: string,
   path: string,
   body?: unknown,
   retry = true
 ): Promise<T> {
-  const { controlPlaneURL, tokens, refresh } = useAuth.getState();
-  const base = controlPlaneURL.replace(/\/$/, "");
-  if (!base) throw new ControlError("NOT_CONFIGURED", "No control plane is configured.", 0);
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (tokens?.access_token) headers.Authorization = `Bearer ${tokens.access_token}`;
-  const response = await fetch(`${base}${path}`, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  const { tokens, refresh } = useAuth.getState();
+  const response = await requestRaw(method, path, body);
   if (response.status === 401 && retry && tokens?.refresh_token) {
     // Access tokens are short-lived; one refresh, then replay the request.
     const refreshed = await refresh();
     if (refreshed) return request<T>(method, path, body, false);
   }
   if (response.status === 204) return undefined as T;
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) {
-    const code = payload?.code ?? "REQUEST_FAILED";
-    const message = payload?.message ?? `Control plane returned ${response.status}`;
+  let payload: Record<string, unknown> | null = null;
+  try {
+    payload = response.body ? (JSON.parse(response.body) as Record<string, unknown>) : null;
+  } catch {
+    payload = null;
+  }
+  if (response.status < 200 || response.status >= 300) {
+    const code = (payload?.code as string | undefined) ?? "REQUEST_FAILED";
+    const message =
+      (payload?.message as string | undefined) ?? `Control plane returned ${response.status}`;
     throw new ControlError(code, message, response.status);
   }
   return payload as T;
+}
+
+/** The control plane's page ceiling (database.MaxPageLimit). */
+const PAGE_LIMIT = 500;
+/** Safety valve against a server that never reports a short page. */
+const MAX_PAGES = 20;
+
+/**
+ * Walk a paginated list endpoint to completion. Without paging, the desktop
+ * silently showed only the first 100 machines of a fleet.
+ */
+async function requestAll<T>(path: string): Promise<T[]> {
+  const all: T[] = [];
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    const separator = path.includes("?") ? "&" : "?";
+    const values = await request<T[]>(
+      "GET",
+      `${path}${separator}limit=${PAGE_LIMIT}&offset=${all.length}`
+    );
+    all.push(...values);
+    if (values.length < PAGE_LIMIT) break;
+  }
+  return all;
 }
 
 export const control = {
@@ -90,7 +142,8 @@ export const control = {
     return result;
   },
   logout: () => request<void>("POST", "/v1/auth/logout"),
-  organizations: () => request<Organization[]>("GET", "/v1/organizations"),
+  health: () => request<{ status: string; version?: string }>("GET", "/health"),
+  organizations: () => requestAll<Organization>("/v1/organizations"),
   machines: (organizationID: string) =>
-    request<ControlMachine[]>("GET", `/v1/organizations/${organizationID}/machines`),
+    requestAll<ControlMachine>(`/v1/organizations/${organizationID}/machines`),
 };

@@ -1,9 +1,9 @@
 // Workloads — the operating surface: create, start, pause/resume, stop,
-// checkpoint, migrate, fork (clone), delete, inspect, and read logs. Every
-// action is a real agent call; failures surface the agent's own error code
-// and message, never a generic "something went wrong".
+// checkpoint, migrate, fork, delete, inspect, logs, and the periodic
+// checkpoint policy. Every action is a real agent call; failures surface the
+// agent's own error code and message, never a generic "something went wrong".
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronDown,
@@ -17,7 +17,7 @@ import {
   Waypoints,
 } from "lucide-react";
 import clsx from "clsx";
-import { backend, formatBytes, shortID } from "@/lib/backend";
+import { backend, errorMessage, formatBytes, formatRelative, shortID } from "@/lib/backend";
 import { control } from "@/lib/control";
 import { useAuth } from "@/lib/store";
 import { Badge, Button, Card, Dot, EmptyState, ErrorBanner, KeyValue, SectionLabel, Spinner } from "@/components/ui";
@@ -233,7 +233,7 @@ function WorkloadCard({
           onClick={() => onAction("fork", () => backend.forkWorkload(id))}
           title="Fork: an independent copy from this workload's latest state"
         >
-          <Copy className="w-3.5 h-3.5" /> Fork
+          <Copy className="w-3.5 h-3.5" /> Fork <span className="text-text-faint">from latest state</span>
         </Button>
         <Button
           variant="ghost"
@@ -281,6 +281,7 @@ function WorkloadInspect({ workload }: { workload: Workload }) {
   const [logs, setLogs] = useState<string | null>(null);
   const [restoring, setRestoring] = useState<string | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [confirmRestore, setConfirmRestore] = useState<string | null>(null);
 
   const checkpoints = useQuery({
     queryKey: ["agent-checkpoints", spec.id],
@@ -355,7 +356,12 @@ function WorkloadInspect({ workload }: { workload: Workload }) {
       <div>
         <SectionLabel>Checkpoints</SectionLabel>
         <ErrorBanner message={restoreError} />
-        {(checkpoints.data ?? []).length === 0 ? (
+        {checkpoints.isError ? (
+          // A failed query is not an empty history: say what went wrong.
+          <p className="text-[13px] text-status-error">
+            Cannot read checkpoints: {errorMessage(checkpoints.error) ?? "the agent rejected the request"}
+          </p>
+        ) : (checkpoints.data ?? []).length === 0 ? (
           <p className="text-[13px] text-text-muted">No checkpoints yet — use Checkpoint while the workload runs.</p>
         ) : (
           <div className="divide-y divide-border-subtle rounded-lg border border-border overflow-hidden">
@@ -372,19 +378,55 @@ function WorkloadInspect({ workload }: { workload: Workload }) {
                   </div>
                 </div>
                 <div className="ml-auto flex items-center gap-2">
-                  <Button
-                    variant="ghost"
-                    disabled={restoring === checkpoint.id}
-                    onClick={() => void restore(checkpoint.id)}
-                  >
-                    {restoring === checkpoint.id ? "Restoring…" : "Restore here"}
-                  </Button>
+                  {confirmRestore === checkpoint.id ? (
+                    <>
+                      <Button
+                        variant="danger"
+                        disabled={restoring === checkpoint.id}
+                        onClick={() => {
+                          setConfirmRestore(null);
+                          void restore(checkpoint.id);
+                        }}
+                      >
+                        {restoring === checkpoint.id
+                          ? "Restoring…"
+                          : `Confirm — restore ${shortID(checkpoint.id)}`}
+                      </Button>
+                      <Button variant="ghost" onClick={() => setConfirmRestore(null)}>
+                        Cancel
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      disabled={restoring === checkpoint.id}
+                      onClick={() => setConfirmRestore(checkpoint.id)}
+                    >
+                      {restoring === checkpoint.id ? "Restoring…" : "Restore here"}
+                    </Button>
+                  )}
                 </div>
               </div>
             ))}
           </div>
         )}
+        {confirmRestore && (
+          <p className="text-[12px] text-status-warning leading-relaxed mt-2">
+            Restoring replaces this workload's current root state with checkpoint {shortID(confirmRestore)} —
+            everything written since that checkpoint is discarded. The previous state is backed up and
+            rolled back automatically if the restore fails.
+          </p>
+        )}
       </div>
+
+      {/* Periodic checkpoint policy — remounted when the saved policy
+          changes so a stale draft can never be written back. */}
+      <CheckpointPolicyCard
+        key={`${workload.spec.checkpoint_policy?.interval_seconds ?? "off"}:${
+          workload.spec.checkpoint_policy?.keep_last ?? 0
+        }`}
+        workload={workload}
+      />
 
       {/* Logs */}
       <div>
@@ -407,8 +449,116 @@ function WorkloadInspect({ workload }: { workload: Workload }) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Checkpoint policy — periodic checkpoints while the workload runs    */
+/* ------------------------------------------------------------------ */
+
+/** "10m", "30s", "1h", or a bare number (minutes) → seconds. */
+function parseInterval(value: string): number {
+  const trimmed = value.trim().toLowerCase();
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*(s|m|h)?$/);
+  if (!match) throw new Error(`POLICY_INTERVAL_INVALID: "${value}" — use 10m, 30s, 1h, or minutes as a number`);
+  const amount = Number(match[1]);
+  const unit = match[2] ?? "m";
+  const seconds = Math.round(amount * (unit === "s" ? 1 : unit === "m" ? 60 : 3600));
+  if (seconds < 10) throw new Error("POLICY_INTERVAL_INVALID: the minimum interval is 10 seconds");
+  return seconds;
+}
+
+function formatInterval(seconds: number): string {
+  if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+  if (seconds % 60 === 0) return `${seconds / 60}m`;
+  return `${seconds}s`;
+}
+
+function CheckpointPolicyCard({ workload }: { workload: Workload }) {
+  const queryClient = useQueryClient();
+  const policy = workload.spec.checkpoint_policy ?? null;
+  const [interval, setInterval] = useState(policy ? formatInterval(policy.interval_seconds) : "");
+  const [keep, setKeep] = useState(policy?.keep_last ? String(policy.keep_last) : "");
+  const [error, setError] = useState<string | null>(null);
+
+  const save = useMutation({
+    mutationFn: (off: boolean) => {
+      if (off) return backend.workloadPolicy(workload.spec.id, 0, 0);
+      const seconds = parseInterval(interval);
+      const keepLast = keep.trim() === "" ? 0 : Number(keep);
+      if (!Number.isInteger(keepLast) || keepLast < 0) {
+        throw new Error("POLICY_KEEP_INVALID: keep must be a non-negative integer (0 keeps all)");
+      }
+      return backend.workloadPolicy(workload.spec.id, seconds, keepLast);
+    },
+    onSuccess: () => {
+      setError(null);
+      void queryClient.invalidateQueries({ queryKey: ["agent-workloads"] });
+    },
+    onError: (mutationError) =>
+      setError(mutationError instanceof Error ? mutationError.message : String(mutationError)),
+  });
+
+  return (
+    <div>
+      <SectionLabel>Checkpoint policy</SectionLabel>
+      <ErrorBanner message={error} />
+      <p className="text-[13px] text-text-muted mb-3">
+        {policy
+          ? `Periodic checkpointing on — every ${formatInterval(policy.interval_seconds)}, retaining ${
+              policy.keep_last ? `the last ${policy.keep_last}` : "all"
+            }.`
+          : "Periodic checkpointing is off — checkpoints are taken only on demand."}
+      </p>
+      <div className="grid md:grid-cols-2 gap-3">
+        <Field label="Interval" value={interval} onChange={setInterval} placeholder="10m, 30s, or 1h" />
+        <Field label="Keep last (0 keeps all)" value={keep} onChange={setKeep} placeholder="0" />
+      </div>
+      <div className="flex gap-2 mt-3">
+        <Button variant="primary" disabled={save.isPending} onClick={() => save.mutate(false)}>
+          {save.isPending ? "Saving…" : "Save policy"}
+        </Button>
+        <Button variant="ghost" disabled={save.isPending || !policy} onClick={() => save.mutate(true)}>
+          Disable
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Create workload                                                     */
 /* ------------------------------------------------------------------ */
+
+/** Split a command line into argv, honoring shell-style quoting so paths
+ * with spaces can be expressed ("python3" '/opt/my app/run.py' --flag). */
+function splitCommand(line: string): string[] {
+  const argv: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let started = false;
+  for (const char of line) {
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      started = true;
+      continue;
+    }
+    if (char === " " || char === "\t") {
+      if (started) {
+        argv.push(current);
+        current = "";
+        started = false;
+      }
+      continue;
+    }
+    current += char;
+    started = true;
+  }
+  if (quote) throw new Error("COMMAND_UNTERMINATED_QUOTE: close the quoted argument");
+  if (started) argv.push(current);
+  return argv;
+}
 
 function CreateWorkloadCard({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient();
@@ -421,7 +571,8 @@ function CreateWorkloadCard({ onClose }: { onClose: () => void }) {
 
   const create = useMutation({
     mutationFn: async () => {
-      const commandParts = command.trim().split(/\s+/).filter(Boolean);
+      const commandParts = splitCommand(command);
+      if (commandParts.length === 0) throw new Error("COMMAND_INVALID: the command is empty");
       const portSpecs = ports
         .split(",")
         .map((entry) => entry.trim())
@@ -430,9 +581,14 @@ function CreateWorkloadCard({ onClose }: { onClose: () => void }) {
           // "8080" publishes 8080→8080; "8080:80" publishes host 8080 → container 80.
           const match = entry.match(/^(?:(\d+):)?(\d+)$/);
           if (!match) throw new Error(`PORT_INVALID: ${entry} — use 8080 or 8080:80`);
-          const hostPort = match[1] ? Number(match[1]) : undefined;
+          const hostPort = match[1] !== undefined ? Number(match[1]) : undefined;
           const containerPort = Number(match[2]);
-          return { protocol: "tcp", container_port: containerPort, ...(hostPort ? { host_port: hostPort } : {}) };
+          for (const [label, port] of [["host", hostPort], ["container", containerPort]] as const) {
+            if (port !== undefined && (port < 1 || port > 65535)) {
+              throw new Error(`PORT_INVALID: ${entry} — the ${label} port must be 1–65535`);
+            }
+          }
+          return { protocol: "tcp", container_port: containerPort, ...(hostPort !== undefined ? { host_port: hostPort } : {}) };
         });
       return backend.createWorkload({
         name: name.trim(),
@@ -473,7 +629,7 @@ function CreateWorkloadCard({ onClose }: { onClose: () => void }) {
       <p className="text-[12px] text-text-muted leading-relaxed">
         The root must be an explicit directory owned by you — SHIFT never captures an unrestricted home
         directory. Only TCP ports can be declared; they are reserved before restore and published after the
-        health check passes.
+        health check passes. The command is parsed like a shell line: quote arguments that contain spaces.
       </p>
       <div className="flex gap-2">
         <Button variant="primary" disabled={create.isPending} onClick={submit}>
@@ -523,6 +679,12 @@ function MigrateDialog({
   const [destinationURL, setDestinationURL] = useState("");
   const [mode, setMode] = useState<"cold" | "live">("cold");
   const [error, setError] = useState<string | null>(null);
+  const [preflight, setPreflight] = useState<{
+    result: import("../lib/backend").PreflightResult;
+    target: string;
+    mode: "cold" | "live";
+  } | null>(null);
+  const [confirmingStart, setConfirmingStart] = useState(false);
 
   const machines = useQuery({
     queryKey: ["control-machines", organization?.id],
@@ -531,11 +693,42 @@ function MigrateDialog({
     retry: false,
   });
 
+  // A preflight report is valid only for the destination and mode it was
+  // computed for; drop it the moment either changes so a stale green badge
+  // can never vouch for a different target.
+  useEffect(() => {
+    setPreflight(null);
+    setConfirmingStart(false);
+  }, [destinationURL, mode]);
+
+  // Dry run: the same discover/validate stages a real migration performs,
+  // without freezing or moving anything — the report comes back inline.
+  const check = useMutation({
+    mutationFn: async (input: { target: string; mode: "cold" | "live" }) => {
+      if (!input.target) throw new Error("DESTINATION_REQUIRED: pick a registered machine or enter its agent endpoint.");
+      const parsed = parseEndpoint(input.target, machines.data ?? []);
+      return backend.preflightMigration({
+        workload_id: workload.spec.id,
+        destination: {
+          machine_id: parsed.machineID,
+          agent_url: parsed.agentURL,
+          server_name: parsed.serverName,
+        },
+        mode: input.mode,
+      });
+    },
+    onSuccess: (result, input) => {
+      setError(null);
+      setPreflight({ result, target: input.target, mode: input.mode });
+    },
+    onError: (mutationError) =>
+      setError(mutationError instanceof Error ? mutationError.message : String(mutationError)),
+  });
+
   const start = useMutation({
-    mutationFn: async () => {
-      const target = destinationURL.trim();
-      if (!target) throw new Error("DESTINATION_REQUIRED: pick a registered machine or enter its agent endpoint.");
-      const parsed = parseEndpoint(target, machines.data ?? []);
+    mutationFn: async (input: { target: string; mode: "cold" | "live" }) => {
+      if (!input.target) throw new Error("DESTINATION_REQUIRED: pick a registered machine or enter its agent endpoint.");
+      const parsed = parseEndpoint(input.target, machines.data ?? []);
       return backend.createMigration({
         workload_id: workload.spec.id,
         destination: {
@@ -543,13 +736,25 @@ function MigrateDialog({
           agent_url: parsed.agentURL,
           server_name: parsed.serverName,
         },
-        mode,
+        mode: input.mode,
       });
     },
     onSuccess: (migration) => onStarted(migration.id),
     onError: (mutationError) =>
       setError(mutationError instanceof Error ? mutationError.message : String(mutationError)),
   });
+
+  const preflightIssues = preflight?.result.report.issues ?? [];
+  const errorIssues = preflightIssues.filter((issue) => issue.severity === "error");
+  const startDisabled = start.isPending || check.isPending || !destinationURL.trim();
+  const beginStart = () => {
+    setError(null);
+    setConfirmingStart(true);
+  };
+  const confirmStart = () => {
+    setConfirmingStart(false);
+    start.mutate({ target: destinationURL.trim(), mode });
+  };
 
   return (
     <Card className="p-4 space-y-4 border-accent/30">
@@ -626,9 +831,79 @@ function MigrateDialog({
         </div>
       </div>
 
+      {preflight && (
+        <div className="rounded-md border border-border bg-bg p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="tlabel block">compatibility preflight</span>
+            <Badge tone={preflight.result.report.compatible ? "healthy" : "error"}>
+              {preflight.result.report.compatible ? "compatible" : "issues reported"}
+            </Badge>
+            <span className="text-[11px] text-text-faint ml-auto truncate max-w-64">
+              {preflight.target} · {preflight.mode} · checked {formatRelative(preflight.result.report.checked_at)} ·
+              nothing was moved or frozen
+            </span>
+          </div>
+          {preflightIssues.length > 0 && (
+            <div className="space-y-1.5">
+              {preflightIssues.map((issue, index) => (
+                <div key={index} className="text-[12px]">
+                  <Badge tone={issue.severity === "error" ? "error" : issue.severity === "warning" ? "warning" : "neutral"}>
+                    {issue.severity}
+                  </Badge>{" "}
+                  <span className="text-text-secondary">{issue.resource}: {issue.description}</span>
+                  {issue.adaptation && (
+                    <p className="text-text-muted text-[11px] mt-0.5">Adaptation: {issue.adaptation}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {preflight.result.report.compatible && preflightIssues.length === 0 && (
+            <p className="text-[12px] text-text-muted">
+              No issues found. An error-severity issue would reject the migration at validate time.
+            </p>
+          )}
+        </div>
+      )}
+
+      {confirmingStart && (
+        <div className="rounded-md border border-status-warning/40 bg-status-warning/10 p-3 space-y-2">
+          <p className="text-[13px] text-text-secondary">
+            {mode === "cold"
+              ? `Cold migration stops “${workload.spec.name}”, checkpoints it, transfers it, and restores it on the destination.`
+              : `Live migration pre-dumps “${workload.spec.name}” while it runs and stops it only for the final checkpoint.`}
+            {" "}The source is preserved unless the migration commits cleanly.
+          </p>
+          <p className="text-[12px] text-text-muted">
+            {preflight === null
+              ? "No compatibility preflight has been run for this destination and mode — the agent validates first and may reject the migration."
+              : errorIssues.length > 0
+                ? `The last preflight reported ${errorIssues.length} error-severity issue${
+                    errorIssues.length === 1 ? "" : "s"
+                  }; the agent will reject this migration at validate time.`
+                : "The last preflight reported no blocking issues for this destination and mode."}
+          </p>
+          <div className="flex gap-2">
+            <Button variant="danger" disabled={start.isPending} onClick={confirmStart}>
+              {start.isPending ? "Starting…" : "Yes, start migration"}
+            </Button>
+            <Button variant="ghost" onClick={() => setConfirmingStart(false)}>
+              Back
+            </Button>
+          </div>
+        </div>
+      )}
+
       <div className="flex gap-2">
-        <Button variant="primary" disabled={start.isPending} onClick={() => start.mutate()}>
-          {start.isPending ? "Starting…" : "Start migration"}
+        <Button
+          variant="secondary"
+          disabled={check.isPending || start.isPending || !destinationURL.trim()}
+          onClick={() => check.mutate({ target: destinationURL.trim(), mode })}
+        >
+          {check.isPending ? "Checking…" : "Check compatibility"}
+        </Button>
+        <Button variant="primary" disabled={startDisabled} onClick={beginStart}>
+          Start migration
         </Button>
         <Button variant="ghost" onClick={onClose}>
           Cancel
@@ -638,7 +913,14 @@ function MigrateDialog({
   );
 }
 
-/** Turn a picked or typed endpoint into the Destination the agent expects. */
+/**
+ * Turn a picked or typed endpoint into the Destination the agent expects.
+ * `machine_id` is an identity pin: the agent refuses any run whose pin does
+ * not match the destination's real machine ID, and an empty pin means "no
+ * pinning". For a manually entered endpoint there is no known ID, so the pin
+ * stays empty (the agent writes the resolved ID back) and the endpoint string
+ * doubles as the display label in `server_name`.
+ */
 function parseEndpoint(
   value: string,
   known: Awaited<ReturnType<typeof control.machines>>
@@ -656,7 +938,5 @@ function parseEndpoint(
       serverName: match.name,
     };
   }
-  // A manually entered endpoint: derive a stable machine label from it.
-  const machineID = trimmed.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "destination";
-  return { machineID, agentURL: trimmed };
+  return { machineID: "", agentURL: trimmed, serverName: trimmed };
 }

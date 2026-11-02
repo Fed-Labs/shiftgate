@@ -11,13 +11,16 @@ import React from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Loader2, X } from "lucide-react";
 import clsx from "clsx";
-import { backend, formatBytes, formatDuration, shortID } from "@/lib/backend";
-import { Badge, Button, Card, EmptyState, ProgressBar, SectionLabel, Spinner, KeyValue } from "@/components/ui";
+import { backend, errorMessage, formatBytes, formatDuration, shortID } from "@/lib/backend";
+import { Badge, Button, Card, EmptyState, ErrorBanner, ProgressBar, SectionLabel, Spinner, KeyValue } from "@/components/ui";
 import type { MigrationStage } from "@/lib/types";
 
 /** The five phases users see, in order. */
 const PHASES = ["Checkpointing", "Transferring", "Restoring", "Validating", "Completed"] as const;
 type Phase = (typeof PHASES)[number];
+
+/** Stages that describe how a run ended, not where it had progressed. */
+const TERMINAL_STAGES: MigrationStage[] = ["FAILED", "ROLLING_BACK", "ROLLED_BACK", "CANCELLED"];
 
 /** Map the agent's fine-grained stages onto the user-facing phases. */
 function phaseOf(stage: MigrationStage): Phase {
@@ -57,6 +60,7 @@ export function isTerminal(stage: MigrationStage): boolean {
 
 export function MigrationView({ migrationID, onClose }: { migrationID: string; onClose: () => void }) {
   const queryClient = useQueryClient();
+  const [cancelError, setCancelError] = React.useState<string | null>(null);
   const migration = useQuery({
     queryKey: ["agent-migration", migrationID],
     queryFn: () => backend.migration(migrationID),
@@ -74,24 +78,38 @@ export function MigrationView({ migrationID, onClose }: { migrationID: string; o
     );
   }
 
-  if (migration.isError || !migration.data) {
+  if (!migration.data) {
+    // Nothing has ever loaded: only then is the record itself missing.
+    // A transient poll failure with data already on screen keeps rendering it.
+    const detail = errorMessage(migration.error);
+    const missing = (detail ?? "").includes("MIGRATION_NOT_FOUND");
     return (
       <EmptyState
-        title="Migration not found"
-        description={migration.error instanceof Error ? migration.error.message : String(migration.error)}
+        title={missing ? "Migration not found" : "Cannot read this migration"}
+        description={detail ?? "The agent returned no data for this migration."}
         action={<Button onClick={onClose}>Back</Button>}
       />
     );
   }
 
   const value = migration.data;
-  const current = phaseIndex(value.stage);
+  // The agent serializes an empty event list and a clean compatibility report
+  // as `null`; normalize before touching them.
+  const events = value.events ?? [];
+  const compatibilityIssues = value.compatibility?.issues ?? [];
   const failed = value.stage === "FAILED";
   const cancelled = value.stage === "CANCELLED";
   const rollingBack = value.stage === "ROLLING_BACK";
   const rolledBack = value.stage === "ROLLED_BACK";
   const terminal = isTerminal(value.stage);
-  const latest = value.events[value.events.length - 1];
+  const interrupted = failed || cancelled || rollingBack || rolledBack;
+  // Where the run actually died: the stage of the last forward event. The
+  // terminal stage itself has no phase, and mapping it would pin the failure
+  // marker on "Validating" and checkmark every phase that never ran.
+  const lastForward = [...events].reverse().find((event) => !TERMINAL_STAGES.includes(event.stage));
+  const reachedStage = interrupted ? (lastForward?.stage ?? "CREATED") : value.stage;
+  const current = phaseIndex(reachedStage);
+  const latest = events[events.length - 1];
   const progress = latest?.progress ?? 0;
   const metrics = value.metrics;
   const transferRate = metrics.transfer_bytes_per_second;
@@ -124,7 +142,10 @@ export function MigrationView({ migrationID, onClose }: { migrationID: string; o
               onClick={() =>
                 backend
                   .cancelMigration(value.id)
-                  .catch(() => undefined)
+                  .then(() => setCancelError(null))
+                  .catch((error) =>
+                    setCancelError(error instanceof Error ? error.message : String(error))
+                  )
                   .finally(() => void queryClient.invalidateQueries({ queryKey: ["agent-migration", value.id] }))
               }
             >
@@ -136,6 +157,20 @@ export function MigrationView({ migrationID, onClose }: { migrationID: string; o
           </Button>
         </div>
       </div>
+
+      {/* A transient poll failure keeps the last known state on screen */}
+      {migration.isError && (
+        <ErrorBanner
+          message={`Live update failed: ${errorMessage(migration.error) ?? "unknown error"} — showing the last known state.`}
+        />
+      )}
+
+      {/* Cancel refusals surface with the agent's own reason */}
+      {cancelError && (
+        <div className="rounded-lg border border-status-error/40 bg-status-error/10 px-4 py-3 text-[13px] text-status-error">
+          Cancellation refused: {cancelError}
+        </div>
+      )}
 
       {/* Failure / rollback banner — the real reason, never a euphemism */}
       {(failed || rollingBack || rolledBack || cancelled) && (
@@ -153,12 +188,11 @@ export function MigrationView({ migrationID, onClose }: { migrationID: string; o
             <>
               <span className="readout">{value.failure_code || "FAILED"}</span>
               {value.failure_reason ? ` — ${value.failure_reason}` : ""}
-              {value.stage !== "ROLLING_BACK" && (
-                <div className="text-[12px] mt-1 text-text-muted">
-                  The source is {value.source_preserved ? "preserved and still usable" : "not preserved"}.
-                  {value.stage === "FAILED" && " The agent will roll the destination back; nothing is half-restored."}
-                </div>
-              )}
+              <div className="text-[12px] mt-1 text-text-muted">
+                The source is {value.source_preserved ? "preserved and still usable" : "not preserved"}.
+                {" "}FAILED is terminal — no automatic rollback will run. Inspect the destination
+                before reusing it; it may be half-restored.
+              </div>
             </>
           )}
           {rollingBack && <span>Rolling the destination back — the restore is being undone cleanly.</span>}
@@ -171,11 +205,11 @@ export function MigrationView({ migrationID, onClose }: { migrationID: string; o
       <Card className="p-6">
         <div className="flex items-center justify-between gap-1">
           {PHASES.map((phase, index) => {
-            const done = terminal && !failed && !cancelled && !rolledBack
+            const done = terminal && !interrupted
               ? index < PHASES.length - 1
               : index < current;
-            const activeNow = !terminal && index === current;
-            const isFailedHere = (failed || cancelled || rolledBack) && index === current;
+            const activeNow = !terminal && !interrupted && index === current;
+            const isFailedHere = interrupted && index === current;
             return (
               <React.Fragment key={phase}>
                 {index > 0 && (
@@ -262,16 +296,16 @@ export function MigrationView({ migrationID, onClose }: { migrationID: string; o
             label="Destination"
             value={value.destination.server_name || shortID(value.destination.machine_id)}
           />
-          <KeyValue label="Compatibility" value={value.compatibility.compatible ? "compatible" : "issues reported"} />
+          <KeyValue label="Compatibility" value={value.compatibility?.compatible ? "compatible" : "issues reported"} />
         </Card>
       </div>
 
       {/* Compatibility issues, when the checker found any */}
-      {value.compatibility.issues.length > 0 && (
+      {compatibilityIssues.length > 0 && (
         <Card className="p-4">
           <SectionLabel>Compatibility notes</SectionLabel>
           <div className="space-y-2">
-            {value.compatibility.issues.map((issue, index) => (
+            {compatibilityIssues.map((issue, index) => (
               <div key={index} className="text-[13px]">
                 <div className="flex items-baseline gap-2">
                   <Badge
@@ -297,7 +331,7 @@ export function MigrationView({ migrationID, onClose }: { migrationID: string; o
       <Card className="p-4">
         <SectionLabel>Event log</SectionLabel>
         <div className="max-h-72 overflow-y-auto divide-y divide-border-subtle">
-          {[...value.events].reverse().map((event) => (
+          {[...events].reverse().map((event) => (
             <div key={event.sequence} className="flex items-start gap-3 py-2">
               <span className="readout text-[11px] text-text-faint w-14 shrink-0">
                 {new Date(event.timestamp).toLocaleTimeString()}

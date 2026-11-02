@@ -6,9 +6,10 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Laptop } from "lucide-react";
-import { backend, formatBytes, formatRelative } from "@/lib/backend";
+import { backend, errorMessage, formatBytes, formatRelative } from "@/lib/backend";
 import { control, ControlMachine } from "@/lib/control";
 import { useAuth } from "@/lib/store";
+import { evaluateSupportPolicy } from "@/lib/support-policy";
 import { Badge, Card, Dot, EmptyState, KeyValue, SectionLabel, Spinner } from "@/components/ui";
 
 interface MachineCapabilitiesLike {
@@ -29,7 +30,14 @@ export function MachinesScreen() {
   const { organization, tokens } = useAuth();
   const [selected, setSelected] = useState<string | null>(null);
 
-  const localMachine = useQuery({ queryKey: ["agent-machine"], queryFn: backend.machine, retry: false });
+  // The local inventory is always available (agent-only usage has no control
+  // plane) and must stay fresh next to the polled fleet list.
+  const localMachine = useQuery({
+    queryKey: ["agent-machine"],
+    queryFn: backend.machine,
+    refetchInterval: 15_000,
+    retry: false,
+  });
   const machines = useQuery({
     queryKey: ["control-machines", organization?.id],
     queryFn: () => control.machines(organization!.id),
@@ -38,32 +46,6 @@ export function MachinesScreen() {
     retry: false,
   });
 
-  if (localMachine.isLoading) {
-    return (
-      <div className="flex items-center justify-center py-32">
-        <Spinner className="w-6 h-6" />
-      </div>
-    );
-  }
-
-  if (!organization || !tokens) {
-    return (
-      <EmptyState
-        title="Fleet view needs the control plane"
-        description="Sign in and select an organization in Settings to see registered machines. The local machine below is always available."
-      />
-    );
-  }
-
-  if (machines.isError) {
-    return (
-      <EmptyState
-        title="Could not load registered machines"
-        description={machines.error instanceof Error ? machines.error.message : String(machines.error)}
-      />
-    );
-  }
-
   const registered = machines.data ?? [];
 
   return (
@@ -71,14 +53,32 @@ export function MachinesScreen() {
       <div>
         <h1 className="text-xl font-semibold">Machines</h1>
         <p className="text-[13px] text-text-muted mt-0.5">
-          {registered.length} registered · migrations target a machine's agent endpoint
+          {organization && tokens
+            ? `${registered.length} registered · migrations target a machine's agent endpoint`
+            : "migrations target a machine's agent endpoint"}
         </p>
       </div>
 
-      {registered.length === 0 ? (
+      {/* Registered fleet — needs the control plane. Scoped here so the local
+          machine below is never hidden behind a sign-in wall. */}
+      {!organization || !tokens ? (
+        <EmptyState
+          title="Fleet view needs the control plane"
+          description="Sign in and select an organization in Settings to see registered machines across the fleet. The local machine is always shown below."
+        />
+      ) : machines.isError ? (
+        <EmptyState
+          title="Could not load registered machines"
+          description={errorMessage(machines.error) ?? "The control plane did not answer."}
+        />
+      ) : machines.isLoading ? (
+        <div className="flex items-center justify-center py-12">
+          <Spinner className="w-5 h-5" />
+        </div>
+      ) : registered.length === 0 ? (
         <EmptyState
           title="No machines registered"
-          description="Enroll machines with the agent's enroll command, or let presence reporting register them. This machine still appears below."
+          description="Register machines with shiftgate fleet machines register --machine-id ID --name NAME --agent-url URL, or let the agent's presence reporter do it (SHIFT_CONTROL_* settings). This machine still appears below."
         />
       ) : (
         <div className="space-y-2">
@@ -95,13 +95,72 @@ export function MachinesScreen() {
       )}
 
       {/* Local machine inventory */}
-      {localMachine.data && (
+      {localMachine.isLoading ? (
+        <div className="flex items-center justify-center py-12">
+          <Spinner className="w-5 h-5" />
+        </div>
+      ) : localMachine.isError ? (
         <Card className="p-4">
           <SectionLabel>This machine · live inventory</SectionLabel>
-          <MachineDetail capabilities={localMachine.data as unknown as MachineCapabilitiesLike} />
+          <p className="text-[13px] text-status-error">
+            Cannot read the local inventory: {errorMessage(localMachine.error) ?? "the agent is unreachable"}.
+            {" "}Start the agent (shift-agent) and confirm its socket path in Settings.
+          </p>
         </Card>
+      ) : (
+        localMachine.data && (
+          <>
+            <Card className="p-4">
+              <SectionLabel>This machine · live inventory</SectionLabel>
+              <MachineDetail capabilities={localMachine.data as unknown as MachineCapabilitiesLike} />
+            </Card>
+            <SupportPolicyCard capabilities={localMachine.data as unknown as MachineCapabilitiesLike} />
+          </>
+        )
       )}
     </div>
+  );
+}
+
+/**
+ * The support-matrix policy decision for this machine: whether unattended
+ * (automatic) migration and failover may run without an operator. Mirrors
+ * `shiftgate verify`; the decision vocabulary and rules come from the shipped
+ * support matrix (docs/support-matrix.json).
+ */
+function SupportPolicyCard({ capabilities }: { capabilities: MachineCapabilitiesLike }) {
+  const decision = evaluateSupportPolicy({
+    os: capabilities.os ?? "",
+    architecture: capabilities.architecture ?? "",
+    distribution: capabilities.distribution ?? "",
+    kernel: capabilities.kernel ?? "",
+    criuVersion: capabilities.criu?.version ?? "",
+    criuCheck: capabilities.criu?.healthy ? "passed" : "failed (agent reports CRIU unavailable or unhealthy)",
+  });
+  const tone = decision.allowAutomatic ? "healthy" : decision.status === "untested" ? "warning" : "error";
+
+  return (
+    <Card className="p-4">
+      <SectionLabel>Support policy · unattended operations</SectionLabel>
+      <div className="flex items-center gap-2 mt-1.5">
+        <Badge tone={tone}>{decision.action.replace(/_/g, " ")}</Badge>
+        <span className="text-[12px] text-text-secondary">
+          {decision.allowAutomatic
+            ? "Automatic migration and failover are permitted on this platform."
+            : "Automatic migration and failover are not permitted on this platform without an operator."}
+        </span>
+      </div>
+      <div className="mt-3">
+        <KeyValue label="Matrix" value={`v${decision.matrixVersion} · ${decision.status}${decision.platformID ? ` · ${decision.platformID}` : ""}`} />
+      </div>
+      <p className="text-[12px] text-text-muted leading-relaxed mt-2">{decision.reason}</p>
+      <p className="text-[11px] text-text-faint leading-relaxed mt-2">
+        Advisory preview of <span className="readout">shiftgate verify</span>, which runs the same
+        matrix rules against live evidence. A passing <span className="readout">criu check</span> is
+        evidence, not certification — unknown and untested combinations stay operator-gated until
+        certified with <span className="readout">scripts/verify-support-matrix.sh</span>.
+      </p>
+    </Card>
   );
 }
 

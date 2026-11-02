@@ -3,16 +3,17 @@
 // session login). Everything else the app shows is read-only data from those.
 
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { backend } from "@/lib/backend";
-import { useAuth } from "@/lib/store";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { backend, errorMessage } from "@/lib/backend";
+import { useAuth, effectiveControlURL, DEFAULT_CONTROL_URL } from "@/lib/store";
+import { APP_VERSION } from "@/lib/version";
 import { Badge, Button, Card, ErrorBanner, KeyValue, SectionLabel, Spinner } from "@/components/ui";
 
 export function SettingsScreen() {
   const { controlPlaneURL, agentSocket, tokens, user, organization, organizations, configure, login, logout, selectOrganization } =
     useAuth();
 
-  const [urlDraft, setURLDraft] = useState(controlPlaneURL);
+  const [urlDraft, setURLDraft] = useState(effectiveControlURL(controlPlaneURL));
   const [socketDraft, setSocketDraft] = useState(agentSocket);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -21,6 +22,9 @@ export function SettingsScreen() {
   const [busy, setBusy] = useState(false);
 
   const health = useQuery({ queryKey: ["agent-health"], queryFn: backend.health, refetchInterval: 10_000, retry: false });
+  // Surfaces a saved endpoints.json that could not be read or parsed (the
+  // Rust side falls back to defaults) instead of reverting silently.
+  const config = useQuery({ queryKey: ["backend-config"], queryFn: backend.config, retry: false });
 
   const saveEndpoints = async () => {
     setBusy(true);
@@ -39,6 +43,13 @@ export function SettingsScreen() {
     setLoginError(null);
     setBusy(true);
     try {
+      // Sign-in never requires a prior save: persist the URL first only when
+      // it differs from the configured one (empty means the platform default).
+      const target = urlDraft.trim() || DEFAULT_CONTROL_URL;
+      if (target !== effectiveControlURL(controlPlaneURL)) {
+        await backend.saveEndpoints(target, socketDraft.trim() || "/run/shift/agent.sock");
+        configure(target, socketDraft.trim() || "/run/shift/agent.sock");
+      }
       await login(email.trim(), password);
       setPassword("");
     } catch (error) {
@@ -77,7 +88,7 @@ export function SettingsScreen() {
                   </>
                 ) : (
                   <Badge tone="error">
-                    unreachable — {health.error instanceof Error ? health.error.message : "socket error"}
+                    unreachable — {errorMessage(health.error) ?? "socket error"}
                   </Badge>
                 )}
               </span>
@@ -93,7 +104,8 @@ export function SettingsScreen() {
           />
         </label>
         <p className="text-[12px] text-text-muted leading-relaxed">
-          The agent's Unix socket. The SHIFT_AGENT_ENDPOINT environment variable overrides this at startup.
+          The agent's Unix socket. The SHIFT_AGENT_ENDPOINT environment variable supplies the
+          default; a path saved here overrides it.
         </p>
       </Card>
 
@@ -101,14 +113,20 @@ export function SettingsScreen() {
       <Card className="p-4 space-y-3">
         <SectionLabel>Control plane</SectionLabel>
         <ErrorBanner message={saveError} />
+        <ErrorBanner message={config.data?.load_error ?? null} />
+        <ErrorBanner message={loginError} />
         <label className="block">
           <span className="tlabel block mb-1.5">Control plane URL</span>
           <input
             value={urlDraft}
             onChange={(event) => setURLDraft(event.target.value)}
-            placeholder="https://shift.example.com"
+            placeholder={DEFAULT_CONTROL_URL}
           />
         </label>
+        <p className="text-[12px] text-text-muted leading-relaxed">
+          Defaults to the platform endpoint ({DEFAULT_CONTROL_URL}) — the same default the CLI uses. A
+          private deployment overrides it here.
+        </p>
         <Button variant="secondary" disabled={busy} onClick={saveEndpoints}>
           Save endpoints
         </Button>
@@ -143,13 +161,13 @@ export function SettingsScreen() {
                 Sign out
               </Button>
               <span className="text-[12px] text-text-faint">
-                Session expires {new Date(tokens.expires_at).toLocaleTimeString()}
+                Access token expires {new Date(tokens.expires_at).toLocaleTimeString()} — renewed
+                automatically while signed in
               </span>
             </div>
           </div>
         ) : (
           <div className="space-y-3">
-            <ErrorBanner message={loginError} />
             <p className="text-[12px] text-text-muted leading-relaxed">
               Sign in to see registered machines across the fleet. The agent connection works without it.
             </p>
@@ -168,25 +186,107 @@ export function SettingsScreen() {
                 />
               </label>
             </div>
-            <Button variant="primary" disabled={busy || !controlPlaneURL} onClick={signIn}>
+            <Button variant="primary" disabled={busy} onClick={signIn}>
               {busy ? "Signing in…" : "Sign in"}
             </Button>
-            {!controlPlaneURL && (
-              <p className="text-[12px] text-status-warning">
-                Set and save the control plane URL first.
-              </p>
-            )}
+            <p className="text-[12px] text-text-muted leading-relaxed">
+              SSO organizations: password sign-in is refused when single sign-on is enforced — use{" "}
+              <span className="readout">shiftgate login --sso</span> in the CLI instead.
+            </p>
           </div>
         )}
       </Card>
 
+      <AgentUpdatesCard />
+
       {/* About */}
       <Card className="p-4">
         <SectionLabel>About</SectionLabel>
-        <KeyValue label="Client" value="SHIFT desktop 0.1.0" />
+        <KeyValue label="Client" value={`SHIFT desktop ${APP_VERSION}`} />
         <KeyValue label="Agent" value={health.data?.version ?? "—"} />
         <KeyValue label="Machine" value={health.data?.machine_id ?? "—"} />
       </Card>
     </div>
+  );
+}
+
+/** Agent update state: what is installed, what is staged, and a feed check. */
+function AgentUpdatesCard() {
+  const queryClient = useQueryClient();
+  const status = useQuery({ queryKey: ["agent-updates"], queryFn: backend.updateStatus, retry: false });
+
+  const check = useMutation({
+    mutationFn: () => backend.updateCheck(),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["agent-updates"] }),
+  });
+
+  // The agent accepts update mutations only from its own euid (root on a
+  // typical install): a 403 here is a privilege boundary, not a failure, and
+  // the remedy is to run the check as the agent's user.
+  const checkFailure = check.isError ? String(check.error instanceof Error ? check.error.message : check.error) : null;
+  const forbidden =
+    checkFailure !== null &&
+    (checkFailure.includes("UPDATE_FORBIDDEN") || checkFailure.includes("403") || checkFailure.toLowerCase().includes("forbidden"));
+
+  return (
+    <Card className="p-4 space-y-3">
+      <SectionLabel>Agent updates</SectionLabel>
+      {status.isLoading ? (
+        <Spinner />
+      ) : status.isError ? (
+        <ErrorBanner message={status.error instanceof Error ? status.error.message : "Update status unavailable"} />
+      ) : (
+        <>
+          <KeyValue label="Installed" value={status.data?.current_version ?? "—"} />
+          <KeyValue
+            label="Staged"
+            value={
+              status.data?.pending_version
+                ? `${status.data.pending_version}${status.data.restart_required ? " (restart required)" : ""}`
+                : "none"
+            }
+          />
+          <KeyValue
+            label="Available"
+            value={
+              typeof status.data?.available?.version === "string"
+                ? status.data.available.version
+                : "no newer release evaluated"
+            }
+          />
+          {status.data?.last_check_error && (
+            <KeyValue label="Last check error" value={status.data.last_check_error} />
+          )}
+          {(status.data?.blocked?.length ?? 0) > 0 && (
+            <KeyValue
+              label="Blocked"
+              value={status.data!.blocked!.map((entry) => entry.version).join(", ")}
+            />
+          )}
+        </>
+      )}
+      <div className="flex items-center gap-2">
+        <Button variant="secondary" disabled={check.isPending} onClick={() => check.mutate()}>
+          {check.isPending ? "Checking…" : "Check the release feed"}
+        </Button>
+        {check.isError && (
+          <span className="text-[12px] text-status-error">
+            {checkFailure}
+          </span>
+        )}
+        {check.isSuccess && <span className="text-[12px] text-text-muted">Feed checked.</span>}
+      </div>
+      {forbidden && (
+        <p className="text-[12px] text-status-warning leading-relaxed">
+          The agent only accepts update mutations from its own user (root on a typical
+          install) while the desktop runs as your user. Run the check from a terminal on
+          this machine instead: <span className="readout">sudo shiftgate update check</span>
+        </p>
+      )}
+      <p className="text-[12px] text-text-muted leading-relaxed">
+        Applying or rolling back an update is an operator action: use{" "}
+        <span className="readout">shiftgate update apply|rollback</span> on this machine.
+      </p>
+    </Card>
   );
 }

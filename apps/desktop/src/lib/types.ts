@@ -52,10 +52,12 @@ export interface MachineCapabilities {
   architecture: string;
   cpus: number;
   memory_bytes: number;
-  storage: StorageDevice[];
-  gpus: GPUDevice[];
+  // Go serializes nil slices/maps as `null`: these three fields are nullable
+  // on the wire (e.g. a GPU-less machine reports `"gpus": null`).
+  storage: StorageDevice[] | null;
+  gpus: GPUDevice[] | null;
   criu: CRIUCapabilities;
-  features: Record<string, boolean>;
+  features: Record<string, boolean> | null;
   agent_version: string;
   observed_at: string;
 }
@@ -96,6 +98,11 @@ export interface PortSpec {
   host_port?: number;
 }
 
+export interface CheckpointPolicy {
+  interval_seconds: number;
+  keep_last?: number;
+}
+
 export interface WorkloadSpec {
   id: string;
   name: string;
@@ -109,6 +116,7 @@ export interface WorkloadSpec {
   ports?: PortSpec[];
   device_policy: "reject_incompatible" | "warn_incompatible";
   network_policy: "preserve" | "reconnect" | "drain";
+  checkpoint_policy?: CheckpointPolicy | null;
 }
 
 export interface ProcessState {
@@ -144,6 +152,31 @@ export interface CheckpointSummary {
   manifest_hash: string;
 }
 
+// The create route responds with the full manifest (internal/agent/api.go
+// handleCheckpointCreate → model.CheckpointManifest), not a CheckpointSummary.
+export interface CheckpointManifest {
+  format: string;
+  format_version: string;
+  id: string;
+  parent_id?: string;
+  kind: CheckpointKind;
+  workload: WorkloadSpec;
+  source_identity: MachineIdentity;
+  source_machine: MachineCapabilities;
+  created_at: string;
+  engine: Record<string, unknown>;
+  assets: unknown[];
+  state_inventory: unknown[];
+  filesystem_capture: Record<string, unknown>;
+  dependencies?: unknown[];
+  device_requirements?: GPUDevice[];
+  required_bytes: number;
+  metrics: Record<string, unknown>;
+  security: Record<string, unknown>;
+  manifest_sha256: string;
+  compatibility_id: string;
+}
+
 export interface RestoreRecord {
   id: string;
   checkpoint_id: string;
@@ -159,9 +192,29 @@ export interface RestoreRecord {
   error?: string;
 }
 
+export type ForkState = string;
+
 export interface ForkRecord {
   id: string;
-  [key: string]: unknown;
+  source_workload_id: string;
+  source_checkpoint_id?: string;
+  source_root_path?: string;
+  fork_workload_id: string;
+  fork_checkpoint_id?: string;
+  fork_name: string;
+  state: ForkState;
+  root_path: string;
+  staging_root?: string;
+  images_directory?: string;
+  generation?: number;
+  activated?: boolean;
+  pid?: number;
+  created_workload?: boolean;
+  plain_bytes?: number;
+  stored_bytes?: number;
+  deduplicated_bytes?: number;
+  created_at: string;
+  updated_at?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -184,7 +237,8 @@ export interface CompatibilityIssue {
 
 export interface CompatibilityReport {
   compatible: boolean;
-  issues: CompatibilityIssue[];
+  // A fully compatible run serializes as "issues": null (nil slice).
+  issues: CompatibilityIssue[] | null;
   checked_at: string;
 }
 
@@ -219,7 +273,8 @@ export interface Migration {
   stage: MigrationStage;
   compatibility: CompatibilityReport;
   metrics: MigrationMetrics;
-  events: MigrationEvent[];
+  // Nullable on the wire until the run loop appends the first event.
+  events: MigrationEvent[] | null;
   created_at: string;
   updated_at: string;
   completed_at?: string | null;
@@ -227,5 +282,43 @@ export interface Migration {
   failure_reason?: string;
   source_preserved: boolean;
   revision: number;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Agent — updates                                                     */
+/* ------------------------------------------------------------------ */
+
+export interface BlockedVersion {
+  version: string;
+  blocked_at: string;
+  reason?: string;
+}
+
+export interface UpdateEvaluation {
+  version: string;
+  [key: string]: unknown;
+}
+
+export interface UpdateStatus {
+  component: string;
+  current_version: string;
+  pending_version?: string;
+  restart_required?: boolean;
+  channel?: string;
+  executable_path?: string;
+  last_checked_at?: string | null;
+  last_check_error?: string;
+  available?: UpdateEvaluation | null;
+  blocked?: BlockedVersion[];
+  [key: string]: unknown;
+}
+
+export interface UpdateCheckResult {
+  checked_at: string;
+  component: string;
+  current_version: string;
+  pending_version?: string;
+  available?: UpdateEvaluation | null;
+  evaluations?: UpdateEvaluation[];
 }
 

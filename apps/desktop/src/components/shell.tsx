@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { backend } from "@/lib/backend";
+import { control } from "@/lib/control";
 import { useAuth } from "@/lib/store";
 import { Dot } from "@/components/ui";
 
@@ -43,8 +44,17 @@ export function Shell({
     retry: false,
   });
 
-  const { user, organization, controlPlaneURL } = useAuth();
+  const { user, controlPlaneURL } = useAuth();
+  // The connection dot reflects reachability, not configuration: a
+  // configured-but-offline control plane must not read as connected.
+  const controlHealth = useQuery({
+    queryKey: ["control-health", controlPlaneURL],
+    queryFn: () => control.health(),
+    refetchInterval: 30_000,
+    retry: false,
+  });
   const agentOnline = agentHealth.isSuccess;
+  const controlOnline = controlHealth.isSuccess;
 
   return (
     <div className="flex h-full">
@@ -58,23 +68,28 @@ export function Shell({
           <span className="text-[15px] font-semibold tracking-wide">SHIFT</span>
         </div>
 
-        <nav className="flex-1 py-3 px-2.5 space-y-0.5">
-          {NAV.map(({ id, label, icon: Icon }) => (
-            <button
-              key={id}
-              onClick={() => onNavigate(id)}
-              className={clsx(
-                "w-full flex items-center gap-2.5 px-2.5 h-9 rounded-md text-[13px] transition-colors",
-                screen === id
-                  ? "bg-bg-active text-text"
-                  : "text-text-secondary hover:text-text hover:bg-bg-hover"
-              )}
-            >
-              <Icon className="w-4 h-4 shrink-0" />
-              {label}
-              {screen === id && <span className="ml-auto w-1 h-1 rounded-full bg-accent" />}
-            </button>
-          ))}
+        <nav className="flex-1 py-3 px-2.5 space-y-0.5" aria-label="Primary navigation">
+          {NAV.map(({ id, label, icon: Icon }) => {
+            const selected = screen === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => onNavigate(id)}
+                aria-current={selected ? "page" : undefined}
+                className={clsx(
+                  "w-full flex items-center gap-2.5 px-2.5 h-9 rounded-md text-[13px] transition-colors",
+                  selected
+                    ? "bg-bg-active text-text"
+                    : "text-text-secondary hover:text-text hover:bg-bg-hover"
+                )}
+              >
+                <Icon aria-hidden="true" className="w-4 h-4 shrink-0" />
+                <span>{label}</span>
+                {selected && <span aria-hidden="true" className="ml-auto w-1 h-1 rounded-full bg-accent" />}
+              </button>
+            );
+          })}
         </nav>
 
         {/* Connection status — the honest state of both endpoints */}
@@ -87,9 +102,10 @@ export function Shell({
             </span>
           </div>
           <div className="flex items-center gap-2 text-[12px] text-text-secondary">
-            <Dot tone={controlPlaneURL ? "accent" : "offline"} />
+            <Dot tone={controlOnline ? "healthy" : controlHealth.isError ? "error" : "offline"} />
             <span className="truncate">
-              {controlPlaneURL ? (organization?.name ?? "Control plane") : "Control plane unset"}
+              {controlPlaneURL || "platform"}
+              {controlHealth.isError ? " · unreachable" : controlOnline ? " · reachable" : ""}
             </span>
           </div>
           {user && (

@@ -5,7 +5,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
-import { backend, formatBytes, formatRelative, shortID } from "@/lib/backend";
+import { backend, errorMessage, formatBytes, formatRelative, shortID } from "@/lib/backend";
 import { Badge, Card, EmptyState, Spinner } from "@/components/ui";
 import { stageTone } from "@/screens/Dashboard";
 import type { Migration } from "@/lib/types";
@@ -41,25 +41,9 @@ export function HistoryScreen({ onOpenMigration }: { onOpenMigration: (id: strin
     retry: false,
   });
 
-  const loading = migrations.isLoading || checkpoints.isLoading || restores.isLoading;
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-32">
-        <Spinner className="w-6 h-6" />
-      </div>
-    );
-  }
-
-  if (migrations.isError) {
-    return (
-      <EmptyState
-        title="Cannot read history"
-        description={migrations.error instanceof Error ? migrations.error.message : String(migrations.error)}
-      />
-    );
-  }
-
+  // Each tab owns its loading and failure state: one broken endpoint must
+  // not blank the whole durable record, and the forks tab must not wait on
+  // three unrelated fetches.
   const migrationValues = [...(migrations.data ?? [])].sort((a, b) =>
     b.created_at.localeCompare(a.created_at)
   );
@@ -75,7 +59,9 @@ export function HistoryScreen({ onOpenMigration }: { onOpenMigration: (id: strin
       <div>
         <h1 className="text-xl font-semibold">History</h1>
         <p className="text-[13px] text-text-muted mt-0.5">
-          {migrationValues.length} migrations · {checkpointValues.length} checkpoints
+          {migrations.data ? `${migrationValues.length} migrations` : "migrations unavailable"}
+          {" · "}
+          {checkpoints.data ? `${checkpointValues.length} checkpoints` : "checkpoints unavailable"}
           {failures.length > 0 ? ` · ${failures.length} failures` : ""}
         </p>
       </div>
@@ -100,7 +86,16 @@ export function HistoryScreen({ onOpenMigration }: { onOpenMigration: (id: strin
 
       {tab === "migrations" && (
         <Card className="overflow-hidden">
-          {migrationValues.length === 0 ? (
+          {migrations.isLoading ? (
+            <div className="flex items-center justify-center py-12">
+              <Spinner />
+            </div>
+          ) : migrations.isError ? (
+            <EmptyState
+              title="Cannot read migrations"
+              description={errorMessage(migrations.error) ?? "The agent did not answer."}
+            />
+          ) : migrationValues.length === 0 ? (
             <EmptyState title="No migrations yet" description="Run one from the Workloads screen." />
           ) : (
             <div className="divide-y divide-border-subtle">
@@ -118,7 +113,16 @@ export function HistoryScreen({ onOpenMigration }: { onOpenMigration: (id: strin
 
       {tab === "checkpoints" && (
         <Card className="overflow-hidden">
-          {checkpointValues.length === 0 ? (
+          {checkpoints.isLoading ? (
+            <div className="flex items-center justify-center py-12">
+              <Spinner />
+            </div>
+          ) : checkpoints.isError ? (
+            <EmptyState
+              title="Cannot read checkpoints"
+              description={errorMessage(checkpoints.error) ?? "The agent did not answer."}
+            />
+          ) : checkpointValues.length === 0 ? (
             <EmptyState title="No checkpoints yet" description="Checkpoint a workload while it runs." />
           ) : (
             <div className="divide-y divide-border-subtle">
@@ -151,7 +155,16 @@ export function HistoryScreen({ onOpenMigration }: { onOpenMigration: (id: strin
 
       {tab === "restores" && (
         <Card className="overflow-hidden">
-          {(restores.data ?? []).length === 0 ? (
+          {restores.isLoading ? (
+            <div className="flex items-center justify-center py-12">
+              <Spinner />
+            </div>
+          ) : restores.isError ? (
+            <EmptyState
+              title="Cannot read restores"
+              description={errorMessage(restores.error) ?? "The agent did not answer."}
+            />
+          ) : (restores.data ?? []).length === 0 ? (
             <EmptyState
               title="No restores yet"
               description="Restore a checkpoint from a workload's inspect panel, or migrate in — the destination restores too."
@@ -242,6 +255,17 @@ function ForksTab() {
     );
   }
 
+  if (forks.isError) {
+    return (
+      <Card>
+        <EmptyState
+          title="Cannot read forks"
+          description={errorMessage(forks.error) ?? "The agent did not answer."}
+        />
+      </Card>
+    );
+  }
+
   const values = forks.data ?? [];
   if (values.length === 0) {
     return (
@@ -257,23 +281,32 @@ function ForksTab() {
   return (
     <Card className="overflow-hidden">
       <div className="divide-y divide-border-subtle">
-        {values.map((fork) => {
-          const record = fork as Record<string, unknown>;
-          const id = typeof record.id === "string" ? record.id : "";
-          const name = typeof record.name === "string" ? record.name : "fork";
-          const createdAt = typeof record.created_at === "string" ? record.created_at : null;
-          return (
-            <div key={id} className="flex items-center gap-4 px-4 py-3">
-              <div className="min-w-0">
-                <div className="text-[13px]">{name}</div>
-                <div className="text-[11px] text-text-faint">
-                  {shortID(id)}
-                  {createdAt ? ` · ${new Date(createdAt).toLocaleString()}` : ""}
-                </div>
+        {values.map((fork) => (
+          <div key={fork.id} className="flex items-center gap-4 px-4 py-3">
+            <div className="min-w-0">
+              <div className="text-[13px]">{fork.fork_name || "fork"}</div>
+              <div className="text-[11px] text-text-faint truncate">
+                {shortID(fork.id)}
+                {fork.created_at ? ` · ${new Date(fork.created_at).toLocaleString()}` : ""}
+                {fork.root_path ? ` · ${fork.root_path}` : ""}
               </div>
             </div>
-          );
-        })}
+            <Badge
+              tone={
+                fork.state === "FAILED"
+                  ? "error"
+                  : fork.state === "ROLLING_BACK" || fork.state === "ROLLED_BACK"
+                    ? "warning"
+                    : fork.state === "COMMITTED" || fork.state === "RUNNING" || fork.state === "MATERIALIZED"
+                      ? "healthy"
+                      : "neutral"
+              }
+              className="ml-auto shrink-0"
+            >
+              {fork.state}
+            </Badge>
+          </div>
+        ))}
       </div>
     </Card>
   );

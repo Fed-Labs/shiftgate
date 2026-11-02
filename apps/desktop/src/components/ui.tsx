@@ -211,3 +211,37 @@ export function KeyValue({ label, value }: { label: string; value: React.ReactNo
     </div>
   );
 }
+
+/**
+ * One render crash must never white-screen the whole app: the boundary shows
+ * the real error and lets the operator move on to another screen.
+ */
+export class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: string | null }
+> {
+  state = { error: null as string | null };
+
+  static getDerivedStateFromError(error: unknown) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="max-w-lg mx-auto py-24">
+          <EmptyState
+            title="This screen hit an unexpected error"
+            description={this.state.error}
+            action={
+              <Button variant="primary" onClick={() => this.setState({ error: null })}>
+                Try again
+              </Button>
+            }
+          />
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}

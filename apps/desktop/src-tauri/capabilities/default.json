@@ -1,17 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window capability: core app APIs plus control-plane HTTP access. Production control planes speak HTTPS; plain HTTP is allowed only for loopback development deployments.",
+  "description": "Main window capability: core app APIs only. The webview holds no HTTP permission — agent traffic goes through the Unix-socket `agent_request` command and control-plane traffic through `control_request`, which validates every target against the configured endpoint. This keeps a script-injection bug in the UI from reaching any host or loopback service.",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    {
-      "identifier": "http:default",
-      "allow": [
-        { "url": "https://**" },
-        { "url": "http://localhost:**" },
-        { "url": "http://127.0.0.1:**" }
-      ]
-    }
-  ]
+  "permissions": ["core:default"]
 }

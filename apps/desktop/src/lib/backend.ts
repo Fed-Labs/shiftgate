@@ -15,12 +15,16 @@ import type {
   MachineIdentity,
   DoctorResponse,
   Workload,
+  CheckpointManifest,
   CheckpointSummary,
   RestoreRecord,
   ForkRecord,
   Migration,
   Destination,
   MigrationMode,
+  CompatibilityReport,
+  UpdateStatus,
+  UpdateCheckResult,
 } from "./types";
 
 export interface CreateWorkloadInput {
@@ -44,7 +48,25 @@ export interface CreateMigrationInput {
   mode?: MigrationMode;
 }
 
+// The dry-run answer: nothing is moved, frozen, or recorded. `report` is the
+// same compatibility document a real migration's validate stage produces.
+export interface PreflightResult {
+  source_machine: MachineCapabilities;
+  destination: MachineCapabilities;
+  mode: MigrationMode;
+  report: CompatibilityReport;
+  network: unknown;
+}
+
 export interface BackendConfig {
+  control_plane_url: string;
+  agent_socket: string;
+  /** Set when the saved endpoints.json could not be read/parsed at startup. */
+  load_error?: string;
+}
+
+/** Invoke arguments for `save_endpoints` — snake_case, matching Rust exactly. */
+export interface SaveEndpointsArgs {
   control_plane_url: string;
   agent_socket: string;
 }
@@ -59,6 +81,19 @@ export class AgentError extends Error {
   }
 }
 
+/** The error shape every command rejection carries: "<CODE>: <message>". */
+export class CommandError extends AgentError {
+  constructor(code: string, message: string) {
+    super(code, message, 0);
+  }
+}
+
+/** The message to show for any thrown value, without "Error:" noise. */
+export function errorMessage(error: unknown): string | null {
+  if (error === null || error === undefined) return null;
+  return error instanceof Error ? error.message : String(error);
+}
+
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: {
@@ -69,13 +104,29 @@ declare global {
 
 const tauriInvoke = window.__TAURI_INTERNALS__?.invoke?.bind(window.__TAURI_INTERNALS__);
 
-async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (!tauriInvoke) {
     throw new Error(
       "Desktop shell unavailable — start the app with `npm run tauri dev`, not `npm run dev`."
     );
   }
-  return tauriInvoke(command, args) as Promise<T>;
+  try {
+    return (await tauriInvoke(command, args)) as T;
+  } catch (error) {
+    throw toCommandError(error);
+  }
+}
+
+/**
+ * The Rust side rejects with "<CODE>: <message>" strings; split them so the
+ * UI can render the code and message cleanly instead of a raw blob.
+ */
+export function toCommandError(error: unknown): Error {
+  const text =
+    typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
+  const match = /^([A-Z][A-Z0-9_]*):\s*([\s\S]*)$/.exec(text);
+  if (match) return new CommandError(match[1], match[2]);
+  return error instanceof Error ? error : new Error(text);
 }
 
 /**
@@ -92,7 +143,7 @@ async function agentRequest<T>(
   try {
     return JSON.parse(raw) as T;
   } catch {
-    throw new AgentError("AGENT_PROTOCOL", "The agent returned a non-JSON body.", 0);
+    throw new CommandError("AGENT_PROTOCOL", "The agent returned a non-JSON body.");
   }
 }
 
@@ -108,8 +159,14 @@ async function agentText(
 export const backend = {
   /* Configuration -------------------------------------------------- */
   config: () => invoke<BackendConfig>("get_config"),
+  // Invoke argument keys are the command's snake_case parameter names
+  // verbatim (`#[tauri::command(rename_all = "snake_case")]` on the Rust
+  // side). The typed args below keep the two spellings in lockstep.
   saveEndpoints: (controlPlaneURL: string, agentSocket: string) =>
-    invoke<BackendConfig>("save_endpoints", { controlPlaneURL, agentSocket }),
+    invoke<BackendConfig>("save_endpoints", {
+      control_plane_url: controlPlaneURL,
+      agent_socket: agentSocket,
+    } satisfies SaveEndpointsArgs),
 
   /* Agent — machine and health -------------------------------------- */
   health: () => agentRequest<Health>("GET", "/v1/health"),
@@ -128,6 +185,15 @@ export const backend = {
     agentRequest<void>("DELETE", `/v1/workloads/${id}`),
   workloadLogs: (id: string, tail: number) =>
     agentText("GET", `/v1/workloads/${id}/logs?tail=${tail}`),
+  workloadPolicy: (id: string, intervalSeconds: number, keepLast: number) =>
+    agentRequest<Workload>("POST", `/v1/workloads/${id}/policy`, {
+      interval_seconds: intervalSeconds,
+      keep_last: keepLast,
+    }),
+
+  /* Agent — updates --------------------------------------------------- */
+  updateStatus: () => agentRequest<UpdateStatus>("GET", "/v1/updates"),
+  updateCheck: () => agentRequest<UpdateCheckResult>("POST", "/v1/updates/check", {}),
 
   /* Agent — checkpoints, restores, forks ------------------------------ */
   checkpoints: (workloadId?: string) =>
@@ -136,7 +202,7 @@ export const backend = {
       workloadId ? `/v1/checkpoints?workload_id=${encodeURIComponent(workloadId)}` : "/v1/checkpoints"
     ),
   createCheckpoint: (input: CreateCheckpointInput) =>
-    agentRequest<CheckpointSummary>("POST", "/v1/checkpoints", input),
+    agentRequest<CheckpointManifest>("POST", "/v1/checkpoints", input),
   restoreCheckpoint: (id: string, timeoutSeconds: number) =>
     agentRequest<RestoreRecord>("POST", `/v1/checkpoints/${id}/restore`, {
       timeout_seconds: timeoutSeconds,
@@ -151,6 +217,8 @@ export const backend = {
   migration: (id: string) => agentRequest<Migration>("GET", `/v1/migrations/${id}`),
   createMigration: (input: CreateMigrationInput) =>
     agentRequest<Migration>("POST", "/v1/migrations", input),
+  preflightMigration: (input: CreateMigrationInput) =>
+    agentRequest<PreflightResult>("POST", "/v1/migrations/preflight", input),
   cancelMigration: (id: string) =>
     agentRequest<void>("POST", `/v1/migrations/${id}/cancel`),
 };

@@ -12,14 +12,26 @@ history, and drives the same agent API the CLI uses.
   architecture, CPU, RAM, GPU, storage, SHIFT agent version, online state,
   and compatibility summary.
 - **Workloads** — create, start, pause/resume, stop, checkpoint, migrate,
-  fork, delete, inspect (full spec, checkpoints, restore, logs).
+  fork (one independent copy from the workload's latest state), delete,
+  inspect (full spec, checkpoints, restore, logs), and the periodic
+  checkpoint policy.
 - **Migration view** — the live pipeline (Checkpointing → Transferring →
   Restoring → Validating → Completed) with progress, transfer metrics,
   compatibility notes, and the full event log. Failures show the real failure
   code and the rollback state.
 - **History** — migrations, checkpoints, restores, and forks with timestamps,
   sources, destinations, and failures.
-- **Settings** — the agent socket path and the control-plane connection.
+- **Settings** — the agent socket path, the control-plane connection and
+  sign-in, and the agent's update status (installed, staged, available).
+
+## Scope
+
+The desktop client covers the operator surfaces above and intentionally not
+the full CLI. Use `shiftgate` for: clone sets, failover/standby duties,
+workload failover policy, update apply/rollback/block, checkpoint mirror,
+storage setup, fleet and marketplace management, GC, and API-key management.
+Applying an agent update is also a CLI action (`shiftgate update apply`) —
+Settings shows update status and can check the release feed only.
 
 ## Architecture
 
@@ -30,14 +42,17 @@ network connections:
   socket (`src-tauri/src/http.rs`, std only), exposed to the frontend as the
   generic `agent_request` Tauri command. Agent errors surface verbatim as
   `<CODE>: <message>`.
-- **Control plane** — the official `tauri-plugin-http` plugin performs HTTPS
-  requests; the HTTP capability scope allows HTTPS plus loopback HTTP for
-  development control planes.
+- **Control plane** — the `control_request` Tauri command performs HTTPS
+  requests in Rust, pinned to the configured control-plane URL (verified TLS;
+  plain http only for loopback deployments). The webview holds no HTTP
+  permission at all, so a script-injection bug in the UI cannot reach any
+  host or local service.
 
 Endpoints persist in the OS config dir (`endpoints.json`) on the Rust side
 and in `localStorage` on the frontend side; the two sync at startup. Sessions
 use the control plane's short-lived access tokens with transactional refresh
-rotation, the same model as the web dashboard.
+rotation. (The web dashboard keeps its refresh token in memory only; the
+desktop persists the session because its WebView loads only bundled content.)
 
 ## Building
 
@@ -58,5 +73,7 @@ npm run tauri dev
 ```
 
 The agent must be running with its socket at `/run/shift/agent.sock` (or set
-`SHIFT_AGENT_ENDPOINT` to another socket path). Control-plane features need a
-control-plane URL in Settings.
+`SHIFT_AGENT_ENDPOINT` to another socket path — the saved setting in Settings
+overrides the environment variable). Control-plane features use
+the platform control plane by default; set a private deployment URL in
+Settings.

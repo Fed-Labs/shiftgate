@@ -3,7 +3,7 @@
 // checkpoint footprint, and storage.
 
 import { useQuery } from "@tanstack/react-query";
-import { backend, formatBytes, formatRelative, shortID } from "@/lib/backend";
+import { backend, errorMessage, formatBytes, formatRelative, shortID } from "@/lib/backend";
 import { control } from "@/lib/control";
 import { useAuth } from "@/lib/store";
 import { Badge, Card, Dot, EmptyState, ErrorBanner, KeyValue, SectionLabel, Spinner, Stat } from "@/components/ui";
@@ -28,7 +28,14 @@ export function DashboardScreen() {
     refetchInterval: 10_000,
     retry: false,
   });
-  const machine = useQuery({ queryKey: ["agent-machine"], queryFn: backend.machine, retry: false });
+  // The machine inventory must recover on its own: the app may start before
+  // the agent (autostart ordering), and refetchOnWindowFocus is disabled.
+  const machine = useQuery({
+    queryKey: ["agent-machine"],
+    queryFn: backend.machine,
+    refetchInterval: 15_000,
+    retry: false,
+  });
   const doctor = useQuery({ queryKey: ["agent-doctor"], queryFn: backend.doctor, refetchInterval: 30_000, retry: false });
   const workloads = useQuery({ queryKey: ["agent-workloads"], queryFn: backend.workloads, refetchInterval: 5_000, retry: false });
   const migrations = useQuery({ queryKey: ["agent-migrations"], queryFn: backend.migrations, refetchInterval: 3_000, retry: false });
@@ -55,9 +62,9 @@ export function DashboardScreen() {
         <EmptyState
           title="The local agent is unreachable"
           description={
-            health.error instanceof Error
-              ? health.error.message
-              : "Start the agent (shift-agent) and confirm its socket path in Settings."
+            errorMessage(health.error) ??
+            errorMessage(machine.error) ??
+            "Start the agent (shift-agent) and confirm its socket path in Settings."
           }
         />
       </div>
@@ -65,6 +72,11 @@ export function DashboardScreen() {
   }
 
   const capabilities = machine.data!;
+  // The agent serializes empty slices as JSON `null` (a GPU-less machine
+  // reports `"gpus": null`); normalize before touching them.
+  const gpus = capabilities.gpus ?? [];
+  const storage = capabilities.storage ?? [];
+  const features = capabilities.features ?? {};
   const running = (workloads.data ?? []).filter((w) => w.status === "running");
   const active = (migrations.data ?? []).filter((m) => ACTIVE_STAGES.includes(m.stage));
   const recent = [...(migrations.data ?? [])]
@@ -72,8 +84,8 @@ export function DashboardScreen() {
     .slice(0, 5);
   const storedBytes = (checkpoints.data ?? []).reduce((sum, c) => sum + c.stored_bytes, 0);
   const onlineMachines = (machines.data ?? []).filter((m) => m.status === "online");
-  const primaryStorage = capabilities.storage.find((s) => s.mountpoint === "/") ?? capabilities.storage[0];
-  const gpuSummary = capabilities.gpus.length > 0 ? `${capabilities.gpus.length}× GPU` : "None";
+  const primaryStorage = storage.find((s) => s.mountpoint === "/") ?? storage[0];
+  const gpuSummary = gpus.length > 0 ? `${gpus.length}× GPU` : "None";
 
   return (
     <div className="space-y-6">
@@ -94,7 +106,7 @@ export function DashboardScreen() {
         </div>
       </div>
 
-      <ErrorBanner message={migrations.error ? String(migrations.error) : null} />
+      <ErrorBanner message={errorMessage(migrations.error)} />
 
       {/* Instrument row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -150,7 +162,7 @@ export function DashboardScreen() {
                 : "—"
             }
           />
-          <KeyValue label="GPU" value={`${gpuSummary}${capabilities.gpus.some((g) => g.checkpoint_restore) ? " · checkpointable" : ""}`} />
+          <KeyValue label="GPU" value={`${gpuSummary}${gpus.some((g) => g.checkpoint_restore) ? " · checkpointable" : ""}`} />
           <KeyValue
             label="CRIU"
             value={capabilities.criu.healthy ? capabilities.criu.version || "healthy" : "unavailable"}
@@ -161,13 +173,13 @@ export function DashboardScreen() {
         {/* Device compatibility */}
         <Card className="p-4">
           <SectionLabel>Device compatibility</SectionLabel>
-          {capabilities.gpus.length === 0 && (
+          {gpus.length === 0 && (
             <p className="text-[13px] text-text-muted leading-relaxed">
               No accelerators on this machine. Workloads without GPU requirements migrate freely;
               GPU-dependent workloads report this machine as incompatible.
             </p>
           )}
-          {capabilities.gpus.map((gpu, index) => (
+          {gpus.map((gpu, index) => (
             <div key={index} className="py-1.5 space-y-1">
               <div className="flex items-center gap-2">
                 <Dot tone={gpu.checkpoint_restore ? "healthy" : "warning"} />
@@ -182,7 +194,7 @@ export function DashboardScreen() {
           ))}
           <div className="hline my-3" />
           <div className="flex flex-wrap gap-1.5">
-            {Object.entries(capabilities.features)
+            {Object.entries(features)
               .filter(([, enabled]) => enabled)
               .map(([feature]) => (
                 <Badge key={feature} tone="neutral">
